@@ -3628,7 +3628,7 @@ evalLoop:
 					mname := binding.car.str
 					macroParams := binding.cdr.car
 					macroBody := binding.cdr.cdr
-					params, rest, e := parseParams(macroParams)
+					params, rest, _, _, e := parseMacroParams(macroParams)
 					if e != nil {
 						return nil, e
 					}
@@ -4726,7 +4726,19 @@ func parseParams(v *Value) ([]string, string, error) {
 		}
 		seen[v] = true
 		if v.car != nil && v.car.typ == VSym {
-			params = append(params, v.car.str)
+			s := v.car.str
+			if s == "&rest" || s == "&REST" || s == "&body" || s == "&BODY" {
+				// Next symbol is the rest param name
+				if v.cdr == nil || v.cdr.typ != VPair || v.cdr.car == nil || v.cdr.car.typ != VSym {
+					return nil, "", fmt.Errorf("bad lambda parameter list: %s requires a symbol", s)
+				}
+				return params, v.cdr.car.str, nil
+			}
+			if s == "&optional" || s == "&OPTIONAL" || s == "&key" || s == "&KEY" || s == "&allow-other-keys" || s == "&aux" || s == "&AUX" || s == "&whole" || s == "&WHOLE" || s == "&environment" || s == "&ENVIRONMENT" {
+				// Stop collecting required params at these keywords
+				break
+			}
+			params = append(params, s)
 			v = v.cdr
 		} else {
 			break
