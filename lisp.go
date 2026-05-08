@@ -540,13 +540,18 @@ var packages = map[string]*Package{}
 
 // -------- Readtable --------
 
-// macroEntry stores a macro character function in the readtable.
+// macroEntry stores a readtable macro character function.
 // Either goFn or lispFn should be set, not both.
 type macroEntry struct {
 	goFn        func(*Parser, rune) (*Value, error) // Go-level macro function
-	lispFn      *Value                              // Lisp-level VFunc
+	lispFn      *Value                              // Lisp-level VFunc or VPrim
 	terminating bool                                // true = terminating macro char
 }
+
+// closeParenSentinel is the special VPrim function returned by
+// get-macro-character for ')', recognized by set-macro-character
+// to register the target character as a close-paren equivalent.
+var closeParenSentinel *Value
 
 // Readtable controls how the reader parses input.
 type Readtable struct {
@@ -566,11 +571,13 @@ func initStandardReadtable() {
 	}
 	currentReadtable = standardReadtable
 
-	// Register standard macro characters with nil lispFn (Go-level handling).
-	// These are handled by the lexer/parser, but registered for introspection.
+	// Register standard macro characters with Go-level entries for introspection.
+	// The lexer/parser handles these via hardcoded switch cases, but the entries
+	// allow get-macro-character to return useful information.
 	registerGoMacro := func(ch rune, term bool) {
 		standardReadtable.macroFns[ch] = &macroEntry{
 			goFn:        nil,
+			lispFn:      nil,
 			terminating: term,
 		}
 	}
@@ -592,6 +599,13 @@ func initStandardReadtable() {
 	// Note: actual dispatch handling is done in the parser's dispatch reader.
 	// Dispatch entries are nil by default (handled by hardcoded parser logic).
 	// They can be overridden with set-dispatch-macro-character.
+
+	// Create the close-paren sentinel - a VPrim function that represents
+	// the behavior of ')'. get-macro-character returns this for ')', and
+	// set-macro-character recognizes it to register close-paren equivalence.
+	closeParenSentinel = &Value{typ: VPrim, fn: func(args []*Value) (*Value, error) {
+		return nil, fmt.Errorf("unmatched close parenthesis")
+	}}
 }
 
 func findPackage(name string) *Package {
@@ -1529,17 +1543,34 @@ func (p *Parser) read() (*Value, error) {
 	}
 }
 
+// isCloseParenMacro returns true if the current token is a TMacro whose
+// registered lispFn is the closeParenSentinel, meaning it acts as ')'.
+func (p *Parser) isCloseParenMacro() bool {
+	if p.tok.typ != TMacro {
+		return false
+	}
+	rt := p.readtable
+	if rt == nil {
+		rt = currentReadtable
+	}
+	entry, ok := rt.macroFns[p.tok.ch]
+	if !ok || entry == nil || entry.lispFn == nil {
+		return false
+	}
+	return entry.lispFn == closeParenSentinel
+}
+
 func (p *Parser) readList() (*Value, error) {
 	p.advance() // skip (
 	var head, tail *Value
-	for p.tok.typ != TRParen && p.tok.typ != TEOF {
+	for p.tok.typ != TRParen && p.tok.typ != TEOF && !p.isCloseParenMacro() {
 		if p.tok.typ == TDot {
 			p.advance()
 			v, err := p.readExpr()
 			if err != nil {
 				return nil, err
 			}
-			if p.tok.typ != TRParen {
+			if p.tok.typ != TRParen && !p.isCloseParenMacro() {
 				return nil, fmt.Errorf("expected ) after dot")
 			}
 			if tail == nil {
@@ -1565,7 +1596,7 @@ func (p *Parser) readList() (*Value, error) {
 	if p.tok.typ == TEOF {
 		return nil, fmt.Errorf("unclosed list")
 	}
-	p.advance() // skip )
+	p.advance() // skip ) or close-paren macro
 	if head == nil {
 		return vnil(), nil
 	}
@@ -1682,6 +1713,10 @@ func (p *Parser) invokeMacro(ch rune) (*Value, error) {
 	if !ok || entry == nil || entry.lispFn == nil {
 		// No Lisp-level macro function registered
 		return nil, fmt.Errorf("invokeMacro: no macro function for %q", string(ch))
+	}
+	// Close-paren sentinel: signal error (like unmatched close paren)
+	if entry.lispFn == closeParenSentinel {
+		return nil, fmt.Errorf("unmatched close parenthesis")
 	}
 	// Call the macro function by constructing (fn ch) and evaluating it.
 	chVal := &Value{typ: VChar, ch: ch}
@@ -9889,6 +9924,11 @@ func builtinSetMacroCharacter(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("set-macro-character: first argument must be a character")
 	}
 	fn := args[1]
+	// CL spec: nil means remove the macro character
+	if fn.typ == VNil {
+		delete(currentReadtable.macroFns, ch)
+		return vbool(true), nil
+	}
 	if fn.typ != VFunc && fn.typ != VPrim {
 		return nil, fmt.Errorf("set-macro-character: second argument must be a function")
 	}
@@ -9900,9 +9940,12 @@ func builtinSetMacroCharacter(args []*Value) (*Value, error) {
 	if len(args) >= 4 && isReadtable(args[3]) {
 		rt = args[3].readtable
 	}
+	// Recognize close-paren sentinel: register as terminating macro character
+	// (overrides the non-terminating flag if passed)
+	isCloseParen := (fn == closeParenSentinel)
 	rt.macroFns[ch] = &macroEntry{
 		lispFn:      fn,
-		terminating: !nonTerm,
+		terminating: isCloseParen || !nonTerm,
 	}
 	return vbool(true), nil
 }
@@ -9932,7 +9975,17 @@ func builtinGetMacroCharacter(args []*Value) (*Value, error) {
 	if entry.lispFn != nil {
 		return entry.lispFn, nil
 	}
-	return vnil(), nil
+	// Standard macro character with no Lisp-level or Go-level function.
+	// For close-paren ')', return the sentinel so set-macro-character can
+	// recognize it and register the target character as close-paren equivalent.
+	if ch == ')' {
+		return closeParenSentinel, nil
+	}
+	// For other standard macro chars, return a wrapper that signals an error
+	// when called as a reader macro (since the real handling is in the lexer).
+	return &Value{typ: VPrim, fn: func(args []*Value) (*Value, error) {
+		return nil, fmt.Errorf("standard macro character %q cannot be invoked as a reader macro function", string(ch))
+	}}, nil
 }
 
 func builtinMakeDispatchMacroCharacter(args []*Value) (*Value, error) {
