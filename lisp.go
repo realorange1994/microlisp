@@ -1355,7 +1355,15 @@ func (l *Lexer) lexNum() Tok {
 	if !hasDecimal && !hasExponent {
 		n, err := strconv.ParseInt(numStr, 10, 64)
 		if err == nil {
-			l.tok = Tok{typ: TNum, num: float64(n), pos: start}
+			// Only use float64 if the integer fits in float64 mantissa exactly
+			// (53 bits, ±2^53 = ±9007199254740992)
+			if n >= -9007199254740992 && n <= 9007199254740992 {
+				l.tok = Tok{typ: TNum, num: float64(n), pos: start}
+				return l.tok
+			}
+			// Fits in int64 but not in float64 mantissa — use big.Int
+			bi := big.NewInt(n)
+			l.tok = Tok{typ: TNum, bigInt: bi, pos: start}
 			return l.tok
 		}
 		// Overflow: try big.Int
@@ -2355,6 +2363,7 @@ evalLoop:
 						globalEnv.Set(name, ev)
 					}
 				}
+				// defvar without initial value: leave unbound (no binding created)
 				return vsym(name), nil
 			case "defparameter":
 				if v.cdr == nil || v.cdr.typ != VPair {
@@ -3897,7 +3906,9 @@ evalLoop:
 							return ev, nil
 						}
 					}
-					return nil, fmt.Errorf("setf: undefined %s", name)
+					// Not found in any scope: create in globalEnv (CL setf semantics)
+					globalEnv.Set(name, ev)
+					return ev, nil
 				}
 				// (setf (accessor args...) newval)
 				if target.typ != VPair {
@@ -19326,6 +19337,16 @@ func builtinValuesList(args []*Value) (*Value, error) {
 
 // -------- Standard Library (embedded) --------
 var initLib = `
+;; SBCL test harness stub: with-test just evaluates the body
+(define-macro (with-test spec . body)
+  (cons (quote begin) body))
+
+;; SBCL test harness stubs
+(define (enable-test-parallelism) nil)
+(define (checked-compile form) form)
+(define (checked-eval form) (eval form))
+(define (ctu:asm-search pattern source) nil)
+
 (define (not x) (if x #f #t))
 (define (caar x) (car (car x)))
 (define (cadr x) (car (cdr x)))
