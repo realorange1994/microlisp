@@ -61,4 +61,14 @@
 22. `make-sequence` 不接受 `:initial-element` 关键字
 23. `subseq` 对字符串返回 nil 而非子字符串
 24. `nreverse` 对列表原地修改但返回错误结果
-20. `defmacro` 的 `&optional`/`&key`/`&aux` 参数默认值未求值（参数名被提取，但无参数时使用 nil 而非默认值）
+25. `defmacro` 的 `&optional`/`&key`/`&aux` 参数默认值未求值（参数名被提取，但无参数时使用 nil 而非默认值）
+26. `copy-seq` 在向量上调用 Lisp 定义覆盖了 Go 内置函数
+27. `assoc` 找不到时返回 `#f` 而非 `nil`
+28. `loop` 的 `for x on ...` 无限循环
+29. `loop` 的 `with x = value` 子句解析错误
+30. `mapcon` 返回错误结果
+31. `typep` 缺少 `'vector` 类型检查
+32. `typep` 缺少 `'atom` 类型检查
+33. `subtypep` 返回 list 而非 VMultiVal（导致 `not` 接收整个列表）
+34. 浮点数指数标记（d/D/f/F/s/S/l/L）不被 `parseFloatStr` 支持
+35. `ignore-errors` 出错时返回 `(nil . condition)` 而非 `nil`
