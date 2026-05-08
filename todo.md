@@ -53,3 +53,4 @@
 14. EQL specializer 分发完全失效（methodApplicable 只检查 VInstance，specializer 被静默丢弃）
 15. `export` 不接受符号列表（只支持单个符号）
 16. 缺少 `CL-USER` 包（USER 包未设置 CL-USER 昵称）
+17. `export` 不接受字符串参数（`defpackage` 的 `:export` 选项传递字符串时会失败）

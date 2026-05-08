@@ -9816,26 +9816,36 @@ func builtinExport(args []*Value) (*Value, error) {
 			pkg = pkg2
 		}
 	}
-	// CL spec: first arg can be a symbol or a list of symbols
+	// CL spec: first arg can be a symbol, string, or list of symbols/strings
 	var syms []*Value
 	first := primaryValue(args[0])
 	if first.typ == VPair {
 		syms = toSlice(first)
-	} else if first.typ == VSym {
-		syms = []*Value{first}
 	} else {
-		return nil, fmt.Errorf("export: need symbol or list of symbols, got %v", first.typ)
+		syms = []*Value{first}
 	}
 	var lastSym *Value
 	for _, s := range syms {
 		sym := primaryValue(s)
-		if sym.typ != VSym {
-			return nil, fmt.Errorf("export: need symbol, got %v", sym.typ)
-		}
-		symName := sym.str
-		// Strip keyword prefix
-		if isKeyword(symName) {
-			symName = keywordName(symName)
+		var symName string
+		if sym.typ == VSym {
+			symName = sym.str
+			// Strip keyword prefix
+			if isKeyword(symName) {
+				symName = keywordName(symName)
+			}
+		} else if sym.typ == VStr {
+			// CL spec: strings are interned as symbols in the package
+			symName = sym.str
+			// Intern the string as a symbol in the package
+			if existing, ok := pkg.symbols[symName]; ok {
+				sym = existing
+			} else {
+				sym = internSymbol(symName, pkg)
+				pkg.symbols[symName] = sym
+			}
+		} else {
+			return nil, fmt.Errorf("export: need symbol or string, got %v", sym.typ)
 		}
 		pkg.exports[symName] = true
 		// Also intern the symbol in the package
