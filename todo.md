@@ -54,3 +54,5 @@
 15. `export` 不接受符号列表（只支持单个符号）
 16. 缺少 `CL-USER` 包（USER 包未设置 CL-USER 昵称）
 17. `export` 不接受字符串参数（`defpackage` 的 `:export` 选项传递字符串时会失败）
+18. `cl:NAME` 包限定符号无法解析（CL 包没有导出符号）
+19. `nil` 类型说明符被错误当作 `null`（ANSI CL 中 nil 是空类型，null 才匹配 nil）
