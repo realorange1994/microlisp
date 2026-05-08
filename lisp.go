@@ -7499,6 +7499,7 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 		return fmt.Errorf("destructuring-bind: invalid pattern")
 	}
 	// List pattern: bind each element
+	// Handle lambda-list keywords: &rest, &optional, &key
 	vp := pattern
 	vv := val
 	localSeen := make(map[*Value]bool)
@@ -7507,19 +7508,85 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 			return fmt.Errorf("destructuring-bind: circular pattern")
 		}
 		localSeen[vp] = true
-		// Check for dotted pair (rest parameter)
-		if vp.typ == VSym {
+		// Check for dotted pair (rest parameter) - must come before &rest handling
+		if !isNil(vp) && vp.typ == VSym {
+			// Dotted pair: (a b . rest)
 			env.Set(vp.str, vv)
 			return nil
 		}
-		if isNil(vv) {
-			// Not enough values — bind remaining to nil
-			if vp.typ != VPair || vp.car == nil || vp.car.typ != VSym {
-				return fmt.Errorf("destructuring: malformed var pattern")
+		if vp.typ != VPair {
+			break
+		}
+		head := vp.car
+		// Skip &rest, &optional, &key keywords and handle them specially
+		if head != nil && head.typ == VSym {
+			symName := head.str
+			if symName == "&rest" || symName == "&body" {
+				// &rest var: bind var to the remaining value list
+				restVar := vp.cdr
+				if restVar == nil || restVar.typ != VPair || restVar.car == nil || restVar.car.typ != VSym {
+					return fmt.Errorf("destructuring-bind: malformed &rest pattern")
+				}
+				env.Set(restVar.car.str, vv)
+				return nil
 			}
-			env.Set(vp.car.str, vnil())
+			if symName == "&optional" || symName == "&key" {
+				// Process &optional/&key vars: bind from remaining values
+				vp = vp.cdr
+				for !isNil(vp) {
+					if vp.typ != VPair {
+						break
+					}
+					elem := vp.car
+					if elem == nil || elem.typ == VNil {
+						// nil element, skip
+					} else if elem.typ == VSym {
+						// Simple optional var: bind to value or nil
+						if !isNil(vv) {
+							env.Set(elem.str, vv.car)
+							if !isNil(vv) {
+								vv = vv.cdr
+							}
+						} else {
+							env.Set(elem.str, vnil())
+						}
+					} else if elem.typ == VPair {
+						// (var default-value) or (var)
+						varName := elem.car
+						if varName != nil && varName.typ == VSym {
+							if !isNil(vv) {
+								env.Set(varName.str, vv.car)
+								if !isNil(vv) {
+									vv = vv.cdr
+								}
+							} else {
+								// Use default value if provided, else nil
+								if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
+									// Can't eval default in Go - bind to nil as fallback
+									// The macro-based implementation handles this properly
+									env.Set(varName.str, vnil())
+								} else {
+									env.Set(varName.str, vnil())
+								}
+							}
+						}
+					} else {
+						// Non-symbol/non-list element (e.g., number literal in default),
+						// not a valid pattern variable - skip
+					}
+					vp = vp.cdr
+				}
+				return nil
+			}
+		}
+		if isNil(vv) {
+			// Not enough values — bind variable to nil
+			if head == nil || head.typ != VSym {
+				return fmt.Errorf("destructuring-bind: malformed var pattern")
+			}
+			env.Set(head.str, vnil())
 		} else {
-			if err := bindPatternRec(vp.car, vv.car, env, seen); err != nil {
+			if err := bindPatternRec(head, vv.car, env, seen); err != nil {
 				return err
 			}
 		}
@@ -7529,7 +7596,9 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 			env.Set(vp.str, vv.cdr)
 			return nil
 		}
-		vv = vv.cdr
+		if !isNil(vv) {
+			vv = vv.cdr
+		}
 	}
 	return nil
 }
