@@ -1,0 +1,20603 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"io"
+	"math"
+	"math/big"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode"
+	"unicode/utf8"
+	"unsafe"
+)
+
+// -------- Types --------
+type ValType int
+
+const (
+	VNil ValType = iota
+	VNum
+	VRat
+	VComplex
+	VStr
+	VSym
+	VBool
+	VPair
+	VPrim
+	VFunc
+	VMacro
+	VSymMacro
+	VClass
+	VGeneric
+	VInstance
+	VVHash
+	VThread
+	VLock
+	VCondition
+	VChar
+	VStream
+	VMultiVal
+	VArray
+	VBigInt
+	VPathname
+	VPackage
+	VReadtable
+	VRandomState
+)
+
+// LispStream represents an I/O stream
+type LispStream struct {
+	file      *os.File
+	reader    *bufio.Reader
+	writer    *bufio.Writer
+	isFile    bool
+	isInput   bool
+	isOutput  bool
+	isClosed  bool
+	isString  bool
+	strBuf    *bytes.Buffer
+	strReader *strings.Reader
+	path      string
+	// Composite stream types
+	isSynonym        bool
+	synSym           string // symbol name to resolve for synonym-stream
+	isBroadcast      bool
+	broadcastTargets []*Value // list of streams to broadcast to
+	isConcatenated   bool
+	concatStreams    []*Value // ordered list of input streams
+	concatIndex      int      // current stream index
+	isTwoWay         bool
+	twoWayInput      *Value // input stream
+	twoWayOutput     *Value // output stream
+	// Peek/unread support
+	peekedChar rune   // cached peeked character
+	hasPeeked  bool   // whether peekedChar is valid
+	unreadBuf  []rune // stack of characters pushed back by unread-char
+}
+
+// LispPathname represents a Common Lisp pathname
+type LispPathname struct {
+	host      string // host (e.g., "localhost", or "" for unspecified)
+	device    string // device (empty for Unix-style)
+	directory *Value // list like (:absolute "usr" "local") or nil
+	name      string // file name
+	ftype     string // type/extension
+	version   string // "newest", "", or version number
+}
+
+// LispArray represents a multi-dimensional array
+type LispArray struct {
+	dims       []int    // dimensions
+	elements   []*Value // flat storage (row-major)
+	fillPtr    int      // fill-pointer for vectors (-1 if no fill-pointer)
+	adjustable bool     // whether array is adjustable
+	displaced  *Value   // displaced-to array, or nil
+}
+
+type Value struct {
+	typ    ValType
+	mark   byte
+	gen    int
+	num    float64
+	ch     rune
+	irat   int64
+	iden   int64
+	imag   float64
+	str    string
+	name   string // function name for trace
+	car    *Value
+	cdr    *Value
+	params []string
+	rest   string
+	whole  string // &whole binding
+	body   *Value
+	env    *Env
+	fn     NativeFunc
+
+	// CLOS fields
+	className    string
+	classSlots   []string
+	classParents []*Value
+	cpl          []*Value
+	genMethods   []genMethod
+	instClass    *Value
+	instSlots    map[string]*Value
+	hashTab      *HashTable
+	stream       *LispStream
+	array        *LispArray
+	bigInt       *big.Int
+	plist        *Value        // symbol property list
+	pathname     *LispPathname // pathname components
+	pkg          *Package      // for VPackage type
+	readtable    *Readtable    // for VReadtable type
+	randState   *rand.Rand   // for VRandomState type
+}
+
+type genMethod struct {
+	qualifier    string
+	params       []string
+	specializers []string
+	body         *Value
+	env          *Env
+	rest         string
+}
+
+type HashTable struct {
+	testFn     *Value
+	hashFn     *Value
+	table      map[uint64][]*hashEntry
+	count      int
+	rehashSize float64
+}
+
+type hashEntry struct {
+	key   *Value
+	value *Value
+}
+
+type NativeFunc func([]*Value) (*Value, error)
+
+type blockReturn struct {
+	name         string
+	value        *Value
+	isLoopFinish bool
+}
+
+func (br *blockReturn) Error() string { return "<block-return>" }
+
+type goTag struct {
+	tag string
+}
+
+func (gt *goTag) Error() string { return "<go-tag>" }
+
+type throwValue struct {
+	tag   string
+	value *Value
+}
+
+func (tv *throwValue) Error() string { return "<throw>" }
+
+// tailCall is used to implement proper tail-call optimization (TCO).
+// Instead of making a recursive Go call in tail position (which would
+// grow the Go stack), we return a tailCall error. The eval loop
+// catches it and continues with the new form/environment.
+type tailCall struct {
+	form *Value
+	env  *Env
+}
+
+func (tc *tailCall) Error() string { return "<tail-call>" }
+
+type Env struct {
+	bindings map[string]*Value
+	parent   *Env
+}
+
+func NewEnv(parent *Env) *Env {
+	return &Env{bindings: make(map[string]*Value), parent: parent}
+}
+
+func (e *Env) Get(s string) (*Value, error) {
+	for scope := e; scope != nil; scope = scope.parent {
+		if v, ok := scope.bindings[s]; ok {
+			return v, nil
+		}
+	}
+	return nil, fmt.Errorf("undefined: %s", s)
+}
+
+func (e *Env) Set(s string, v *Value) { e.bindings[s] = v }
+
+func (e *Env) Extend(s string, v *Value) *Env {
+	child := NewEnv(e)
+	child.bindings[s] = v
+	return child
+}
+
+// Global class registry — separates class namespace from function namespace
+var classRegistry = make(map[string]*Value)
+
+var globalEnv = NewEnv(nil)
+
+// Features for reader conditionals (#+ / #-)
+var lispFeatures map[string]bool
+
+// Modules table for provide/require
+var lispModules map[string]bool
+
+// Threading globals
+var evalMu sync.Mutex
+var nextThreadID int64
+
+type threadResult struct {
+	value *Value
+	err   error
+}
+
+var threadChannels = make(map[int64]chan threadResult)
+var threadChannelsMu sync.Mutex
+
+// Stream globals
+var stdoutStream *Value
+var stdinStream *Value
+
+// Condition system globals
+type handlerEntry struct {
+	typeSymbol string
+	handlerFn  *Value
+	env        *Env
+}
+type restartEntry struct {
+	name      string
+	handlerFn *Value
+	condition *Value
+	env       *Env
+}
+
+var handlerStack []handlerEntry
+var restartStack []restartEntry
+
+// Recursion depth limit to prevent infinite recursion / stack overflow
+const maxEvalDepth = 3000
+
+var evalDepth int
+
+// Loop iteration safety limit
+const maxLoopIterations = 10000000
+
+var loopIterationCount int
+
+type conditionSignal struct {
+	typeSymbol string
+	condition  *Value
+}
+
+func (c *conditionSignal) Error() string { return "<condition>" }
+
+// handledError is used internally by error/signal to carry a handled condition result.
+// restartInvoke is used by invoke-restart to transfer control to restart-case.
+type restartInvoke struct {
+	name string
+	args *Value
+}
+
+func (r *restartInvoke) Error() string { return "restart-invoke" }
+
+type handledError struct {
+	condition *Value
+	result    *Value
+	typeSym   string // the type symbol of the matching handler
+}
+
+func (h *handledError) Error() string { return "handled" }
+
+func initFeatures() {
+	lispFeatures = make(map[string]bool)
+	features := []string{
+		":microlisp", ":common-lisp", ":ansi-cl",
+		":windows", ":x86-64",
+		":threading",
+	}
+	for _, f := range features {
+		lispFeatures[f] = true
+	}
+	// Create *features* Lisp list
+	var featList *Value
+	for i := len(features) - 1; i >= 0; i-- {
+		featList = cons(vsym(features[i]), featList)
+	}
+	if featList == nil {
+		featList = vnil()
+	}
+	globalEnv.Set("*features*", featList)
+}
+
+// featureSatisfied checks a feature spec against lispFeatures
+func featureSatisfied(spec *Value) bool {
+	return featureSatisfiedEnv(spec, globalEnv, make(map[*Value]bool))
+}
+
+func featureSatisfiedEnv(spec *Value, env *Env, seen map[*Value]bool) bool {
+	if spec.typ == VSym && len(spec.str) > 0 && spec.str[0] == ':' {
+		return lispFeatures[spec.str]
+	}
+	if spec.typ == VSym {
+		return lispFeatures[":"+spec.str] || lispFeatures[spec.str]
+	}
+	if spec.typ == VPair {
+		if seen[spec] {
+			return false
+		}
+		seen[spec] = true
+		// Compound feature spec: (and ...), (or ...), (not feature)
+		car := spec.car
+		if car.typ == VSym {
+			switch car.str {
+			case "and":
+				args := spec.cdr
+				seenArgs := make(map[*Value]bool)
+				for !isNil(args) {
+					if seenArgs[args] {
+						break
+					}
+					seenArgs[args] = true
+					if !featureSatisfiedEnv(args.car, env, seen) {
+						return false
+					}
+					args = args.cdr
+				}
+				return true
+			case "or":
+				args := spec.cdr
+				seenOrArgs := make(map[*Value]bool)
+				for !isNil(args) {
+					if seenOrArgs[args] {
+						break
+					}
+					seenOrArgs[args] = true
+					if featureSatisfiedEnv(args.car, env, seen) {
+						return true
+					}
+					args = args.cdr
+				}
+				return false
+			case "not":
+				if !isNil(spec.cdr) {
+					return !featureSatisfiedEnv(spec.cdr.car, env, seen)
+				}
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func initStdStreams() {
+	stdoutStream = newFileStream(os.Stdout, false, true, "")
+	stdinStream = newFileStream(os.Stdin, true, false, "")
+}
+
+func initGlobalEnv() {
+	initFeatures()
+	initStdStreams()
+	lispModules = make(map[string]bool)
+	initPackages()
+	// Initialize standard readtable BEFORE evalString(initLib) so that
+	// the lexer has a valid readtable during initLib evaluation.
+	initStandardReadtable()
+	globalEnv.Set("nil", &Value{typ: VNil})
+	globalEnv.Set("#t", &Value{typ: VBool})
+	globalEnv.Set("#f", &Value{typ: VBool})
+	// Make 't' also evaluate to #t (CL compatibility: both 't' and '#t' are canonical true)
+	tSym := &Value{typ: VSym, str: "t"}
+	symbolTable["t"] = tSym
+	globalEnv.Set("t", globalEnv.bindings["#t"])
+	for _, b := range builtins {
+		globalEnv.Set(b.name, &Value{typ: VPrim, fn: b.fn})
+	}
+	globalEnv.Set("*modules*", vnil())
+	// *package* is set by initPackages via makePackage
+	globalEnv.Set("*debugger-hook*", vnil())
+	globalEnv.Set("*step*", vnil())
+	globalEnv.Set("*break-on-signals*", vnil())
+	globalEnv.Set("*print-circle*", vbool(false))
+	globalEnv.Set("*print-case*", vsym(":UPCASE"))
+	globalEnv.Set("*print-escape*", vbool(true))
+	globalEnv.Set("*print-length*", vnil())
+	globalEnv.Set("*print-level*", vnil())
+	globalEnv.Set("*print-pretty*", vbool(false))
+	if initLib != "" {
+		_, err := evalString(initLib, globalEnv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "initLib error: %v\n", err)
+		}
+	}
+	// Sync CL package with USER package (after all builtins/initLib are registered)
+	syncCLPackage()
+	// Set *readtable* variable (readtable is already initialized above)
+	globalEnv.Set("*readtable*", vrt(standardReadtable))
+}
+
+// -------- GC --------
+var allValues []*Value
+var minorCount int
+
+const youngThreshold = 20000
+const majorEvery = 5
+
+func gcv() *Value {
+	v := &Value{}
+	allValues = append(allValues, v)
+	if len(allValues) >= youngThreshold {
+		gcollect()
+	}
+	return v
+}
+
+func gcollect() {
+	minorCount++
+	doMajor := minorCount%majorEvery == 0
+	markRoots()
+	n := 0
+	for _, v := range allValues {
+		if v.mark != 0 {
+			v.mark = 0
+			if v.gen < 3 {
+				v.gen++
+			}
+			allValues[n] = v
+			n++
+		} else if !doMajor && v.gen > 0 {
+			allValues[n] = v
+			n++
+		}
+	}
+	allValues = allValues[:n]
+}
+
+func markRoots() {
+	markEnv(globalEnv)
+	for _, sym := range symbolTable {
+		markVal(sym)
+	}
+}
+
+func markVal(v *Value) {
+	if v == nil || v.mark != 0 {
+		return
+	}
+	v.mark = 1
+	switch v.typ {
+	case VPair:
+		markVal(v.car)
+		markVal(v.cdr)
+	case VFunc, VMacro:
+		markVal(v.body)
+		if v.env != nil {
+			markEnv(v.env)
+		}
+	case VClass:
+		for _, p := range v.classParents {
+			markVal(p)
+		}
+		for _, c := range v.cpl {
+			markVal(c)
+		}
+	case VGeneric:
+		for _, m := range v.genMethods {
+			markVal(m.body)
+			if m.env != nil {
+				markEnv(m.env)
+			}
+		}
+	case VInstance:
+		markVal(v.instClass)
+		for _, sv := range v.instSlots {
+			markVal(sv)
+		}
+	case VVHash:
+		if v.hashTab != nil {
+			for _, bucket := range v.hashTab.table {
+				for _, entry := range bucket {
+					markVal(entry.key)
+					markVal(entry.value)
+				}
+			}
+		}
+	case VArray:
+		if v.array != nil {
+			for _, elem := range v.array.elements {
+				markVal(elem)
+			}
+		}
+	}
+}
+
+func markEnv(e *Env) {
+	for s := e; s != nil; s = s.parent {
+		for _, v := range s.bindings {
+			markVal(v)
+		}
+	}
+}
+
+// -------- Value helpers --------
+var symbolTable = make(map[string]*Value)
+
+// -------- Package System --------
+type Package struct {
+	name          string
+	symbols       map[string]*Value
+	exports       map[string]bool
+	used          []*Package
+	nicknames     []string
+	shadowingImps []string // symbols imported via shadowing-import
+}
+
+var packages = map[string]*Package{}
+
+// -------- Readtable --------
+
+// macroEntry stores a macro character function in the readtable.
+// Either goFn or lispFn should be set, not both.
+type macroEntry struct {
+	goFn        func(*Parser, rune) (*Value, error) // Go-level macro function
+	lispFn      *Value                              // Lisp-level VFunc
+	terminating bool                                // true = terminating macro char
+}
+
+// Readtable controls how the reader parses input.
+type Readtable struct {
+	macroFns map[rune]*macroEntry // character → macro function
+	dispFns  map[rune]*macroEntry // # dispatch: sub-character → function
+	caseMode string               // :UPCASE, :DOWNCASE, :PRESERVE, :INVERT
+}
+
+var standardReadtable *Readtable
+var currentReadtable *Readtable
+
+func initStandardReadtable() {
+	standardReadtable = &Readtable{
+		macroFns: make(map[rune]*macroEntry),
+		dispFns:  make(map[rune]*macroEntry),
+		caseMode: ":UPCASE",
+	}
+	currentReadtable = standardReadtable
+
+	// Register standard macro characters with nil lispFn (Go-level handling).
+	// These are handled by the lexer/parser, but registered for introspection.
+	registerGoMacro := func(ch rune, term bool) {
+		standardReadtable.macroFns[ch] = &macroEntry{
+			goFn:        nil,
+			terminating: term,
+		}
+	}
+
+	// Standard terminating macro characters
+	registerGoMacro('(', true)
+	registerGoMacro(')', true)
+	registerGoMacro('"', true)
+	registerGoMacro(';', true)
+
+	// Standard non-terminating macro characters
+	registerGoMacro('\'', false)
+	registerGoMacro('`', false)
+	registerGoMacro(',', false)
+	registerGoMacro('#', false)
+
+	// Initialize dispatch table
+	standardReadtable.dispFns = make(map[rune]*macroEntry)
+	// Note: actual dispatch handling is done in the parser's dispatch reader.
+	// Dispatch entries are nil by default (handled by hardcoded parser logic).
+	// They can be overridden with set-dispatch-macro-character.
+}
+
+func findPackage(name string) *Package {
+	up := strings.ToUpper(name)
+	for _, p := range packages {
+		if p.name == up {
+			return p
+		}
+		for _, n := range p.nicknames {
+			if strings.ToUpper(n) == up {
+				return p
+			}
+		}
+	}
+	return nil
+}
+
+func makePackage(name string) *Package {
+	if p := findPackage(name); p != nil {
+		return p
+	}
+	p := &Package{
+		name:    strings.ToUpper(name),
+		symbols: make(map[string]*Value),
+		exports: make(map[string]bool),
+	}
+	packages[p.name] = p
+	// Set current package
+	currentPackage = p
+	// Update *package* special variable
+	globalEnv.Set("*package*", vpkg(p))
+	return p
+}
+
+var currentPackage *Package
+
+func initPackages() {
+	// Create KEYWORD package
+	makePackage("KEYWORD")
+	// Create initial user package
+	makePackage("USER")
+	// Create CL package (will be synced with USER after initLib)
+	makePackage("CL")
+}
+
+// syncCLPackage copies all symbols from USER to CL so (defpackage ... (:use :cl)) works
+func syncCLPackage() {
+	userPkg := findPackage("USER")
+	clPkg := findPackage("CL")
+	if userPkg == nil || clPkg == nil {
+		return
+	}
+	for name, sym := range userPkg.symbols {
+		clPkg.symbols[name] = sym
+	}
+	for name, exported := range userPkg.exports {
+		if exported {
+			clPkg.exports[name] = true
+		}
+	}
+}
+
+// internSymbol interns a symbol name in a package, returning the symbol
+func internSymbol(name string, pkg *Package) *Value {
+	sym := vsym(name)
+	pkg.symbols[name] = sym
+	return sym
+}
+
+// isKeyword checks if a symbol name represents a keyword
+func isKeyword(name string) bool {
+	return len(name) > 0 && name[0] == ':'
+}
+
+// keywordName strips the leading colon from a keyword
+func keywordName(name string) string {
+	if len(name) > 0 && name[0] == ':' {
+		return name[1:]
+	}
+	return name
+}
+
+// mkKeyword creates a keyword symbol from a mode string like ":UPCASE"
+func mkKeyword(modeStr string) *Value {
+	if len(modeStr) > 0 && modeStr[0] != ':' {
+		return vsym(":" + modeStr)
+	}
+	return vsym(modeStr)
+}
+
+// resolvePackageSymbol splits "pkg:sym" or "pkg::sym" and resolves the symbol
+func resolvePackageSymbol(s string) *Value {
+	if strings.Contains(s, "::") {
+		parts := strings.SplitN(s, "::", 2)
+		pkg := findPackage(parts[0])
+		if pkg == nil {
+			return nil
+		}
+		symName := parts[1]
+		if sym, ok := pkg.symbols[symName]; ok {
+			return sym
+		}
+		// Intern if not found (internal access creates)
+		return internSymbol(symName, pkg)
+	}
+	if strings.Contains(s, ":") {
+		parts := strings.SplitN(s, ":", 2)
+		pkg := findPackage(parts[0])
+		if pkg == nil {
+			return nil
+		}
+		symName := parts[1]
+		if sym, ok := pkg.symbols[symName]; ok && pkg.exports[symName] {
+			return sym
+		}
+		return nil // not found or not exported
+	}
+	return nil
+}
+
+// resolvePackageFromDesignator converts a package designator (string, symbol, or VPackage) to a *Package.
+func resolvePackageFromDesignator(v *Value) *Package {
+	if v == nil || isNil(v) {
+		return currentPackage
+	}
+	if v.typ == VPackage {
+		return v.pkg
+	}
+	if v.typ == VStr {
+		return findPackage(v.str)
+	}
+	if v.typ == VSym {
+		name := v.str
+		if isKeyword(name) {
+			name = keywordName(name)
+		}
+		return findPackage(name)
+	}
+	return nil
+}
+
+// internOrVsym creates a symbol, properly interning it into the current package.
+// This should be used by the reader instead of bare vsym().
+func internOrVsym(name string) *Value {
+	// Handle qualified symbols: pkg:sym or pkg::sym
+	if resolved := resolvePackageSymbol(name); resolved != nil {
+		return resolved
+	}
+	// Handle keywords: auto-intern into KEYWORD package
+	if isKeyword(name) {
+		kPkg := findPackage("KEYWORD")
+		if kPkg != nil {
+			if sym, ok := kPkg.symbols[name]; ok {
+				return sym
+			}
+			// Create a fresh keyword symbol with the ":" prefix in its name.
+			// This ensures it won't conflict with regular symbols in symbolTable.
+			sym := gcv()
+			sym.typ = VSym
+			sym.str = name // keep ":" prefix
+			kPkg.symbols[name] = sym
+			return sym
+		}
+	}
+	// Intern in current package
+	cp := currentPackage
+	if cp != nil {
+		if sym, ok := cp.symbols[name]; ok {
+			return sym
+		}
+		return internSymbol(name, cp)
+	}
+	// Fallback: create uninterned symbol
+	return vsym(name)
+}
+
+func vnum(f float64) *Value { v := gcv(); v.typ = VNum; v.num = f; return v }
+func vrat(n, d int64) *Value {
+	if d == 0 {
+		return nil
+	}
+	if d < 0 {
+		n = -n
+		d = -d
+	}
+	g := gcd(n, d)
+	if g < 0 {
+		g = -g
+	}
+	n /= g
+	d /= g
+	if d == 1 {
+		return vnum(float64(n))
+	}
+	v := gcv()
+	v.typ = VRat
+	v.irat = n
+	v.iden = d
+	return v
+}
+func vcomplex(r, i float64) *Value {
+	if i == 0 {
+		return vnum(r)
+	}
+	v := gcv()
+	v.typ = VComplex
+	v.num = r
+	v.imag = i
+	return v
+}
+func gcd(a, b int64) int64 {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+// parseFloatStr parses a string as a float64, handling integers, floats, and rationals (e.g. "1/2")
+func parseFloatStr(s string) (float64, error) {
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return f, nil
+	}
+	// Try rational like "1/2"
+	if idx := strings.IndexByte(s, '/'); idx > 0 {
+		num, err1 := strconv.ParseFloat(s[:idx], 64)
+		den, err2 := strconv.ParseFloat(s[idx+1:], 64)
+		if err1 == nil && err2 == nil && den != 0 {
+			return num / den, nil
+		}
+	}
+	return 0, fmt.Errorf("not a number: %s", s)
+}
+
+func vbigint(i *big.Int) *Value {
+	// Only auto-downgrade to float64 if value fits in float64 mantissa exactly.
+	// float64 has 53 bits of mantissa precision, so only ±2^53 are exact.
+	if i.IsInt64() {
+		n := i.Int64()
+		if n >= -9007199254740992 && n <= 9007199254740992 {
+			return vnum(float64(n))
+		}
+	}
+	v := gcv()
+	v.typ = VBigInt
+	v.bigInt = new(big.Int).Set(i)
+	return v
+}
+func vstr(s string) *Value { v := gcv(); v.typ = VStr; v.str = s; return v }
+func vsym(s string) *Value {
+	if sym, ok := symbolTable[s]; ok {
+		return sym
+	}
+	v := gcv()
+	v.typ = VSym
+	v.str = s
+	symbolTable[s] = v
+	return v
+}
+func vbool(b bool) *Value {
+	if b {
+		return globalEnv.bindings["#t"]
+	}
+	return globalEnv.bindings["#f"]
+}
+func vchar(ch rune) *Value    { v := gcv(); v.typ = VChar; v.ch = ch; return v }
+func vnil() *Value            { return globalEnv.bindings["nil"] }
+func cons(a, b *Value) *Value { v := gcv(); v.typ = VPair; v.car = a; v.cdr = b; return v }
+
+func isNil(v *Value) bool { return v == nil || v.typ == VNil }
+
+// primaryValue extracts the primary value from a potentially multi-valued result.
+func primaryValue(v *Value) *Value {
+	if v != nil && v.typ == VMultiVal && v.car != nil {
+		return v.car
+	}
+	return v
+}
+
+// multiVal creates a VMultiVal with the given values.
+func multiVal(vals ...*Value) *Value {
+	if len(vals) == 0 {
+		v := gcv()
+		v.typ = VMultiVal
+		v.car = vnil()
+		v.cdr = vnil()
+		return v
+	}
+	v := gcv()
+	v.typ = VMultiVal
+	v.car = vals[0]
+	v.cdr = list(vals[1:]...)
+	return v
+}
+
+// multiValList extracts the list of values from a multi-valued result.
+func multiValList(v *Value) *Value {
+	if v != nil && v.typ == VMultiVal {
+		return cons(v.car, v.cdr) // primary value + secondary values as full list
+	}
+	if isNil(v) {
+		return vnil()
+	}
+	// It's already a proper list (VPair) - return as-is for floor/ceiling/etc. results
+	return v
+}
+func isPair(v *Value) bool { return v != nil && v.typ == VPair }
+
+// pairCar returns v.car if v is a VPair, nil otherwise.
+func pairCar(v *Value) *Value {
+	if v == nil || v.typ != VPair {
+		return nil
+	}
+	return v.car
+}
+
+// pairCdr returns v.cdr if v is a VPair, nil otherwise.
+func pairCdr(v *Value) *Value {
+	if v == nil || v.typ != VPair {
+		return nil
+	}
+	return v.cdr
+}
+
+func isTruthy(v *Value) bool {
+	if v == nil {
+		return false
+	}
+	return (v.typ != VBool || v == globalEnv.bindings["#t"]) && v.typ != VNil
+}
+
+func list(vv ...*Value) *Value {
+	var r *Value = vnil()
+	for i := len(vv) - 1; i >= 0; i-- {
+		r = cons(vv[i], r)
+	}
+	return r
+}
+
+func listFromSlice(vv []*Value) *Value {
+	var r *Value = vnil()
+	for i := len(vv) - 1; i >= 0; i-- {
+		r = cons(vv[i], r)
+	}
+	return r
+}
+
+func toSlice(v *Value) []*Value {
+	var r []*Value
+	seen := make(map[*Value]bool)
+	for !isNil(v) && v.typ == VPair {
+		if seen[v] {
+			break // circular list detected
+		}
+		seen[v] = true
+		r = append(r, v.car)
+		v = v.cdr
+	}
+	return r
+}
+
+func length(v *Value) int {
+	n := 0
+	seen := make(map[*Value]bool)
+	for !isNil(v) && v.typ == VPair {
+		if seen[v] {
+			break // circular list
+		}
+		seen[v] = true
+		n++
+		v = v.cdr
+	}
+	return n
+}
+
+// -------- Lexer --------
+type TokType int
+
+const (
+	TErr TokType = iota
+	TLParen
+	TRParen
+	TDot
+	TQuote
+	TQq
+	TUnq
+	TUnqS
+	TNum
+	TStr
+	TSym
+	TTrue
+	TFalse
+	TChar
+	TEOF
+	TFuncQuote
+	TPathname
+	TComplex
+	TMacro // readtable macro character
+)
+
+type Tok struct {
+	typ    TokType
+	lit    string
+	num    float64
+	irat   int64   // rational numerator
+	iden   int64   // rational denominator (0 = not rational)
+	imag   float64 // complex imaginary part
+	ch     rune
+	pos    int
+	bigInt *big.Int
+}
+
+type Lexer struct {
+	src []rune
+	pos int
+	tok Tok
+	err error
+}
+
+func lex(s string) *Lexer { return &Lexer{src: []rune(s)} }
+
+func (l *Lexer) next() Tok {
+	l.skipWS()
+	if l.pos >= len(l.src) {
+		l.tok = Tok{typ: TEOF}
+		return l.tok
+	}
+	p := l.pos
+	ch := l.src[l.pos]
+	l.pos++
+	switch ch {
+	case '(':
+		l.tok = Tok{typ: TLParen, pos: p}
+	case ')':
+		l.tok = Tok{typ: TRParen, pos: p}
+	case '.':
+		l.tok = Tok{typ: TDot, pos: p}
+	case '\'':
+		l.tok = Tok{typ: TQuote, pos: p}
+	case '`':
+		l.tok = Tok{typ: TQq, pos: p}
+	case ',':
+		if l.pos < len(l.src) && l.src[l.pos] == '@' {
+			l.pos++
+			l.tok = Tok{typ: TUnqS, pos: p}
+		} else {
+			l.tok = Tok{typ: TUnq, pos: p}
+		}
+	case '"':
+		return l.lexStr()
+	case ';':
+		for l.pos < len(l.src) && l.src[l.pos] != '\n' {
+			l.pos++
+		}
+		return l.next()
+	case '#':
+		// #|...|# block comment — skip until closing |#
+		if l.pos < len(l.src) && l.src[l.pos] == '|' {
+			l.pos++ // skip |
+			for l.pos+1 < len(l.src) {
+				if l.src[l.pos] == '|' && l.src[l.pos+1] == '#' {
+					l.pos += 2 // skip |#
+					return l.next()
+				}
+				l.pos++
+			}
+			// Unterminated block comment — return next token to signal EOF
+			return l.tok
+		}
+		if l.pos < len(l.src) && l.src[l.pos] == '\\' {
+			return l.lexChar(p)
+		}
+		if l.pos < len(l.src) && l.src[l.pos] == '\x27' {
+			// #' is function shorthand: #'name -> (function name)
+			l.pos++ // skip quote
+			l.tok = Tok{typ: TFuncQuote, pos: p}
+			return l.tok
+		}
+		if l.pos < len(l.src) && (l.src[l.pos] == 'C' || l.src[l.pos] == 'c') {
+			// #C(real imag) is complex number literal - let parser handle it
+			l.pos++ // skip C
+			if l.pos < len(l.src) && l.src[l.pos] == '(' {
+				l.pos++ // skip (
+				depth := 1
+				start := l.pos
+				for l.pos < len(l.src) && depth > 0 {
+					if l.src[l.pos] == '(' {
+						depth++
+					} else if l.src[l.pos] == ')' {
+						depth--
+					}
+					l.pos++
+				}
+				inner := strings.TrimSpace(string(l.src[start : l.pos-1]))
+				l.tok = Tok{typ: TComplex, lit: inner, pos: p}
+				return l.tok
+			}
+			// #C not followed by (, treat as symbol
+			return l.lexSym()
+		}
+		if l.pos < len(l.src) && (l.src[l.pos] == 'P' || l.src[l.pos] == 'p') {
+			// #P"..." is pathname syntax
+			l.pos++ // skip P
+			if l.pos < len(l.src) && l.src[l.pos] == '"' {
+				l.pos++ // skip opening "
+				var b strings.Builder
+				for l.pos < len(l.src) {
+					ch2 := l.src[l.pos]
+					l.pos++
+					if ch2 == '"' {
+						l.tok = Tok{typ: TPathname, lit: b.String(), pos: p}
+						return l.tok
+					}
+					if ch2 == '\\' && l.pos < len(l.src) {
+						switch l.src[l.pos] {
+						case 'n':
+							b.WriteByte('\n')
+						case 't':
+							b.WriteByte('\t')
+						case '"':
+							b.WriteByte('"')
+						case '\\':
+							b.WriteByte('\\')
+						default:
+							b.WriteByte(byte(l.src[l.pos]))
+						}
+						l.pos++
+						continue
+					}
+					b.WriteRune(ch2)
+				}
+				// Unterminated string
+				l.tok = Tok{typ: TPathname, lit: b.String(), pos: p}
+				return l.tok
+			}
+			// Not followed by string, treat #P as symbol
+			return l.lexSym()
+		}
+		// Not #\, fall through to symbol/number handling
+		return l.lexSym()
+	default:
+		// Check if this character is a readtable macro character with a Lisp-level function
+		if currentReadtable != nil {
+			if entry, ok := currentReadtable.macroFns[rune(ch)]; ok && entry != nil && entry.lispFn != nil {
+				l.tok = Tok{typ: TMacro, ch: rune(ch), pos: p}
+				return l.tok
+			}
+		}
+		if unicode.IsDigit(ch) {
+			// Check if this is a symbol like 1+ or 1- (CL arithmetic functions)
+			if l.pos < len(l.src) && (l.src[l.pos] == '+' || l.src[l.pos] == '-') {
+				// Peek ahead: if the char after +/- is a delimiter or EOF, it's a symbol
+				nextPos := l.pos + 1
+				if nextPos >= len(l.src) || l.src[nextPos] == ' ' || l.src[nextPos] == '\t' || l.src[nextPos] == ')' || l.src[nextPos] == '(' || l.src[nextPos] == '\n' || l.src[nextPos] == '\r' {
+					return l.lexSymFrom(p)
+				}
+			}
+			return l.lexNum()
+		}
+		if (ch == '-' || ch == '+') && l.pos < len(l.src) && unicode.IsDigit(l.src[l.pos]) {
+			return l.lexNum()
+		}
+		return l.lexSym()
+	}
+	return l.tok
+}
+
+func (l *Lexer) skipWS() {
+	for l.pos < len(l.src) && (l.src[l.pos] == ' ' || l.src[l.pos] == '\t' || l.src[l.pos] == '\n' || l.src[l.pos] == '\r') {
+		l.pos++
+	}
+}
+
+func (l *Lexer) lexStr() Tok {
+	start := l.pos
+	var b strings.Builder
+	for l.pos < len(l.src) {
+		ch := l.src[l.pos]
+		l.pos++
+		if ch == '"' {
+			l.tok = Tok{typ: TStr, lit: b.String()}
+			return l.tok
+		}
+		if ch == '\\' && l.pos < len(l.src) {
+			switch l.src[l.pos] {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case '"':
+				b.WriteByte('"')
+			case '\\':
+				b.WriteByte('\\')
+			default:
+				b.WriteRune(l.src[l.pos])
+			}
+			l.pos++
+			continue
+		}
+		b.WriteRune(ch)
+	}
+	l.err = fmt.Errorf("unclosed string at %d", start)
+	l.tok = Tok{typ: TErr, lit: "unclosed string"}
+	return l.tok
+}
+
+func (l *Lexer) lexNum() Tok {
+	start := l.pos - 1
+	if l.pos > 0 && (l.src[l.pos-1] == '-' || l.src[l.pos-1] == '+') {
+		if l.pos >= len(l.src) || !unicode.IsDigit(l.src[l.pos]) {
+			return l.lexSymFrom(start)
+		}
+	}
+	// Read integer part (digits only)
+	for l.pos < len(l.src) && unicode.IsDigit(l.src[l.pos]) {
+		l.pos++
+	}
+	// Check for fraction syntax: integer/integer
+	if l.pos < len(l.src) && l.src[l.pos] == '/' && l.pos+1 < len(l.src) && unicode.IsDigit(l.src[l.pos+1]) {
+		l.pos++ // consume '/'
+		denStart := l.pos
+		for l.pos < len(l.src) && unicode.IsDigit(l.src[l.pos]) {
+			l.pos++
+		}
+		numStr := string(l.src[start : denStart-1]) // numerator (before '/')
+		denStr := string(l.src[denStart:l.pos])     // denominator (after '/')
+		n, err1 := strconv.ParseInt(numStr, 10, 64)
+		d, err2 := strconv.ParseInt(denStr, 10, 64)
+		if err1 == nil && err2 == nil && d != 0 {
+			l.tok = Tok{typ: TNum, irat: n, iden: d, pos: start}
+			return l.tok
+		}
+		// Try big rational
+		bn := new(big.Int)
+		bd := new(big.Int)
+		_, ok1 := bn.SetString(numStr, 10)
+		_, ok2 := bd.SetString(denStr, 10)
+		if ok1 && ok2 && bd.Sign() != 0 {
+			br := new(big.Rat).SetFrac(bn, bd)
+			f, _ := new(big.Float).SetRat(br).Float64()
+			l.tok = Tok{typ: TNum, num: f, pos: start}
+			return l.tok
+		}
+		// Invalid rational, fall through to symbol
+		return l.lexSymFrom(start)
+	}
+	// Check for decimal point
+	hasDecimal := false
+	if l.pos < len(l.src) && l.src[l.pos] == '.' {
+		hasDecimal = true
+		l.pos++
+		for l.pos < len(l.src) && unicode.IsDigit(l.src[l.pos]) {
+			l.pos++
+		}
+	}
+	// Check for scientific notation
+	hasExponent := false
+	if l.pos < len(l.src) && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
+		hasExponent = true
+		l.pos++
+		if l.pos < len(l.src) && (l.src[l.pos] == '-' || l.src[l.pos] == '+') {
+			l.pos++
+		}
+		for l.pos < len(l.src) && unicode.IsDigit(l.src[l.pos]) {
+			l.pos++
+		}
+	}
+	numStr := string(l.src[start:l.pos])
+	// If pure integer (no decimal, no exponent), try big.Int first
+	if !hasDecimal && !hasExponent {
+		n, err := strconv.ParseInt(numStr, 10, 64)
+		if err == nil {
+			l.tok = Tok{typ: TNum, num: float64(n), pos: start}
+			return l.tok
+		}
+		// Overflow: try big.Int
+		bi := new(big.Int)
+		if _, ok := bi.SetString(numStr, 10); ok {
+			l.tok = Tok{typ: TNum, bigInt: bi, pos: start}
+			return l.tok
+		}
+	}
+	f, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return l.lexSymFrom(start)
+	}
+	l.tok = Tok{typ: TNum, num: f, pos: start}
+	return l.tok
+}
+
+// Examples: #\a, #\space, #\newline, #\tab, #\return, #\backspace, #\rubout, #\page
+func (l *Lexer) lexChar(pos int) Tok {
+	// Named characters mapping
+	namedChars := map[string]rune{
+		"space":     ' ',
+		"newline":   '\n',
+		"tab":       '\t',
+		"return":    '\r',
+		"backspace": '\x08',
+		"rubout":    '\x7f',
+		"page":      '\f',
+	}
+
+	// Skip the \ after #
+	l.pos++ // consume \ after #
+
+	// Read characters until whitespace or delimiter
+	nameStart := l.pos
+	for l.pos < len(l.src) && !unicode.IsSpace(l.src[l.pos]) && !strings.ContainsRune("()\"';'`,", l.src[l.pos]) {
+		l.pos++
+	}
+
+	name := string(l.src[nameStart:l.pos])
+
+	if len(name) == 0 {
+		// #\ followed by whitespace - read one char
+		if l.pos < len(l.src) {
+			ch := l.src[l.pos]
+			l.pos++
+			l.tok = Tok{typ: TChar, ch: ch, pos: pos}
+			return l.tok
+		}
+	}
+
+	// Try named character (case-insensitive lookup)
+	if ch, ok := namedChars[strings.ToLower(name)]; ok {
+		l.tok = Tok{typ: TChar, ch: ch, pos: pos}
+		return l.tok
+	}
+
+	// Single character (preserve original case)
+	if len(name) == 1 {
+		l.tok = Tok{typ: TChar, ch: rune(name[0]), pos: pos}
+		return l.tok
+	}
+
+	// Multi-character that is not a named char - treat as symbol
+	l.tok = Tok{typ: TSym, lit: "#" + "\\" + name, pos: pos}
+	return l.tok
+}
+
+func (l *Lexer) lexSym() Tok {
+	start := l.pos - 1
+	return l.lexSymFrom(start)
+}
+
+func (l *Lexer) lexSymFrom(start int) Tok {
+	for l.pos < len(l.src) && !unicode.IsSpace(l.src[l.pos]) && !strings.ContainsRune("()\";'`,", l.src[l.pos]) {
+		// Check if this character is a readtable macro character with a Lisp-level function
+		if currentReadtable != nil {
+			if entry, ok := currentReadtable.macroFns[l.src[l.pos]]; ok && entry != nil && entry.lispFn != nil {
+				break
+			}
+		}
+		l.pos++
+	}
+	// If the first character of the symbol has a Lisp-level macro function,
+	// emit it as a TMacro token instead of a symbol.
+	if currentReadtable != nil && l.pos > start {
+		firstCh := l.src[start]
+		if entry, ok := currentReadtable.macroFns[firstCh]; ok && entry != nil && entry.lispFn != nil {
+			l.tok = Tok{typ: TMacro, ch: firstCh, pos: start}
+			l.pos = start + 1 // consume just the macro character
+			return l.tok
+		}
+	}
+	s := string(l.src[start:l.pos])
+	switch s {
+	case "#t":
+		l.tok = Tok{typ: TTrue}
+	case "#f":
+		l.tok = Tok{typ: TFalse}
+	case "#c":
+		// #c(real imag) complex number syntax
+		// skip whitespace
+		for l.pos < len(l.src) && (l.src[l.pos] == ' ' || l.src[l.pos] == '\t' || l.src[l.pos] == '\n') {
+			l.pos++
+		}
+		if l.pos < len(l.src) && l.src[l.pos] == '(' {
+			l.pos++ // consume '('
+			// read real part
+			for l.pos < len(l.src) && (l.src[l.pos] == ' ' || l.src[l.pos] == '\t' || l.src[l.pos] == '\n') {
+				l.pos++
+			}
+			realStart := l.pos
+			for l.pos < len(l.src) && !unicode.IsSpace(l.src[l.pos]) && l.src[l.pos] != ')' {
+				l.pos++
+			}
+			realVal, _ := strconv.ParseFloat(string(l.src[realStart:l.pos]), 64)
+			// read imag part
+			for l.pos < len(l.src) && (l.src[l.pos] == ' ' || l.src[l.pos] == '\t' || l.src[l.pos] == '\n') {
+				l.pos++
+			}
+			imagStart := l.pos
+			for l.pos < len(l.src) && !unicode.IsSpace(l.src[l.pos]) && l.src[l.pos] != ')' {
+				l.pos++
+			}
+			imagVal, _ := strconv.ParseFloat(string(l.src[imagStart:l.pos]), 64)
+			// consume ')'
+			for l.pos < len(l.src) && (l.src[l.pos] == ' ' || l.src[l.pos] == '\t') {
+				l.pos++
+			}
+			if l.pos < len(l.src) && l.src[l.pos] == ')' {
+				l.pos++
+			}
+			l.tok = Tok{typ: TNum, num: realVal, imag: imagVal, pos: start}
+			return l.tok
+		}
+		l.tok = Tok{typ: TSym, lit: s}
+	default:
+		// Check for radix reader macros: #b, #o, #x
+		if len(s) >= 2 && s[0] == '#' {
+			switch s[1] {
+			case 'b', 'B':
+				// Binary: #b1010 → 10
+				if len(s) > 2 {
+					n, err := strconv.ParseInt(s[2:], 2, 64)
+					if err == nil {
+						l.tok = Tok{typ: TNum, num: float64(n), pos: start}
+						return l.tok
+					}
+				}
+			case 'o', 'O':
+				// Octal: #o777 → 511
+				if len(s) > 2 {
+					n, err := strconv.ParseInt(s[2:], 8, 64)
+					if err == nil {
+						l.tok = Tok{typ: TNum, num: float64(n), pos: start}
+						return l.tok
+					}
+				}
+			case 'x', 'X':
+				// Hex: #xFF → 255
+				if len(s) > 2 {
+					n, err := strconv.ParseInt(s[2:], 16, 64)
+					if err == nil {
+						l.tok = Tok{typ: TNum, num: float64(n), pos: start}
+						return l.tok
+					}
+				}
+			}
+		}
+		l.tok = Tok{typ: TSym, lit: s}
+	}
+	return l.tok
+}
+
+// -------- Parser --------
+type Parser struct {
+	l         *Lexer
+	tok       Tok
+	ptoks     []Tok
+	pi        int
+	readtable *Readtable
+	env       *Env // for calling Lisp-level macro functions
+}
+
+func parse(s string) (*Value, error) {
+	p := &Parser{l: lex(s), readtable: currentReadtable, env: globalEnv}
+	p.advance()
+	v, err := p.readExpr()
+	if err != nil {
+		return nil, err
+	}
+	// handle reader macros
+	return p.expandReaderMacros(v), nil
+}
+
+func (p *Parser) advance() {
+	if p.pi < len(p.ptoks) {
+		p.tok = p.ptoks[p.pi]
+		p.pi++
+	} else {
+		p.l.next()
+		p.tok = p.l.tok
+		if p.l.err != nil {
+			p.tok = Tok{typ: TErr, lit: p.l.err.Error()}
+		}
+		p.ptoks = append(p.ptoks, p.tok)
+		p.pi = len(p.ptoks)
+	}
+}
+
+func (p *Parser) read() (*Value, error) {
+	switch p.tok.typ {
+	case TLParen:
+		return p.readList()
+	case TNum:
+		if p.tok.iden != 0 {
+			v := vrat(p.tok.irat, p.tok.iden)
+			if v == nil {
+				return nil, fmt.Errorf("invalid rational: division by zero")
+			}
+			p.advance()
+			return v, nil
+		}
+		if p.tok.imag != 0 {
+			v := vcomplex(p.tok.num, p.tok.imag)
+			p.advance()
+			return v, nil
+		}
+		if p.tok.bigInt != nil {
+			v := vbigint(p.tok.bigInt)
+			p.advance()
+			return v, nil
+		}
+		v := vnum(p.tok.num)
+		p.advance()
+		return v, nil
+	case TStr:
+		v := vstr(p.tok.lit)
+		p.advance()
+		return v, nil
+	case TSym:
+		lit := p.tok.lit
+		if len(lit) >= 2 && lit[0] == '#' && (lit[1] == '+' || lit[1] == '-') {
+			include := lit[1] == '+'
+			var featureSpec *Value
+			p.advance()
+			if len(lit) == 2 {
+				// #+feature form (space separated) — read feature spec
+				featureSpec, _ = p.readExpr()
+			} else {
+				// #+feature (no space) — extract feature name from lit
+				featName := lit[2:]
+				if featName[0] != ':' {
+					featName = ":" + featName
+				}
+				featureSpec = internOrVsym(featName)
+			}
+			// Read the conditional form
+			form, err := p.readExpr()
+			if err != nil {
+				return nil, err
+			}
+			// Check features
+			satisfied := featureSatisfied(featureSpec)
+			if include == satisfied {
+				return form, nil
+			}
+			// Feature not satisfied — skip and read next form
+			return p.readExpr()
+		}
+		v := internOrVsym(p.tok.lit)
+		p.advance()
+		return v, nil
+	case TTrue:
+		p.advance()
+		return vbool(true), nil
+	case TFalse:
+		p.advance()
+		return vbool(false), nil
+	case TChar:
+		v := vchar(p.tok.ch)
+		p.advance()
+		return v, nil
+	case TErr:
+		return nil, fmt.Errorf("lex error: %s", p.tok.lit)
+	case TEOF:
+		return nil, fmt.Errorf("unexpected EOF")
+	default:
+		return nil, fmt.Errorf("unexpected token: %s", tokName(p.tok.typ))
+	}
+}
+
+func (p *Parser) readList() (*Value, error) {
+	p.advance() // skip (
+	var head, tail *Value
+	for p.tok.typ != TRParen && p.tok.typ != TEOF {
+		if p.tok.typ == TDot {
+			p.advance()
+			v, err := p.readExpr()
+			if err != nil {
+				return nil, err
+			}
+			if p.tok.typ != TRParen {
+				return nil, fmt.Errorf("expected ) after dot")
+			}
+			if tail == nil {
+				return nil, fmt.Errorf("dot without preceding element")
+			}
+			tail.cdr = v
+			p.advance()
+			return head, nil
+		}
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		pair := cons(v, vnil())
+		if head == nil {
+			head = pair
+			tail = pair
+		} else {
+			tail.cdr = pair
+			tail = pair
+		}
+	}
+	if p.tok.typ == TEOF {
+		return nil, fmt.Errorf("unclosed list")
+	}
+	p.advance() // skip )
+	if head == nil {
+		return vnil(), nil
+	}
+	return head, nil
+}
+
+func (p *Parser) expandReaderMacros(v *Value) *Value {
+	if !isPair(v) {
+		return v
+	}
+	if v.car == nil {
+		return v
+	}
+	switch v.car.typ {
+	case VPair:
+		return cons(p.expandReaderMacros(v.car), p.expandReaderMacros(v.cdr))
+	case VSym:
+	}
+	return cons(p.expandReaderMacros(v.car), p.expandReaderMacros(v.cdr))
+}
+
+func tokName(t TokType) string {
+	switch t {
+	case TLParen:
+		return "("
+	case TRParen:
+		return ")"
+	case TDot:
+		return "."
+	case TNum:
+		return "number"
+	case TStr:
+		return "string"
+	case TSym:
+		return "symbol"
+	case TChar:
+		return "character"
+	case TMacro:
+		return "macro-char"
+	case TEOF:
+		return "EOF"
+	default:
+		return fmt.Sprintf("token(%d)", t)
+	}
+}
+
+// multi-read: read one complete expression, handling quotes as reader syntax
+func parseExpr(s string) (*Value, error) {
+	l := lex(s)
+	p := &Parser{l: l, ptoks: make([]Tok, 0, 64), readtable: currentReadtable, env: globalEnv}
+	p.advance()
+	return p.readExpr()
+}
+
+func (p *Parser) readExpr() (*Value, error) {
+	switch p.tok.typ {
+	case TQuote:
+		p.advance()
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		return list(vsym("quote"), v), nil
+	case TFuncQuote:
+		p.advance()
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		return list(vsym("function"), v), nil
+	case TPathname:
+		pathStr := p.tok.lit
+		p.advance()
+		return vpathname(parsePathnameString(pathStr)), nil
+	case TQq:
+		p.advance()
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		return list(vsym("quasiquote"), v), nil
+	case TUnq:
+		p.advance()
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		return list(vsym("unquote"), v), nil
+	case TUnqS:
+		p.advance()
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		return list(vsym("unquote-splicing"), v), nil
+	case TComplex:
+		// #C(real imag) - parse complex number literal
+		inner := p.tok.lit
+		cparts := strings.Fields(inner)
+		if len(cparts) >= 2 {
+			realStr := cparts[0]
+			imagStr := cparts[1]
+			realVal, err1 := parseFloatStr(realStr)
+			imagVal, err2 := parseFloatStr(imagStr)
+			if err1 == nil && err2 == nil {
+				p.advance()
+				return vcomplex(realVal, imagVal), nil
+			}
+		}
+		return nil, fmt.Errorf("invalid complex number literal: #C(%s)", inner)
+	case TMacro:
+		// Readtable macro character: call the registered macro function
+		result, err := p.invokeMacro(p.tok.ch)
+		p.advance()
+		return result, err
+	default:
+		return p.read()
+	}
+}
+
+// invokeMacro calls a readtable macro function with the macro character.
+func (p *Parser) invokeMacro(ch rune) (*Value, error) {
+	rt := p.readtable
+	if rt == nil {
+		rt = currentReadtable
+	}
+	entry, ok := rt.macroFns[ch]
+	if !ok || entry == nil || entry.lispFn == nil {
+		// No Lisp-level macro function registered
+		return nil, fmt.Errorf("invokeMacro: no macro function for %q", string(ch))
+	}
+	// Call the macro function by constructing (fn ch) and evaluating it.
+	chVal := &Value{typ: VChar, ch: ch}
+	callForm := cons(entry.lispFn, cons(chVal, vnil()))
+	env := p.env
+	if env == nil {
+		env = globalEnv
+	}
+	result, err := eval(callForm, env)
+	if err != nil {
+		return nil, fmt.Errorf("macro function error: %v", err)
+	}
+	return result, nil
+}
+
+func parseAll(s string) (*Value, error) {
+	l := lex(s)
+	p := &Parser{l: l, ptoks: make([]Tok, 0, 64), readtable: currentReadtable, env: globalEnv}
+	p.advance()
+	var result *Value = vnil()
+	for p.tok.typ != TEOF {
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		result = cons(v, result)
+	}
+	// reverse
+	var rev *Value = vnil()
+	for !isNil(result) {
+		rev = cons(result.car, rev)
+		result = result.cdr
+	}
+	return rev, nil
+}
+
+// -------- Evaluator --------
+var symQuote = vsym("quote")
+var symQq = vsym("quasiquote")
+var symUnq = vsym("unquote")
+var symUnqS = vsym("unquote-splicing")
+
+func evalString(s string, env *Env) (*Value, error) {
+	// Use lazy parsing: parse and evaluate one expression at a time.
+	// This ensures that set-macro-character calls take effect for
+	// subsequent forms in the same source string.
+	l := lex(s)
+	p := &Parser{l: l, ptoks: make([]Tok, 0, 64), readtable: currentReadtable, env: globalEnv}
+	p.advance()
+	var result *Value = vnil()
+	for p.tok.typ != TEOF {
+		// Update readtable reference before each expression
+		p.readtable = currentReadtable
+		p.env = globalEnv
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		result, err = eval(v, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func eval(v *Value, env *Env) (result *Value, err error) {
+	if v == nil {
+		return vnil(), nil
+	}
+	evalDepth++
+	if evalDepth > maxEvalDepth {
+		evalDepth--
+		return nil, fmt.Errorf("eval: maximum recursion depth (%d) exceeded — possible infinite recursion", maxEvalDepth)
+	}
+	defer func() { evalDepth-- }()
+evalLoop:
+	for {
+		switch v.typ {
+		case VNum, VStr, VBool, VNil, VPrim, VFunc, VRat, VComplex, VBigInt, VChar, VInstance, VClass, VMultiVal, VPathname, VPackage, VReadtable:
+			return v, nil
+		case VSym:
+			// Keywords are self-evaluating (symbols in KEYWORD package)
+			kPkg := findPackage("KEYWORD")
+			if kPkg != nil {
+				if _, ok := kPkg.symbols[v.str]; ok {
+					return v, nil
+				}
+			}
+			val, e := env.Get(v.str)
+			if e != nil {
+				return nil, e
+			}
+			if val.typ == VSymMacro {
+				v = val.car
+				continue
+			}
+			return val, nil
+		case VPair:
+			if v.car == nil || v.car.typ != VSym {
+				// application
+				fn, e := eval(v.car, env)
+				if e != nil {
+					return nil, e
+				}
+				r, e := apply(fn, v.cdr, env)
+				if e != nil {
+					if tc, ok := e.(*tailCall); ok {
+						v = tc.form
+						env = tc.env
+						continue evalLoop
+					}
+					return nil, e
+				}
+				return r, nil
+			}
+			switch v.car.str {
+			case "funcall":
+				// funcall as special form to pass lexical env to callFnOnSeq
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("funcall: malformed arguments")
+				}
+				fn, e := eval(v.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				fn = primaryValue(fn)
+				if fn.typ == VSym {
+					resolved, err := env.Get(fn.str)
+					if err == nil {
+						fn = resolved
+					}
+				}
+				callArgs := []*Value{}
+				for cp := v.cdr.cdr; !isNil(cp) && cp.typ == VPair; cp = cp.cdr {
+					arg, e := eval(cp.car, env)
+					if e != nil {
+						return nil, e
+					}
+					callArgs = append(callArgs, arg)
+				}
+				r, e := callFnOnSeq(fn, callArgs, env)
+				if e != nil {
+					if tc, ok := e.(*tailCall); ok {
+						v = tc.form
+						env = tc.env
+						continue evalLoop
+					}
+					return nil, e
+				}
+				return r, nil
+			case "quote":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("quote: malformed form")
+				}
+				return v.cdr.car, nil
+			case "function":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("function: malformed form")
+				}
+				arg := v.cdr.car
+				if arg.typ == VSym {
+					val, err := globalEnv.Get(arg.str)
+					if err != nil {
+						return nil, fmt.Errorf("function: undefined: %s", arg.str)
+					}
+					return val, nil
+				}
+				if arg.typ == VPair && arg.car != nil && arg.car.typ == VSym && arg.car.str == "lambda" {
+					return eval(arg, env)
+				}
+				return eval(arg, env)
+			case "quasiquote":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("quasiquote: malformed form")
+				}
+				return evalQuasiquote(v.cdr.car, 0, env)
+			case "if":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("if: malformed form")
+				}
+				cond, e := eval(v.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				cond = primaryValue(cond)
+				alt := v.cdr.cdr
+				if isTruthy(cond) {
+					if alt.typ != VPair {
+						return nil, fmt.Errorf("if: malformed form")
+					}
+					v = alt.car
+				} else if !isNil(alt) && alt.typ == VPair && !isNil(alt.cdr) {
+					v = alt.cdr.car
+				} else {
+					return vnil(), nil
+				}
+				continue
+			case "begin":
+				exprs := v.cdr
+				if isNil(exprs) {
+					return vnil(), nil
+				}
+				for exprs.typ == VPair && !isNil(exprs.cdr) {
+					_, e := eval(exprs.car, env)
+					if e != nil {
+						return nil, e
+					}
+					exprs = exprs.cdr
+				}
+				v = exprs.car
+				continue
+			case "lambda":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("lambda: need lambda list")
+				}
+				fn := gcv()
+				fn.typ = VFunc
+				params, rest, e := parseParams(v.cdr.car)
+				if e != nil {
+					return nil, e
+				}
+				fn.params = params
+				fn.rest = rest
+				fn.body = v.cdr.cdr
+				fn.env = env
+				return fn, nil
+			case "progn":
+				exprs := v.cdr
+				if isNil(exprs) {
+					return vnil(), nil
+				}
+				for exprs.typ == VPair && !isNil(exprs.cdr) {
+					_, e := eval(exprs.car, env)
+					if e != nil {
+						return nil, e
+					}
+					exprs = exprs.cdr
+				}
+				v = exprs.car
+				continue
+			case "declare":
+				// Declarations are advisory, ignored in interpreter
+				return vnil(), nil
+			case "the":
+				// (the type-specifier form) — evaluate form, ignore type check
+				if v.cdr == nil || v.cdr.typ != VPair || v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("the: need type and form")
+				}
+				v = v.cdr.cdr.car
+				continue
+			case "locally":
+				// (locally declaration... body...) — skip declarations, eval body
+				body := v.cdr
+				for !isNil(body) && body.car != nil && body.car.typ == VPair && body.car.car != nil && body.car.car.typ == VSym && body.car.car.str == "declare" {
+					body = body.cdr
+				}
+				if isNil(body) {
+					return vnil(), nil
+				}
+				for body.typ == VPair && !isNil(body.cdr) {
+					_, e := eval(body.car, env)
+					if e != nil {
+						return nil, e
+					}
+					body = body.cdr
+				}
+				if body.typ != VPair {
+					return vnil(), nil
+				}
+				v = body.car
+				continue
+			case "proclaim":
+				// (proclaim decl-spec...) — advisory, ignored
+				return vnil(), nil
+			case "declaim":
+				// (declaim decl-spec...) — advisory, ignored
+				return vnil(), nil
+			case "progv":
+				// (progv symbols-list values-list body...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("progv: malformed form")
+				}
+				symsVal, e := eval(v.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				if v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("progv: requires symbols-list and values-list")
+				}
+				valsVal, e := eval(v.cdr.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				syms := seqToList(symsVal)
+				vals := seqToList(valsVal)
+				newEnv := NewEnv(env)
+				for i, sym := range syms {
+					if sym.typ != VSym {
+						return nil, fmt.Errorf("progv: expected symbol at position ~D", i)
+					}
+					var val *Value = vnil()
+					if i < len(vals) {
+						val = vals[i]
+					}
+					newEnv.Set(sym.str, val)
+				}
+				body := v.cdr.cdr.cdr
+				if !isNil(body) {
+					if isPair(body) && isPair(body.cdr) {
+						for body.typ == VPair && !isNil(body.cdr) {
+							_, err = eval(body.car, newEnv)
+							if err != nil {
+								return nil, err
+							}
+							body = body.cdr
+						}
+						return eval(body.car, newEnv)
+					}
+					if isPair(body) {
+						return eval(body.car, newEnv)
+					}
+					return eval(body, newEnv)
+				}
+				return vnil(), nil
+
+			case "flet":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("flet: malformed form")
+				}
+				bindings := v.cdr.car
+				body := v.cdr.cdr
+				newEnv := NewEnv(env)
+				for !isNil(bindings) {
+					if bindings.typ != VPair {
+						return nil, fmt.Errorf("flet: malformed bindings")
+					}
+					b := bindings.car
+					if b.typ != VPair {
+						return nil, fmt.Errorf("flet: malformed binding")
+					}
+					if b.car == nil || b.car.typ != VSym {
+						return nil, fmt.Errorf("flet: binding name must be a symbol")
+					}
+					fname := b.car.str
+					fn := gcv()
+					fn.typ = VFunc
+					fn.name = fname
+					if b.cdr == nil || b.cdr.typ != VPair {
+						return nil, fmt.Errorf("flet: malformed binding")
+					}
+					fparams := b.cdr.car
+					fbody := b.cdr.cdr
+					params, rest, e := parseParams(fparams)
+					if e != nil {
+						return nil, e
+					}
+					fn.params = params
+					fn.rest = rest
+					fn.body = fbody
+					fn.env = newEnv
+					newEnv.Set(fname, fn)
+					bindings = bindings.cdr
+				}
+				env = newEnv
+				for body.typ == VPair && !isNil(body.cdr) {
+					_, err = eval(body.car, env)
+					if err != nil {
+						return nil, err
+					}
+					body = body.cdr
+				}
+				if body.typ != VPair {
+					return vnil(), nil
+				}
+				v = body.car
+				continue
+			case "labels":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("labels: malformed form")
+				}
+				bindings := v.cdr.car
+				body := v.cdr.cdr
+				newEnv := NewEnv(env)
+				for !isNil(bindings) {
+					if bindings.typ != VPair {
+						return nil, fmt.Errorf("labels: malformed bindings")
+					}
+					if bindings.car == nil || bindings.car.typ != VPair {
+						return nil, fmt.Errorf("labels: malformed binding")
+					}
+					if bindings.car.car == nil || bindings.car.car.typ != VSym {
+						return nil, fmt.Errorf("labels: function name must be a symbol")
+					}
+					fname := bindings.car.car.str
+					fn := gcv()
+					fn.typ = VFunc
+					fn.name = fname
+					fn.env = newEnv
+					newEnv.Set(fname, fn)
+					bindings = bindings.cdr
+				}
+				bindings = v.cdr.car
+				for !isNil(bindings) {
+					if bindings.typ != VPair {
+						return nil, fmt.Errorf("flet: malformed bindings")
+					}
+					b := bindings.car
+					if b == nil || b.typ != VPair {
+						return nil, fmt.Errorf("flet: malformed binding")
+					}
+					if b.car == nil || b.car.typ != VSym {
+						return nil, fmt.Errorf("labels: binding name must be a symbol")
+					}
+					fname := b.car.str
+					fn, _ := newEnv.Get(fname)
+					if b.cdr == nil || b.cdr.typ != VPair {
+						return nil, fmt.Errorf("labels: malformed binding")
+					}
+					fparams := b.cdr.car
+					fbody := b.cdr.cdr
+					params, rest, e := parseParams(fparams)
+					if e != nil {
+						return nil, e
+					}
+					fn.params = params
+					fn.rest = rest
+					fn.body = fbody
+					bindings = bindings.cdr
+				}
+				env = newEnv
+				for body.typ == VPair && !isNil(body.cdr) {
+					_, err = eval(body.car, env)
+					if err != nil {
+						return nil, err
+					}
+					body = body.cdr
+				}
+				if body.typ != VPair {
+					return vnil(), nil
+				}
+				v = body.car
+				continue
+
+			case "define":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("define: malformed form")
+				}
+				head := v.cdr.car
+				var name string
+				var val *Value
+				if head.typ == VSym {
+					name = head.str
+					if v.cdr.cdr == nil || isNil(v.cdr.cdr) {
+						return nil, fmt.Errorf("define: missing value for %s", name)
+					}
+					val = v.cdr.cdr.car
+				} else if isPair(head) {
+					if head.car == nil || head.car.typ != VSym {
+						return nil, fmt.Errorf("define: function name must be a symbol")
+					}
+					name = head.car.str
+					params, rest, e := parseParams(head.cdr)
+					if e != nil {
+						return nil, e
+					}
+					fn := gcv()
+					fn.typ = VFunc
+					fn.name = name
+					fn.params = params
+					fn.rest = rest
+					fn.body = v.cdr.cdr
+					fn.env = env
+					val = fn
+				} else {
+					return nil, fmt.Errorf("bad define syntax")
+				}
+				ev, e := eval(val, env)
+				if e != nil {
+					return nil, e
+				}
+				env.Set(name, ev)
+				return vsym(name), nil
+			case "set!", "setq":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("set!: malformed form")
+				}
+				if v.cdr.car == nil || v.cdr.car.typ != VSym {
+					return nil, fmt.Errorf("set!: variable must be a symbol")
+				}
+				name := v.cdr.car.str
+				if v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("set!: missing value form")
+				}
+				valv := v.cdr.cdr.car
+				ev, e := eval(valv, env)
+				if e != nil {
+					return nil, e
+				}
+				for scope := env; scope != nil; scope = scope.parent {
+					if _, ok := scope.bindings[name]; ok {
+						scope.bindings[name] = ev
+						return ev, nil
+					}
+				}
+				return nil, fmt.Errorf("set!: undefined %s", name)
+			case "defvar":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("defvar: malformed form")
+				}
+				if v.cdr.car == nil || v.cdr.car.typ != VSym {
+					return nil, fmt.Errorf("defvar: first argument must be a symbol")
+				}
+				name := v.cdr.car.str
+				if v.cdr.cdr != nil && v.cdr.cdr.typ == VPair && !isNil(v.cdr.cdr) {
+					if _, err := globalEnv.Get(name); err != nil {
+						ev, e := eval(v.cdr.cdr.car, env)
+						if e != nil {
+							return nil, e
+						}
+						globalEnv.Set(name, ev)
+					}
+				}
+				return vsym(name), nil
+			case "defparameter":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("defparameter: malformed form")
+				}
+				if v.cdr.car == nil || v.cdr.car.typ != VSym {
+					return nil, fmt.Errorf("defparameter: first argument must be a symbol")
+				}
+				name := v.cdr.car.str
+				if v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("defparameter: requires name and initform")
+				}
+				ev, e := eval(v.cdr.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				globalEnv.Set(name, ev)
+				return vsym(name), nil
+			case "defconstant":
+				// (defconstant name initial-value-form &optional documentation)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("defconstant: malformed form")
+				}
+				if v.cdr.car == nil || v.cdr.car.typ != VSym {
+					return nil, fmt.Errorf("defconstant: name must be a symbol")
+				}
+				name := v.cdr.car.str
+				if v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("defconstant: requires name and initform")
+				}
+				ev, e := eval(v.cdr.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				// In CL, defconstant signals a style-warning if the variable is already bound
+				// to a different value. MicroLisp allows redefinition.
+				globalEnv.Set(name, ev)
+				return vsym(name), nil
+			case "defmacro":
+				// (defmacro name lambda-list . body)
+				// CL standard syntax: name is a symbol, lambda-list follows
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("defmacro: malformed form")
+				}
+				head := v.cdr.car
+				if head.typ != VSym {
+					return nil, fmt.Errorf("defmacro: name must be a symbol")
+				}
+				name := head.str
+				if v.cdr.cdr == nil || isNil(v.cdr.cdr) {
+					return nil, fmt.Errorf("defmacro: missing lambda list")
+				}
+				lambdaList := v.cdr.cdr.car
+				macroBody := v.cdr.cdr.cdr
+				params, rest, whole, envSym, e := parseMacroParams(lambdaList)
+				if e != nil {
+					return nil, fmt.Errorf("defmacro: %v", e)
+				}
+				m := gcv()
+				m.typ = VMacro
+				m.str = name
+				m.params = params
+				m.rest = rest
+				m.whole = whole
+				m.body = macroBody
+				m.env = env
+				_ = envSym
+				env.Set(name, m)
+				return vsym(name), nil
+			case "defun":
+				// (defun name lambda-list . body)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("defun: malformed form")
+				}
+				head := v.cdr.car
+				if head.typ != VSym {
+					return nil, fmt.Errorf("defun: name must be a symbol")
+				}
+				name := head.str
+				if v.cdr.cdr == nil || isNil(v.cdr.cdr) {
+					return nil, fmt.Errorf("defun: missing lambda list")
+				}
+				lambdaList := v.cdr.cdr.car
+				params, rest, e := parseParams(lambdaList)
+				if e != nil {
+					return nil, fmt.Errorf("defun: %v", e)
+				}
+				body := v.cdr.cdr.cdr
+				fn := gcv()
+				fn.typ = VFunc
+				fn.name = name
+				fn.params = params
+				fn.rest = rest
+				fn.body = body
+				fn.env = NewEnv(globalEnv)
+				globalEnv.Set(name, fn)
+				return vsym(name), nil
+			case "let":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("let: malformed form")
+				}
+				bindings := v.cdr.car
+				body := v.cdr.cdr
+				names := make([]string, 0, 8)
+				vals := make([]*Value, 0, 8)
+				for !isNil(bindings) {
+					if bindings.typ != VPair {
+						return nil, fmt.Errorf("let: malformed bindings")
+					}
+					b := bindings.car
+					if b.typ != VPair {
+						return nil, fmt.Errorf("let: malformed binding")
+					}
+					if b.car == nil || b.car.typ != VSym {
+						return nil, fmt.Errorf("let: binding name must be a symbol")
+					}
+					names = append(names, b.car.str)
+					if !isNil(b.cdr) && b.cdr.typ == VPair {
+						vals = append(vals, b.cdr.car)
+					} else {
+						vals = append(vals, vnil())
+					}
+					bindings = bindings.cdr
+				}
+				// build ((lambda (names...) body...) vals...)
+				params := vnil()
+				args := vnil()
+				for i := len(names) - 1; i >= 0; i-- {
+					params = cons(vsym(names[i]), params)
+					args = cons(vals[i], args)
+				}
+				lam := list(vsym("lambda"), params)
+				// append body to lambda
+				t := lam.cdr
+				for !isNil(body) {
+					t.cdr = cons(body.car, vnil())
+					t = t.cdr
+					body = body.cdr
+				}
+				v = cons(lam, args)
+				continue
+			case "letrec":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("letrec: malformed form")
+				}
+				bindings := v.cdr.car
+				body := v.cdr.cdr
+				names := make([]string, 0, 8)
+				vals := make([]*Value, 0, 8)
+				for !isNil(bindings) {
+					if bindings.typ != VPair {
+						return nil, fmt.Errorf("let: malformed bindings")
+					}
+					b := bindings.car
+					if b.typ != VPair {
+						return nil, fmt.Errorf("letrec: malformed binding")
+					}
+					if b.car == nil || b.car.typ != VSym {
+						return nil, fmt.Errorf("letrec: binding name must be a symbol")
+					}
+					names = append(names, b.car.str)
+					if !isNil(b.cdr) && b.cdr.typ == VPair {
+						vals = append(vals, b.cdr.car)
+					} else {
+						vals = append(vals, vnil())
+					}
+					bindings = bindings.cdr
+				}
+				newEnv := &Env{parent: env, bindings: make(map[string]*Value)}
+				for _, name := range names {
+					newEnv.bindings[name] = vbool(false)
+				}
+				evals := make([]*Value, len(vals))
+				for i, val := range vals {
+					evald, e := eval(val, newEnv)
+					if e != nil {
+						return nil, e
+					}
+					evals[i] = evald
+				}
+				for i, name := range names {
+					newEnv.bindings[name] = evals[i]
+				}
+				var result *Value = vnil()
+				for !isNil(body) {
+					result, err = eval(body.car, newEnv)
+					if err != nil {
+						return nil, err
+					}
+					body = body.cdr
+				}
+				return result, nil
+			case "define-macro":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("define-macro: malformed form")
+				}
+				head := v.cdr.car
+				if head.typ == VSym {
+					name := head.str
+					m := gcv()
+					m.typ = VMacro
+					m.str = name
+					m.params = nil
+					m.rest = ""
+					m.whole = ""
+					m.body = v.cdr.cdr
+					m.env = env
+					env.Set(name, m)
+					return vsym(name), nil
+				}
+				if head.typ != VPair {
+					return nil, fmt.Errorf("define-macro: need a name and lambda list")
+				}
+				if head.car == nil || head.car.typ != VSym {
+					return nil, fmt.Errorf("define-macro: name must be a symbol")
+				}
+				name := head.car.str
+				params, rest, whole, envSym, e := parseMacroParams(head.cdr)
+				if e != nil {
+					return nil, e
+				}
+				m := gcv()
+				m.typ = VMacro
+				m.str = name // store macro name for &whole reconstruction
+				m.params = params
+				m.rest = rest
+				m.whole = whole
+				m.body = v.cdr.cdr
+				m.env = env
+				_ = envSym // stored in envSym field via macro env
+				env.Set(name, m)
+				return vsym(name), nil
+			case "macro-expand":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("macro-expand: malformed form")
+				}
+				expr, e2 := eval(v.cdr.car, env)
+				if e2 != nil {
+					return nil, e2
+				}
+				if expr.typ != VPair {
+					return nil, fmt.Errorf("macro-expand: need a list")
+				}
+				fnSym := expr.car
+				if fnSym.typ != VSym {
+					return nil, fmt.Errorf("macro-expand: first element must be a symbol")
+				}
+				fn, err := env.Get(fnSym.str)
+				if err != nil || fn.typ != VMacro {
+					return nil, fmt.Errorf("macro-expand: not a macro: %s", fnSym.str)
+				}
+				return expandMacro(fn, expr.cdr, env)
+			case "step":
+				// (step expr) — evaluate expr with stepping info
+				body := v.cdr
+				if isNil(body) || body.typ != VPair {
+					return nil, fmt.Errorf("step: need an expression")
+				}
+				fmt.Fprintf(os.Stderr, "; Step: evaluating %s\n", writeToString(body.car))
+				result, err := eval(body.car, env)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "; Step: error: %s\n", err)
+					return nil, err
+				}
+				fmt.Fprintf(os.Stderr, "; Step: => %s\n", writeToString(result))
+				return result, nil
+			case "time":
+				// (time expr) — evaluate expr and print timing info
+				body := v.cdr
+				if isNil(body) || body.typ != VPair {
+					return nil, fmt.Errorf("time: need an expression")
+				}
+				start := time.Now()
+				result, err := eval(body.car, env)
+				elapsed := time.Since(start)
+				fmt.Fprintf(os.Stderr, "; Evaluation took:\n;   %s\n;   (%v real time)\n", elapsed, elapsed)
+				if err != nil {
+					return nil, err
+				}
+				return result, nil
+			case "ignore-errors":
+				// (ignore-errors body...) — returns (values nil condition) on error
+				body := v.cdr
+				var result *Value
+				for !isNil(body) {
+					result, err = eval(body.car, env)
+					if err != nil {
+						condVal := vstr(err.Error())
+						return list(vnil(), condVal), nil
+					}
+					body = body.cdr
+				}
+				return result, nil
+			case "unwind-protect":
+				// (unwind-protect protected-form cleanup-form...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("unwind-protect: malformed form")
+				}
+				protected := v.cdr.car
+				cleanup := v.cdr.cdr
+				var result *Value
+				// Execute protected form
+				func() {
+					defer func() {
+						// Always execute cleanup forms
+						for !isNil(cleanup) {
+							eval(cleanup.car, env)
+							cleanup = cleanup.cdr
+						}
+					}()
+					result, err = eval(protected, env)
+				}()
+				return result, err
+			case "and":
+				args := v.cdr
+				if isNil(args) {
+					return vbool(true), nil
+				}
+				for args.typ == VPair && !isNil(args.cdr) {
+					r, e := eval(args.car, env)
+					if e != nil {
+						return nil, e
+					}
+					if !isTruthy(r) {
+						return r, nil
+					}
+					args = args.cdr
+				}
+				if args.typ == VPair {
+					v = args.car
+					continue
+				}
+				return vnil(), nil
+			case "or":
+				args := v.cdr
+				if isNil(args) {
+					return vbool(false), nil
+				}
+				for args.typ == VPair && !isNil(args.cdr) {
+					r, e := eval(args.car, env)
+					if e != nil {
+						return nil, e
+					}
+					if isTruthy(r) {
+						return r, nil
+					}
+					args = args.cdr
+				}
+				if args.typ == VPair {
+					v = args.car
+					continue
+				}
+				return vnil(), nil
+			case "block":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("block: malformed form")
+				}
+				if v.cdr.car == nil || v.cdr.car.typ != VSym {
+					return nil, fmt.Errorf("block: name must be a symbol")
+				}
+				blockName := v.cdr.car.str
+				body := v.cdr.cdr
+				var result *Value
+				for !isNil(body) {
+					result, err = eval(body.car, env)
+					if err != nil {
+						if br, ok := err.(*blockReturn); ok && br.name == blockName {
+							if br.isLoopFinish {
+								// loop-finish: return loop-result if set, otherwise result
+								if lr, lerr := env.Get("loop-result"); lerr == nil && lr != nil && lr != vnil() {
+									return lr, nil
+								}
+								return result, nil
+							}
+							return br.value, nil
+						}
+						return nil, err
+					}
+					body = body.cdr
+				}
+				return result, nil
+			case "return-from":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("return-from: malformed form")
+				}
+				if v.cdr.car == nil || v.cdr.car.typ != VSym {
+					return nil, fmt.Errorf("return-from: block name must be a symbol")
+				}
+				name := v.cdr.car.str
+				if v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("return-from: missing return value")
+				}
+				val, err := eval(v.cdr.cdr.car, env)
+				if err != nil {
+					return nil, err
+				}
+				return nil, &blockReturn{name: name, value: val}
+			case "loop-finish":
+				// Check if loop-result is bound and return its value
+				if v, lerr := env.Get("loop-result"); lerr == nil && v != nil && v != vnil() {
+					return nil, &blockReturn{name: "nil", value: v}
+				}
+				return nil, &blockReturn{name: "nil", value: vnil(), isLoopFinish: true}
+			case "return":
+				rval := vnil()
+				if v.cdr != nil && v.cdr.typ == VPair && !isNil(v.cdr) {
+					var e2 error
+					rval, e2 = eval(v.cdr.car, env)
+					if e2 != nil {
+						return nil, e2
+					}
+				}
+				return nil, &blockReturn{name: "nil", value: rval}
+
+			case "tagbody":
+				body := v.cdr
+				if body.typ != VPair && !isNil(body) {
+					return nil, fmt.Errorf("tagbody: malformed form")
+				}
+				// Build tag -> position map
+				tagPos := make(map[string]int)
+				pos := 0
+				for !isNil(body) {
+					stmt := body.car
+					if stmt.typ == VSym {
+						tagPos[stmt.str] = pos
+					} else if stmt.typ == VNum {
+						tagPos[strconv.FormatFloat(stmt.num, 'f', 0, 64)] = pos
+					}
+					body = body.cdr
+					pos++
+				}
+				// Execute statements
+				body = v.cdr
+				for !isNil(body) {
+					stmt := body.car
+					if stmt.typ != VSym && stmt.typ != VNum {
+						_, err = eval(stmt, env)
+						if err != nil {
+							if _, ok := err.(*blockReturn); ok {
+								return nil, err
+							}
+							if gt, ok := err.(*goTag); ok {
+								targetPos, ok := tagPos[gt.tag]
+								if !ok {
+									return nil, fmt.Errorf("go: tag %s not found", gt.tag)
+								}
+								body = v.cdr
+								for i := 0; i < targetPos; i++ {
+									body = body.cdr
+								}
+								// Skip past the tag itself to the next statement
+								body = body.cdr
+								continue
+							}
+							return nil, err
+						}
+					}
+					body = body.cdr
+				}
+				return vnil(), nil
+			case "go":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("go: malformed form")
+				}
+				tag := v.cdr.car
+				if tag.typ == VSym {
+					return nil, &goTag{tag: tag.str}
+				} else if tag.typ == VNum {
+					return nil, &goTag{tag: strconv.FormatFloat(tag.num, 'f', 0, 64)}
+				}
+				return nil, fmt.Errorf("go: tag must be symbol or number")
+			case "catch":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("catch: malformed form")
+				}
+				tag, err := eval(v.cdr.car, env)
+				if err != nil {
+					return nil, fmt.Errorf("catch: tag evaluation error: %v", err)
+				}
+				var tagName string
+				if tag.typ == VSym {
+					tagName = tag.str
+				} else if tag.typ == VStr {
+					tagName = tag.str
+				} else {
+					return nil, fmt.Errorf("catch: tag must be a symbol or string")
+				}
+				body := v.cdr.cdr
+				var result *Value = vnil()
+				for !isNil(body) {
+					result, err = eval(body.car, env)
+					if err != nil {
+						if tv, ok := err.(*throwValue); ok && tv.tag == tagName {
+							return tv.value, nil
+						}
+						// Propagate non-matching throws and other errors
+						return nil, err
+					}
+					body = body.cdr
+				}
+				return result, nil
+			case "throw":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("throw: malformed form")
+				}
+				tag, err := eval(v.cdr.car, env)
+				if err != nil {
+					return nil, fmt.Errorf("throw: tag evaluation error: %v", err)
+				}
+				var tagName string
+				if tag.typ == VSym {
+					tagName = tag.str
+				} else if tag.typ == VStr {
+					tagName = tag.str
+				} else {
+					return nil, fmt.Errorf("throw: tag must be a symbol or string")
+				}
+				if v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("throw: need a value form")
+				}
+				val := v.cdr.cdr.car
+				val, err = eval(val, env)
+				if err != nil {
+					return nil, err
+				}
+				return nil, &throwValue{tag: tagName, value: val}
+			case "multiple-value-bind":
+				// (multiple-value-bind (var1 var2 ...) values-form body...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("multiple-value-bind: malformed form")
+				}
+				vars := v.cdr.car
+				if v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("multiple-value-bind: malformed form")
+				}
+				valForm := v.cdr.cdr.car
+				body := v.cdr.cdr.cdr
+				valResult, e := eval(valForm, env)
+				if e != nil {
+					return nil, e
+				}
+				// Get the list of values
+				vals := multiValList(valResult)
+				newEnv := NewEnv(env)
+				vp := vars
+				vl := vals
+				for !isNil(vp) && !isNil(vl) {
+					if vp.typ != VPair || vp.car == nil || vp.car.typ != VSym {
+						return nil, fmt.Errorf("multiple-value-bind: vars must be symbols")
+					}
+					newEnv.Set(vp.car.str, vl.car)
+					vp = vp.cdr
+					vl = vl.cdr
+				}
+				// Remaining vars get nil
+				for !isNil(vp) {
+					if vp.typ != VPair || vp.car == nil || vp.car.typ != VSym {
+						return nil, fmt.Errorf("multiple-value-bind: vars must be symbols")
+					}
+					newEnv.Set(vp.car.str, vnil())
+					vp = vp.cdr
+				}
+				env = newEnv
+				for body.typ == VPair && !isNil(body.cdr) {
+					_, err = eval(body.car, env)
+					if err != nil {
+						return nil, err
+					}
+					body = body.cdr
+				}
+				if body.typ != VPair {
+					return vnil(), nil
+				}
+				v = body.car
+				continue
+			case "multiple-value-list":
+				// (multiple-value-list form)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("multiple-value-list: need a form")
+				}
+				form := v.cdr.car
+				result, e := eval(form, env)
+				if e != nil {
+					return nil, e
+				}
+				return multiValList(result), nil
+			case "multiple-value-setq":
+				// (multiple-value-setq (var1 var2 ...) form)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("multiple-value-setq: malformed form")
+				}
+				vars := v.cdr.car
+				form := v.cdr.cdr.car
+				result, e := eval(form, env)
+				if e != nil {
+					return nil, e
+				}
+				vals := multiValList(result)
+				vp := vars
+				vl := vals
+				for !isNil(vp) && !isNil(vl) {
+					if vp.typ != VPair || vp.car == nil || vp.car.typ != VSym {
+						return nil, fmt.Errorf("multiple-value-setq: vars must be symbols")
+					}
+					env.Set(vp.car.str, vl.car)
+					vp = vp.cdr
+					vl = vl.cdr
+				}
+				v = result
+				continue
+			case "multiple-value-prog1":
+				// (multiple-value-prog1 form1 form2 ...)
+				// Evaluates all forms, returns values of the first form
+				if isNil(v.cdr) {
+					return nil, fmt.Errorf("multiple-value-prog1: need at least one form")
+				}
+				firstForm := v.cdr.car
+				result, e := eval(firstForm, env)
+				if e != nil {
+					return nil, e
+				}
+				// Evaluate remaining forms for side effects
+				for form := v.cdr.cdr; !isNil(form); form = form.cdr {
+					_, err = eval(form.car, env)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return result, nil
+			case "multiple-value-call":
+				// (multiple-value-call fn form1 form2 ...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("multiple-value-call: malformed form")
+				}
+				fnForm := v.cdr.car
+				fnVal, e := eval(fnForm, env)
+				if e != nil {
+					return nil, e
+				}
+				// Collect all values from each form
+				var allArgs *Value = vnil()
+				tail := allArgs
+				forms := v.cdr.cdr
+				for !isNil(forms) {
+					valResult, e := eval(forms.car, env)
+					if e != nil {
+						return nil, e
+					}
+					vals := multiValList(valResult)
+					// Append vals to allArgs
+					for !isNil(vals) {
+						cell := cons(vals.car, vnil())
+						if isNil(allArgs) {
+							allArgs = cell
+							tail = cell
+						} else {
+							tail.cdr = cell
+							tail = cell
+						}
+						vals = vals.cdr
+					}
+					forms = forms.cdr
+				}
+				return apply(fnVal, allArgs, env)
+			case "nth-value":
+				// (nth-value n form) => nth value (0-based)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("nth-value: malformed form")
+				}
+				nVal, e := eval(v.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				n := int(primaryValue(nVal).num)
+				valResult, e := eval(v.cdr.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				vals := multiValList(valResult)
+				for i := 0; i < n && !isNil(vals); i++ {
+					vals = vals.cdr
+				}
+				if isNil(vals) {
+					return vnil(), nil
+				}
+				return vals.car, nil
+
+			case "case":
+				// (case keyform ((key1 key2 ...) body...) ... (else body...))
+				// Also supports single key: (case keyform (key body...) ...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("case: malformed form")
+				}
+				keyVal, e := eval(v.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				keyVal = primaryValue(keyVal)
+				clauses := v.cdr.cdr
+				caseSeen := make(map[*Value]bool)
+				for !isNil(clauses) {
+					if caseSeen[clauses] {
+						break
+					}
+					caseSeen[clauses] = true
+					clause := clauses.car
+					if clause == nil || clause.typ != VPair {
+						clauses = clauses.cdr
+						continue
+					}
+					keys := clause.car
+					// Check for else clause
+					if keys.typ == VSym && keys.str == "else" {
+						body := clause.cdr
+						for body.typ == VPair && !isNil(body.cdr) {
+							_, err = eval(body.car, env)
+							if err != nil {
+								return nil, err
+							}
+							body = body.cdr
+						}
+						if body.typ != VPair {
+							return vnil(), nil
+						}
+						v = body.car
+						continue evalLoop
+					}
+					// Normalize: if key is not a list, treat as single-element
+					match := false
+					if keys.typ != VPair {
+						if eqVal(keys, keyVal) {
+							match = true
+						}
+					} else {
+						for !isNil(keys) {
+							if eqVal(keys.car, keyVal) {
+								match = true
+								break
+							}
+							keys = keys.cdr
+						}
+					}
+					if match {
+						body := clause.cdr
+						for body.typ == VPair && !isNil(body.cdr) {
+							_, err = eval(body.car, env)
+							if err != nil {
+								return nil, err
+							}
+							body = body.cdr
+						}
+						if body.typ != VPair {
+							return vnil(), nil
+						}
+						v = body.car
+						continue evalLoop
+					}
+					clauses = clauses.cdr
+				}
+				return vnil(), nil
+
+			case "typecase":
+				// (typecase keyform ((type) body...) ... (else body...))
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("typecase: malformed form")
+				}
+				keyVal, e := eval(v.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				keyVal = primaryValue(keyVal)
+				clauses := v.cdr.cdr
+				typecaseSeen := make(map[*Value]bool)
+				for !isNil(clauses) && clauses.typ == VPair {
+					if typecaseSeen[clauses] {
+						break
+					}
+					typecaseSeen[clauses] = true
+					clause := clauses.car
+					if clause == nil || clause.typ != VPair {
+						clauses = clauses.cdr
+						continue
+					}
+					typeSpec := clause.car
+					// Check for else clause
+					if typeSpec != nil && typeSpec.typ == VSym && (typeSpec.str == "else" || typeSpec.str == "otherwise" || typeSpec.str == "t") {
+						body := clause.cdr
+						for body.typ == VPair && !isNil(body.cdr) {
+							_, err = eval(body.car, env)
+							if err != nil {
+								return nil, err
+							}
+							body = body.cdr
+						}
+						if body.typ != VPair {
+							return vnil(), nil
+						}
+						v = body.car
+						continue evalLoop
+					}
+					if typepCheck(keyVal, typeSpec, env) {
+						body := clause.cdr
+						for body.typ == VPair && !isNil(body.cdr) {
+							_, err = eval(body.car, env)
+							if err != nil {
+								return nil, err
+							}
+							body = body.cdr
+						}
+						if body.typ != VPair {
+							return vnil(), nil
+						}
+						v = body.car
+						continue evalLoop
+					}
+					clauses = clauses.cdr
+				}
+				return vnil(), nil
+			case "ecase":
+				// (ecase keyform (key body...) ...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("ecase: malformed form")
+				}
+				keyVal, e := eval(v.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				keyVal = primaryValue(keyVal)
+				clauses := v.cdr.cdr
+				ecaseSeen := make(map[*Value]bool)
+				for !isNil(clauses) {
+					if ecaseSeen[clauses] {
+						break
+					}
+					ecaseSeen[clauses] = true
+					clause := clauses.car
+					if clause == nil || clause.typ != VPair {
+						clauses = clauses.cdr
+						continue
+					}
+					keys := clause.car
+					match := false
+					if keys.typ != VPair {
+						if eqVal(keys, keyVal) {
+							match = true
+						}
+					} else {
+						for !isNil(keys) {
+							if eqVal(keys.car, keyVal) {
+								match = true
+								break
+							}
+							keys = keys.cdr
+						}
+					}
+					if match {
+						body := clause.cdr
+						for body.typ == VPair && !isNil(body.cdr) {
+							_, err = eval(body.car, env)
+							if err != nil {
+								return nil, err
+							}
+							body = body.cdr
+						}
+						if body.typ != VPair {
+							return vnil(), nil
+						}
+						v = body.car
+						continue evalLoop
+					}
+					clauses = clauses.cdr
+				}
+				return nil, fmt.Errorf("ecase: no match for ~A", keyVal)
+			case "etypecase":
+				// (etypecase keyform (type body...) ...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("etypecase: malformed form")
+				}
+				keyVal, e := eval(v.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				keyVal = primaryValue(keyVal)
+				clauses := v.cdr.cdr
+				for !isNil(clauses) {
+					clause := clauses.car
+					if clause == nil || clause.typ != VPair {
+						clauses = clauses.cdr
+						continue
+					}
+					typeSpec := clause.car
+					if typepCheck(keyVal, typeSpec, env) {
+						body := clause.cdr
+						for body.typ == VPair && !isNil(body.cdr) {
+							_, err = eval(body.car, env)
+							if err != nil {
+								return nil, err
+							}
+							body = body.cdr
+						}
+						if body.typ != VPair {
+							return vnil(), nil
+						}
+						v = body.car
+						continue evalLoop
+					}
+					clauses = clauses.cdr
+				}
+				return nil, fmt.Errorf("etypecase: no match for ~A", keyVal)
+
+			case "ctypecase":
+				// (ctypecase keyplace (type body...) ...)
+				// Like etypecase but keyplace is a place (setf-able)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("ctypecase: malformed form")
+				}
+				keyVal, e := eval(v.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				keyVal = primaryValue(keyVal)
+				clauses := v.cdr.cdr
+				for !isNil(clauses) {
+					clause := clauses.car
+					if clause == nil || clause.typ != VPair {
+						clauses = clauses.cdr
+						continue
+					}
+					typeSpec := clause.car
+					if typepCheck(keyVal, typeSpec, env) {
+						body := clause.cdr
+						for body.typ == VPair && !isNil(body.cdr) {
+							_, err = eval(body.car, env)
+							if err != nil {
+								return nil, err
+							}
+							body = body.cdr
+						}
+						if body.typ != VPair {
+							return vnil(), nil
+						}
+						v = body.car
+						continue evalLoop
+					}
+					clauses = clauses.cdr
+				}
+				return nil, fmt.Errorf("ctypecase: no match for ~A", keyVal)
+
+			case "destructuring-bind":
+				// (destructuring-bind (pattern) expr body...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("destructuring-bind: malformed form")
+				}
+				pattern := v.cdr.car
+				expr := v.cdr.cdr.car
+				body := v.cdr.cdr.cdr
+				val, e := eval(expr, env)
+				if e != nil {
+					return nil, e
+				}
+				val = primaryValue(val)
+				newEnv := NewEnv(env)
+				e = bindPattern(pattern, val, newEnv)
+				if e != nil {
+					return nil, e
+				}
+				env = newEnv
+				for body.typ == VPair && !isNil(body.cdr) {
+					_, err = eval(body.car, env)
+					if err != nil {
+						return nil, err
+					}
+					body = body.cdr
+				}
+				if body.typ != VPair {
+					return vnil(), nil
+				}
+				v = body.car
+				continue
+
+			case "handler-case":
+				// (handler-case expr (type (var) body...) ... (:no-error (vars...) body...))
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("handler-case: malformed form")
+				}
+				valForm := v.cdr.car
+				clauses := v.cdr.cdr
+				// Scan for :no-error clause first
+				var noErrorClause *Value
+				var noErrorVars []string
+				hcSeen := make(map[*Value]bool)
+				scanClauses := clauses
+				for !isNil(scanClauses) && scanClauses.typ == VPair {
+					if hcSeen[scanClauses] {
+						break
+					}
+					hcSeen[scanClauses] = true
+					clause := scanClauses.car
+					if clause.typ == VPair && clause.car != nil && clause.car.typ == VSym && clause.car.str == ":no-error" {
+						noErrorClause = clause
+						// Parse variable list
+						varsForm := clause.cdr.car
+						for !isNil(varsForm) && varsForm.typ == VPair {
+							if varsForm.car != nil && varsForm.car.typ == VSym {
+								noErrorVars = append(noErrorVars, varsForm.car.str)
+							}
+							varsForm = varsForm.cdr
+						}
+						break
+					}
+					scanClauses = scanClauses.cdr
+				}
+				// Push handler entries for each clause type (skip :no-error)
+				savedLen := len(handlerStack)
+				hcSeen2 := make(map[*Value]bool)
+				for !isNil(clauses) && clauses.typ == VPair {
+					if hcSeen2[clauses] {
+						break
+					}
+					hcSeen2[clauses] = true
+					clause := clauses.car
+					if clause == nil || clause.typ != VPair {
+						clauses = clauses.cdr
+						continue
+					}
+					if clause.typ != VPair {
+						return nil, fmt.Errorf("handler-case: malformed clause")
+					}
+					if clause.car == nil || clause.car.typ != VSym {
+						return nil, fmt.Errorf("handler-case: clause must start with a type symbol")
+					}
+					typeSym := clause.car.str
+					if typeSym == ":no-error" {
+						clauses = clauses.cdr
+						continue // skip :no-error in handler setup
+					}
+					// Use a sentinel VPrim that panics with handledError
+					capturedType := typeSym
+					handlerFn := &Value{typ: VPrim, fn: func(args []*Value) (*Value, error) {
+						cond := args[0]
+						panic(&handledError{condition: cond, result: nil, typeSym: capturedType})
+					}}
+					handlerStack = append(handlerStack, handlerEntry{
+						typeSymbol: typeSym,
+						handlerFn:  handlerFn,
+						env:        env,
+					})
+					clauses = clauses.cdr
+				}
+				// Evaluate valForm with panic recovery
+				var hcResult *Value
+				var hcErr error
+				hcHandled := false
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							handlerStack = handlerStack[:savedLen]
+							if he, ok := r.(*handledError); ok {
+								// Find matching clause and evaluate body
+								cl2 := v.cdr.cdr
+								cl2Seen := make(map[*Value]bool)
+								for !isNil(cl2) && cl2.typ == VPair {
+									if cl2Seen[cl2] {
+										break
+									}
+									cl2Seen[cl2] = true
+									clause := cl2.car
+									cond := he.condition
+									if clause.typ != VPair {
+										cl2 = cl2.cdr
+										continue
+									}
+									if clause.car == nil || clause.car.typ != VSym {
+										cl2 = cl2.cdr
+										continue
+									}
+									clauseTypeSym := clause.car.str
+									if classMatchesCondition(clauseTypeSym, cond) {
+										hcHandled = true
+										body := clause.cdr
+										varName := ""
+										if isPair(body) && isPair(body.car) && body.car.car != nil && body.car.car.typ == VSym {
+											varName = body.car.car.str
+										} else if isPair(body) && body.car != nil && body.car.typ == VSym {
+											varName = body.car.str
+										}
+										newEnv := NewEnv(env)
+										if varName != "" {
+											newEnv.Set(varName, cond)
+										}
+										body = body.cdr
+										hcResult = vnil()
+										for !isNil(body) {
+											hcResult, hcErr = eval(body.car, newEnv)
+											if hcErr != nil {
+												return
+											}
+											body = body.cdr
+										}
+										return
+									}
+									cl2 = cl2.cdr
+								}
+								// No handler matched — convert to error instead of re-panicking
+								if he.condition != nil {
+									hcErr = fmt.Errorf("unhandled condition: %s", toString(he.condition))
+								} else {
+									hcErr = fmt.Errorf("unhandled condition")
+								}
+							} else {
+								// Not a handledError — re-panic (genuine panic)
+								panic(r)
+							}
+						}
+						handlerStack = handlerStack[:savedLen]
+					}()
+					hcResult, hcErr = eval(valForm, env)
+				}()
+				if hcErr != nil {
+					return nil, hcErr
+				}
+				// Evaluate :no-error clause if present
+				if !hcHandled && noErrorClause != nil {
+					noErrorBody := noErrorClause.cdr.cdr // skip :no-error and var list
+					if len(noErrorVars) > 0 {
+						noErrorEnv := NewEnv(env)
+						for i, vname := range noErrorVars {
+							if i == 0 {
+								noErrorEnv.Set(vname, hcResult)
+							}
+						}
+						hcResult = vnil()
+						for !isNil(noErrorBody) {
+							hcResult, hcErr = eval(noErrorBody.car, noErrorEnv)
+							if hcErr != nil {
+								return nil, hcErr
+							}
+							noErrorBody = noErrorBody.cdr
+						}
+					}
+				}
+				return hcResult, nil
+
+			case "handler-bind":
+				// (handler-bind ((type handler-fn) ...) body...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("handler-bind: malformed form")
+				}
+				bindings := v.cdr.car
+				body := v.cdr.cdr
+				savedLen := len(handlerStack)
+				hbSeen := make(map[*Value]bool)
+				for !isNil(bindings) && bindings.typ == VPair {
+					if hbSeen[bindings] {
+						break
+					}
+					hbSeen[bindings] = true
+					binding := bindings.car
+					if binding.typ != VPair {
+						return nil, fmt.Errorf("handler-bind: malformed binding")
+					}
+					if binding.car == nil || binding.car.typ != VSym {
+						return nil, fmt.Errorf("handler-bind: type specifier must be a symbol")
+					}
+					typeSym := binding.car.str
+					if binding.cdr == nil || binding.cdr.typ != VPair {
+						return nil, fmt.Errorf("handler-bind: handler must be a form")
+					}
+					handlerFn := binding.cdr.car
+					// Evaluate the handler expression (e.g. (lambda (c) ...))
+					evaldFn, e := eval(handlerFn, env)
+					if e != nil {
+						return nil, e
+					}
+					handlerStack = append(handlerStack, handlerEntry{
+						typeSymbol: typeSym,
+						handlerFn:  evaldFn,
+						env:        env,
+					})
+					bindings = bindings.cdr
+				}
+				defer func() {
+					handlerStack = handlerStack[:savedLen]
+				}()
+				var hbResult *Value
+				var hbErr error
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							// Re-panic handledError so handler-case can catch it
+							// Let other panics (restartInvoke, tailCall) propagate naturally
+							if _, ok := r.(*handledError); ok {
+								panic(r)
+							}
+							// For all other panics, convert to error return
+							hbErr = fmt.Errorf("handler-bind caught panic: %v", r)
+						}
+					}()
+					for body.typ == VPair && !isNil(body.cdr) {
+						hbResult, hbErr = eval(body.car, env)
+						if hbErr != nil {
+							return
+						}
+						body = body.cdr
+					}
+					if body.typ == VPair {
+						hbResult, hbErr = eval(body.car, env)
+					} else if !isNil(body) {
+						hbResult, hbErr = eval(body, env)
+					} else {
+						hbResult = vnil()
+					}
+				}()
+				return hbResult, hbErr
+
+			case "restart-case":
+				// (restart-case expr (name (arg) body...) ...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("restart-case: malformed form")
+				}
+				valForm := v.cdr.car
+				clauses := v.cdr.cdr
+				savedLen := len(restartStack)
+				rcSeen := make(map[*Value]bool)
+				for !isNil(clauses) && clauses.typ == VPair {
+					if rcSeen[clauses] {
+						break
+					}
+					rcSeen[clauses] = true
+					clause := clauses.car
+					if clause == nil || clause.typ != VPair {
+						clauses = clauses.cdr
+						continue
+					}
+					if clause.typ != VPair {
+						return nil, fmt.Errorf("restart-case: malformed clause")
+					}
+					if clause.car == nil || clause.car.typ != VSym {
+						return nil, fmt.Errorf("restart-case: clause must start with a name")
+					}
+					name := clause.car.str
+					body := clause.cdr
+					// Extract varName from lambda list
+					varName := ""
+					if isPair(body) && isPair(body.car) && body.car.car != nil && body.car.car.typ == VSym {
+						varName = body.car.car.str
+					}
+					body = body.cdr // skip lambda list
+					restartStack = append(restartStack, restartEntry{
+						name:      name,
+						handlerFn: nil, // body is evaluated on invoke
+						condition: nil,
+						env:       env,
+					})
+					_ = varName
+					_ = body
+					clauses = clauses.cdr
+				}
+				// Evaluate valForm with restart handling
+				var rcResult *Value
+				var rcErr error
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							if ri, ok := r.(*restartInvoke); ok {
+								// Save restart stack before truncating
+								stk := restartStack
+								restartStack = restartStack[:savedLen]
+								// Find matching restart and evaluate body
+								for i := len(stk) - 1; i >= 0; i-- {
+									if stk[i].name == ri.name {
+										// Evaluate body - walk clauses again
+										cl2 := v.cdr.cdr
+										cl2Seen := make(map[*Value]bool)
+										for !isNil(cl2) && cl2.typ == VPair {
+											if cl2Seen[cl2] {
+												break
+											}
+											cl2Seen[cl2] = true
+											if cl2.typ != VPair {
+												break
+											}
+											cl2c := cl2.car
+											if cl2c == nil || cl2c.typ != VPair || cl2c.car == nil || cl2c.car.typ != VSym {
+												cl2 = cl2.cdr
+												continue
+											}
+											if cl2c.car.str == ri.name {
+												bd := cl2c.cdr
+												// Parse lambda list: extract var names
+												varNames := []*Value{}
+												var restVar *Value = nil
+												ll := bd // lambda list is first element of body
+												if isPair(ll) && isPair(ll.car) {
+													ll = ll.car
+													for !isNil(ll) {
+														if ll.car != nil && ll.car.typ == VSym {
+															s := ll.car.str
+															if s == "&rest" || s == "&body" {
+																if ll.cdr != nil && ll.cdr.typ == VPair && ll.cdr.car != nil && ll.cdr.car.typ == VSym {
+																	restVar = ll.cdr.car
+																}
+																break
+															} else if s == "&optional" || s == "&key" || s == "&allow-other-keys" || s == "&aux" {
+																ll = ll.cdr
+																continue
+															}
+															varNames = append(varNames, ll.car)
+														}
+														ll = ll.cdr
+													}
+												}
+												bd = bd.cdr // skip lambda list
+												newEnv := NewEnv(env)
+												// Bind args to vars
+												argVals := ri.args
+												for j := 0; j < len(varNames) && !isNil(argVals); j++ {
+													newEnv.Set(varNames[j].str, argVals.car)
+													argVals = argVals.cdr
+												}
+												// Bind rest var to remaining args as list
+												if restVar != nil {
+													newEnv.Set(restVar.str, argVals)
+												}
+												rcResult = vnil()
+												for !isNil(bd) {
+													rcResult, rcErr = eval(bd.car, newEnv)
+													if rcErr != nil {
+														return
+													}
+													bd = bd.cdr
+												}
+												return
+											}
+											cl2 = cl2.cdr
+										}
+									}
+								}
+							}
+							restartStack = restartStack[:savedLen]
+							panic(r)
+						}
+						restartStack = restartStack[:savedLen]
+					}()
+					rcResult, rcErr = eval(valForm, env)
+				}()
+				if rcErr != nil {
+					return nil, rcErr
+				}
+				return rcResult, nil
+
+			case "restart-bind":
+				// (restart-bind ((name fn) ...) body...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("restart-bind: malformed form")
+				}
+				rbindings := v.cdr.car
+				rbody := v.cdr.cdr
+				rsavedLen := len(restartStack)
+				rbSeen := make(map[*Value]bool)
+				for !isNil(rbindings) && rbindings.typ == VPair {
+					if rbSeen[rbindings] {
+						break
+					}
+					rbinding := rbindings.car
+					if rbinding.typ != VPair {
+						return nil, fmt.Errorf("restart-case: malformed restart binding")
+					}
+					if rbinding.car == nil || rbinding.car.typ != VSym {
+						return nil, fmt.Errorf("restart-bind: binding name must be a symbol")
+					}
+					rname := rbinding.car.str
+					if rbinding.cdr == nil || isNil(rbinding.cdr) {
+						return nil, fmt.Errorf("restart-bind: malformed restart binding")
+					}
+					if rbinding.cdr.typ != VPair {
+						return nil, fmt.Errorf("restart-bind: malformed restart binding")
+					}
+					rfn := rbinding.cdr.car
+					evaldRfn, e := eval(rfn, env)
+					if e != nil {
+						return nil, e
+					}
+					restartStack = append(restartStack, restartEntry{
+						name:      rname,
+						handlerFn: evaldRfn,
+						condition: nil,
+						env:       env,
+					})
+					rbindings = rbindings.cdr
+				}
+				defer func() {
+					restartStack = restartStack[:rsavedLen]
+				}()
+				for rbody.typ == VPair && !isNil(rbody.cdr) {
+					_, err = eval(rbody.car, env)
+					if err != nil {
+						return nil, err
+					}
+					rbody = rbody.cdr
+				}
+				v = rbody.car
+				continue
+
+			case "macrolet":
+				// (macrolet ((name (args...) body...) ...) expr...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("macrolet: malformed form")
+				}
+				bindings := v.cdr.car
+				body := v.cdr.cdr
+				newEnv := NewEnv(env)
+				for !isNil(bindings) {
+					if bindings.typ != VPair {
+						return nil, fmt.Errorf("restart-case: malformed bindings")
+					}
+					binding := bindings.car
+					if binding.typ != VPair {
+						return nil, fmt.Errorf("macrolet: malformed binding")
+					}
+					if binding.car == nil || binding.car.typ != VSym {
+						return nil, fmt.Errorf("macrolet: macro name must be a symbol")
+					}
+					mname := binding.car.str
+					macroParams := binding.cdr.car
+					macroBody := binding.cdr.cdr
+					params, rest, e := parseParams(macroParams)
+					if e != nil {
+						return nil, e
+					}
+					m := gcv()
+					m.typ = VMacro
+					m.params = params
+					m.rest = rest
+					m.body = macroBody
+					m.env = newEnv
+					newEnv.Set(mname, m)
+					bindings = bindings.cdr
+				}
+				env = newEnv
+				for body.typ == VPair && !isNil(body.cdr) {
+					_, err = eval(body.car, env)
+					if err != nil {
+						return nil, err
+					}
+					body = body.cdr
+				}
+				if body.typ != VPair {
+					return vnil(), nil
+				}
+				v = body.car
+				continue
+			case "symbol-macrolet":
+				// (symbol-macrolet ((sym expansion) ...) expr...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("symbol-macrolet: malformed form")
+				}
+				symBindings := v.cdr.car
+				symBody := v.cdr.cdr
+				symEnv := NewEnv(env)
+				for !isNil(symBindings) {
+					if symBindings.typ != VPair {
+						return nil, fmt.Errorf("symbol-macrolet: malformed bindings")
+					}
+					b := symBindings.car
+					if b.typ != VPair {
+						return nil, fmt.Errorf("symbol-macrolet: malformed binding")
+					}
+					if b.car == nil || b.car.typ != VSym {
+						return nil, fmt.Errorf("symbol-macrolet: binding name must be a symbol")
+					}
+					sname := b.car.str
+					if b.cdr == nil || b.cdr.typ != VPair {
+						return nil, fmt.Errorf("symbol-macrolet: malformed binding")
+					}
+					expansion := b.cdr.car
+					sv := gcv()
+					sv.typ = VSymMacro
+					sv.car = expansion
+					symEnv.Set(sname, sv)
+					symBindings = symBindings.cdr
+				}
+				env = symEnv
+				for symBody.typ == VPair && !isNil(symBody.cdr) {
+					v = symBody.car
+					symBody = symBody.cdr
+					continue
+				}
+				v = symBody.car
+				continue
+			case "eval-when":
+				// (eval-when (situations) body...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("eval-when: malformed form")
+				}
+				situations := v.cdr.car
+				ewBody := v.cdr.cdr
+				execute := false
+				for !isNil(situations) {
+					s := situations.car
+					if s.typ == VSym {
+						switch s.str {
+						case ":execute", "execute", ":eval", "eval",
+							":load-toplevel", "load-toplevel", ":load", "load":
+							execute = true
+						}
+					}
+					situations = situations.cdr
+				}
+				if execute {
+					for ewBody.typ == VPair && !isNil(ewBody.cdr) {
+						_, err = eval(ewBody.car, env)
+						if err != nil {
+							return nil, err
+						}
+						ewBody = ewBody.cdr
+					}
+					v = ewBody.car
+					continue
+				}
+				return vnil(), nil
+			case "setf":
+				// (setf var newval) or (setf (accessor args...) newval)
+				if v.cdr == nil || v.cdr.typ != VPair || v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("setf: malformed form")
+				}
+				target := v.cdr.car
+				newValExpr := v.cdr.cdr.car
+				if target.typ == VSym {
+					// Simple variable: (setf x val) -> like (set! x val)
+					name := target.str
+					ev, e := eval(newValExpr, env)
+					if e != nil {
+						return nil, e
+					}
+					for scope := env; scope != nil; scope = scope.parent {
+						if _, ok := scope.bindings[name]; ok {
+							scope.bindings[name] = ev
+							return ev, nil
+						}
+					}
+					return nil, fmt.Errorf("setf: undefined %s", name)
+				}
+				// (setf (accessor args...) newval)
+				if target.typ != VPair {
+					return nil, fmt.Errorf("setf: target must be a list or symbol")
+				}
+				if target.car == nil { return nil, fmt.Errorf("setf: empty accessor") }
+				accessorName := target.car.str
+				args := target.cdr
+				// Look up <accessor>-setf function
+				setter, err := env.Get(accessorName + "-setf")
+				if err != nil {
+					return nil, fmt.Errorf("setf: no setter for %s", accessorName)
+				}
+				// Build: (setter newval args...)
+				newValNode := &Value{typ: VPair, car: newValExpr, cdr: vnil()}
+				var callArgs *Value
+				if isNil(args) {
+					callArgs = newValNode
+				} else {
+					// First arg: newVal
+					callArgs = &Value{typ: VPair, car: newValExpr, cdr: vnil()}
+					tail := callArgs
+					// Then original args
+					for ; !isNil(args); args = args.cdr {
+						tail.cdr = &Value{typ: VPair, car: args.car, cdr: vnil()}
+						tail = tail.cdr
+					}
+				}
+				v = &Value{typ: VPair, car: setter, cdr: callArgs}
+				continue
+			case "cond":
+				clauses := v.cdr
+				seen := make(map[*Value]bool)
+				for !isNil(clauses) && clauses.typ == VPair {
+					if seen[clauses] {
+						break
+					}
+					seen[clauses] = true
+					cl := clauses.car
+					if cl.typ != VPair {
+						clauses = clauses.cdr
+						continue
+					}
+					if cl.car != nil && cl.car.typ == VSym && cl.car.str == "else" {
+						body := cl.cdr
+						if isNil(body) {
+							return vnil(), nil
+						}
+						for body.typ == VPair && !isNil(body.cdr) {
+							_, e := eval(body.car, env)
+							if e != nil {
+								return nil, e
+							}
+							body = body.cdr
+						}
+						if body.typ != VPair {
+							return vnil(), nil
+						}
+						v = body.car
+						continue evalLoop
+					}
+					cond, e := eval(cl.car, env)
+					if e != nil {
+						return nil, e
+					}
+					if isTruthy(cond) {
+						body := cl.cdr
+						if isNil(body) {
+							return cond, nil
+						}
+						for body.typ == VPair && !isNil(body.cdr) {
+							_, e := eval(body.car, env)
+							if e != nil {
+								return nil, e
+							}
+							body = body.cdr
+						}
+						if body.typ != VPair {
+							return vnil(), nil
+						}
+						v = body.car
+						continue evalLoop
+					}
+					clauses = clauses.cdr
+				}
+				return vnil(), nil
+
+			case "defclass":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("defclass: malformed form")
+				}
+				if v.cdr.car == nil || v.cdr.car.typ != VSym {
+					return nil, fmt.Errorf("defclass: name must be a symbol")
+				}
+				className := v.cdr.car.str
+				if v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("defclass: malformed form")
+				}
+				parentsVal := v.cdr.cdr.car
+				if v.cdr.cdr.cdr == nil || v.cdr.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("defclass: missing slots")
+				}
+				slotsVal := v.cdr.cdr.cdr.car
+				// Strip (quote ...) wrapper if present
+				if !isNil(slotsVal) && slotsVal.typ == VPair && slotsVal.car != nil && slotsVal.car.typ == VSym && slotsVal.car.str == "quote" {
+					if !isNil(slotsVal.cdr) && slotsVal.cdr.typ == VPair {
+						slotsVal = slotsVal.cdr.car
+					} else {
+						slotsVal = vnil()
+					}
+				}
+				// Slot specifications (with options) come from the 3rd arg of defclass
+				slotDefsVal := slotsVal
+
+				cl := gcv()
+				cl.typ = VClass
+				cl.str = className
+
+				// Parse parent classes
+				var parents []*Value
+				for !isNil(parentsVal) {
+					p := parentsVal.car
+					// Look up parent in class registry (not eval — separates class ns from function ns)
+					parentName := ""
+					if p.typ == VSym {
+						parentName = p.str
+					} else {
+						return nil, fmt.Errorf("defclass: parent must be a symbol")
+					}
+					pClass := findClass(parentName)
+					if pClass == nil || pClass.typ != VClass {
+						return nil, fmt.Errorf("defclass: %s is not a class", parentName)
+					}
+					parents = append(parents, pClass)
+					parentsVal = parentsVal.cdr
+				}
+				cl.classParents = parents
+
+				// Parse slot names (support both bare symbols and lists with options)
+				var slots []string
+				// Parse slot names and store slot specs in class body
+				cl.body = slotDefsVal
+				for !isNil(slotsVal) {
+					slot := slotsVal.car
+					if slot.typ == VSym {
+						slots = append(slots, slot.str)
+					} else if slot.typ == VPair && slot.car != nil && slot.car.typ == VSym {
+						slots = append(slots, slot.car.str)
+					}
+					slotsVal = slotsVal.cdr
+				}
+				cl.classSlots = slots
+
+				// Compute CPL
+				cl.cpl = c3Linearize(cl, parents)
+
+				// Store in class registry (separate namespace from functions)
+				classRegistry[className] = cl
+				// Also set in env, but don't shadow callable bindings
+				existing, _ := env.Get(className)
+				if existing == nil || existing.typ == VNil || existing.typ == VClass {
+					env.Set(className, cl)
+				}
+
+				// Generate accessor functions for each slot
+				for _, slotName := range slots {
+					sn := slotName // capture in new variable for closure safety
+					// slot-name reader
+					readerName := sn
+					readerFn := func(args []*Value) (*Value, error) {
+						if len(args) != 1 || args[0].typ != VInstance {
+							return nil, fmt.Errorf("%s: requires an instance", readerName)
+						}
+						inst := args[0]
+						val, ok := inst.instSlots[sn]
+						if !ok {
+							return nil, fmt.Errorf("%s: slot %s is unbound", readerName, sn)
+						}
+						return val, nil
+					}
+					env.Set(readerName, &Value{typ: VPrim, fn: readerFn})
+
+					// (setf slot-name) writer
+					setfName := sn + "-setf"
+					setfFn := func(args []*Value) (*Value, error) {
+						if len(args) != 2 || args[0].typ != VInstance {
+							return nil, fmt.Errorf("%s: requires instance and value", setfName)
+						}
+						inst := args[0]
+						val := args[1]
+						inst.instSlots[sn] = val
+						return val, nil
+					}
+					env.Set(setfName, &Value{typ: VPrim, fn: setfFn})
+				}
+
+				// Generate generic function accessors from slot definitions
+				// Parse slot definitions for :accessor, :reader, :writer options
+				for slotDef := slotDefsVal; !isNil(slotDef); slotDef = slotDef.cdr {
+					slotName := ""
+					// First element is slot name symbol
+					if slotDef.car != nil && slotDef.car.typ == VPair && slotDef.car.car != nil && slotDef.car.car.typ == VSym {
+						slotName = slotDef.car.car.str
+					} else if slotDef.car != nil && slotDef.car.typ == VSym {
+						slotName = slotDef.car.str
+					}
+					if slotName == "" {
+						continue
+					}
+					// Parse slot options
+					var accessorName string
+					var readerName string
+					var writerName string
+					options := slotDef.car.cdr // skip slot name
+					for !isNil(options) {
+						opt := options.car
+						if opt != nil && opt.typ == VSym && opt.str == ":accessor" {
+							if options.cdr != nil && options.cdr.typ == VPair {
+								accessorName = options.cdr.car.str
+							}
+						} else if opt != nil && opt.typ == VSym && opt.str == ":reader" {
+							if options.cdr != nil && options.cdr.typ == VPair {
+								readerName = options.cdr.car.str
+							}
+						} else if opt != nil && opt.typ == VSym && opt.str == ":writer" {
+							if options.cdr != nil && options.cdr.typ == VPair {
+								writerName = options.cdr.car.str
+							}
+						}
+						options = options.cdr
+					}
+					// Create generic function for :accessor or :reader
+					if accessorName != "" {
+						gf := gcv()
+						gf.typ = VGeneric
+						gf.str = accessorName
+						m := genMethod{
+							qualifier:    "",
+							params:       []string{"inst"},
+							specializers: []string{className},
+							body:         list(list(vsym("slot-value"), vsym("inst"), list(vsym("quote"), vsym(slotName)))),
+							env:          env,
+						}
+						gf.genMethods = append(gf.genMethods, m)
+						env.Set(accessorName, gf)
+					} else if readerName != "" {
+						gf := gcv()
+						gf.typ = VGeneric
+						gf.str = readerName
+						m := genMethod{
+							qualifier:    "",
+							params:       []string{"inst"},
+							specializers: []string{className},
+							body:         list(list(vsym("slot-value"), vsym("inst"), list(vsym("quote"), vsym(slotName)))),
+							env:          env,
+						}
+						gf.genMethods = append(gf.genMethods, m)
+						env.Set(readerName, gf)
+					}
+					// Create generic function for :writer
+					if writerName != "" {
+						gf := gcv()
+						gf.typ = VGeneric
+						gf.str = writerName
+						m := genMethod{
+							qualifier:    "",
+							params:       []string{"val", "inst"},
+							specializers: []string{"", className},
+							body:         list(list(vsym("setf"), list(vsym("slot-value"), vsym("inst"), list(vsym("quote"), vsym(slotName))), vsym("val"))),
+							env:          env,
+						}
+						gf.genMethods = append(gf.genMethods, m)
+						env.Set(writerName, gf)
+					}
+				}
+
+				return vsym(className), nil
+
+			case "defmethod":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("defmethod: malformed form")
+				}
+				qualifier := ""
+				var gfName string
+				rest := v.cdr
+
+				// Parse function name and optional qualifier
+				if rest.car != nil && rest.car.typ == VSym {
+					gfName = rest.car.str
+					rest = rest.cdr
+					// Check for keyword qualifier: (defmethod greet :before ...)
+					if rest.typ == VPair && rest.car != nil && rest.car.typ == VSym && isKeyword(rest.car.str) {
+						qualifier = rest.car.str
+						rest = rest.cdr
+						// Check for auxiliary qualifier: (defmethod greet :around 1 ...)
+						if rest.typ == VPair && rest.car != nil && rest.car.typ != VPair {
+							qualifier += " " + toString(rest.car)
+							rest = rest.cdr
+						}
+					}
+				} else if rest.car != nil && rest.car.typ == VPair {
+					// (defmethod (greet :before) ...)
+					head := rest.car
+					if head.car == nil || head.car.typ != VSym {
+						return nil, fmt.Errorf("defmethod: generic function name must be a symbol")
+					}
+					gfName = head.car.str
+					rest = rest.cdr
+					if head.cdr != nil && head.cdr.typ == VPair && head.cdr.car != nil && head.cdr.car.typ == VSym && isKeyword(head.cdr.car.str) {
+						qualifier = head.cdr.car.str
+						// Check for auxiliary qualifier: (defmethod (greet :around 1) ...)
+						if head.cdr.cdr != nil && head.cdr.cdr.typ == VPair && head.cdr.cdr.car != nil && head.cdr.cdr.car.typ != VPair {
+							qualifier += " " + toString(head.cdr.cdr.car)
+						}
+					}
+				} else {
+					return nil, fmt.Errorf("defmethod: invalid form")
+				}
+
+				// Get or create generic function
+				gf, err := env.Get(gfName)
+				if err != nil {
+					gf = gcv()
+					gf.typ = VGeneric
+					gf.str = gfName
+					env.Set(gfName, gf)
+				} else if gf.typ != VGeneric {
+					gf = gcv()
+					gf.typ = VGeneric
+					gf.str = gfName
+					env.Set(gfName, gf)
+				}
+
+				// Parse method parameters and body
+				params := rest.car
+				body := rest.cdr
+
+				var paramNames []string
+				var specializers []string
+				for !isNil(params) {
+					if params.car != nil && params.car.typ == VSym {
+						// Simple parameter: (d)
+						paramNames = append(paramNames, params.car.str)
+						specializers = append(specializers, "")
+					} else if params.car != nil && params.car.typ == VPair && params.car.car != nil && params.car.car.typ == VSym {
+						// Specialized parameter: ((d dog))
+						paramNames = append(paramNames, params.car.car.str)
+						sp := params.car.cdr
+						if sp.typ == VPair && sp.car != nil && sp.car.typ == VSym {
+							specializers = append(specializers, sp.car.str)
+						} else {
+							specializers = append(specializers, "")
+						}
+					}
+					params = params.cdr
+				}
+
+				m := genMethod{
+					qualifier:    qualifier,
+					params:       paramNames,
+					specializers: specializers,
+					body:         body,
+					env:          env,
+				}
+				gf.genMethods = append(gf.genMethods, m)
+				return vsym(gfName), nil
+
+			case "call-next-method":
+				// Check if call-next-method is bound locally (inside a method)
+				if cnmFn, cnmErr := env.Get("call-next-method"); cnmErr == nil {
+					return apply(cnmFn, v.cdr, env)
+				}
+				return nil, fmt.Errorf("call-next-method: not inside a method")
+
+			case "load":
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("load: need a filename")
+				}
+				fnameVal := primaryValue(v.cdr.car)
+				if fnameVal.typ != VStr {
+					return nil, fmt.Errorf("load: filename must be a string")
+				}
+				fname := fnameVal.str
+				return loadFile(fname, env)
+			case "with-open-file":
+				// (with-open-file (var pathname &key direction ...) body...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("with-open-file: malformed form")
+				}
+				spec := v.cdr.car
+				if spec.typ != VPair {
+					return nil, fmt.Errorf("with-open-file: need a binding spec")
+				}
+				if spec.car == nil || spec.car.typ != VSym {
+					return nil, fmt.Errorf("with-open-file: var name must be a symbol")
+				}
+				varName := spec.car.str
+				if spec.cdr.typ != VPair {
+					return nil, fmt.Errorf("with-open-file: need a pathname")
+				}
+				body := v.cdr.cdr
+				openCallArgs := []*Value{vsym("open"), spec.cdr.car}
+				rest := spec.cdr.cdr
+				for !isNil(rest) {
+					openCallArgs = append(openCallArgs, rest.car)
+					rest = rest.cdr
+				}
+				stream, e := eval(listFromSlice(openCallArgs), env)
+				if e != nil {
+					return nil, e
+				}
+				newEnv := env.Extend(varName, stream)
+				var result *Value
+				func() {
+					defer func() {
+						if stream.typ == VStream && !stream.stream.isClosed {
+							stream.stream.close()
+						}
+					}()
+					for body.typ == VPair && !isNil(body.cdr) {
+						if body.typ == VPair {
+							_, err = eval(body.car, newEnv)
+						} else if !isNil(body) {
+							_, err = eval(body, newEnv)
+						}
+						if err != nil {
+							return
+						}
+						body = body.cdr
+					}
+					if body.typ == VPair {
+						result, err = eval(body.car, newEnv)
+					} else if !isNil(body) {
+						result, err = eval(body, newEnv)
+					} else {
+						result = vnil()
+					}
+				}()
+				return result, err
+			case "with-output-to-string":
+				// (with-output-to-string (var) body...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("with-output-to-string: malformed form")
+				}
+				spec := v.cdr.car
+				if spec.typ != VPair {
+					return nil, fmt.Errorf("with-output-to-string: need binding spec")
+				}
+				if spec.car == nil || spec.car.typ != VSym {
+					return nil, fmt.Errorf("with-output-to-string: var name must be a symbol")
+				}
+				body := v.cdr.cdr
+				varName := spec.car.str
+				stream := newStringOutput()
+				newEnv := env.Extend(varName, stream)
+				for body.typ == VPair && !isNil(body.cdr) {
+					_, err = eval(body.car, newEnv)
+					if err != nil {
+						return nil, err
+					}
+					body = body.cdr
+				}
+				if body.typ == VPair {
+					_, err = eval(body.car, newEnv)
+					if err != nil {
+						return nil, err
+					}
+				} else if !isNil(body) {
+					_, err = eval(body, newEnv)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return vstr(stream.stream.getStringOutput()), nil
+			case "with-input-from-string":
+				// (with-input-from-string (var string) body...)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("with-input-from-string: malformed form")
+				}
+				spec := v.cdr.car
+				if spec.typ != VPair {
+					return nil, fmt.Errorf("with-input-from-string: need binding spec")
+				}
+				if spec.car == nil || spec.car.typ != VSym {
+					return nil, fmt.Errorf("with-input-from-string: var name must be a symbol")
+				}
+				body := v.cdr.cdr
+				varName := spec.car.str
+				if spec.cdr.typ != VPair {
+					return nil, fmt.Errorf("with-input-from-string: need a string form")
+				}
+				strVal, e := eval(spec.cdr.car, env)
+				if e != nil {
+					return nil, e
+				}
+				stream := newStringInputStream(princToString(strVal))
+				newEnv := env.Extend(varName, stream)
+				var result *Value
+				func() {
+					defer func() {
+						if stream.typ == VStream && !stream.stream.isClosed {
+							stream.stream.close()
+						}
+					}()
+					for body.typ == VPair && !isNil(body.cdr) {
+						_, err = eval(body.car, newEnv)
+						if err != nil {
+							return
+						}
+						body = body.cdr
+					}
+					if body.typ == VPair {
+						result, err = eval(body.car, newEnv)
+					} else if !isNil(body) {
+						result, err = eval(body, newEnv)
+					} else {
+						result = vnil()
+					}
+				}()
+				return result, err
+			default:
+				// regular application
+				fn, e := eval(v.car, env)
+				if e != nil {
+					return nil, e
+				}
+				r, e := apply(fn, v.cdr, env)
+				if e != nil {
+					if tc, ok := e.(*tailCall); ok {
+						v = tc.form
+						env = tc.env
+						continue evalLoop
+					}
+					return nil, e
+				}
+				return r, nil
+			}
+		}
+	}
+}
+
+func apply(fn *Value, args *Value, env *Env) (result *Value, err error) {
+	switch fn.typ {
+	case VPrim:
+		argSlice := toSlice(args)
+		evArgs := make([]*Value, len(argSlice))
+		for i, a := range argSlice {
+			v, e := eval(a, env)
+			if e != nil {
+				return nil, e
+			}
+			evArgs[i] = primaryValue(v)
+		}
+		return fn.fn(evArgs)
+	case VFunc:
+		if fn.name != "" && traceTable[fn.name] {
+			indent := strings.Repeat("  ", traceDepth)
+			argSlice := toSlice(args)
+			argStrs := make([]string, len(argSlice))
+			for i, a := range argSlice {
+				argStrs[i] = toString(primaryValue(a))
+			}
+			fmt.Printf("%s%d: (%s %s)\n", indent, traceDepth, fn.name, strings.Join(argStrs, " "))
+			traceDepth++
+			defer func() {
+				traceDepth--
+				indent2 := strings.Repeat("  ", traceDepth)
+				fmt.Printf("%s%d: <= %s\n", indent2, traceDepth, toString(result))
+			}()
+		}
+		argSlice := toSlice(args)
+		evArgs := make([]*Value, len(argSlice))
+		for i, a := range argSlice {
+			v, e := eval(a, env)
+			if e != nil {
+				return nil, e
+			}
+			evArgs[i] = primaryValue(v)
+		}
+		newEnv := NewEnv(fn.env)
+		if fn.rest != "" {
+			for i, p := range fn.params {
+				if i < len(evArgs) {
+					newEnv.Set(p, evArgs[i])
+				} else {
+					newEnv.Set(p, vnil())
+				}
+			}
+			newEnv.Set(fn.rest, listFromSlice(evArgs[len(fn.params):]))
+		} else {
+			for i, p := range fn.params {
+				if i < len(evArgs) {
+					newEnv.Set(p, evArgs[i])
+				} else {
+					s := fmt.Sprintf("need %d got %d: params=[", len(fn.params), len(evArgs))
+					for _, p := range fn.params {
+						s += p + ","
+					}
+					s += "]"
+					return nil, fmt.Errorf("apply: too few args, %s", s)
+				}
+			}
+		}
+		body := fn.body
+		if isNil(body) {
+			return vnil(), nil
+		}
+		for body.typ == VPair && !isNil(body.cdr) {
+			_, e := eval(body.car, newEnv)
+			if e != nil {
+				if _, ok := e.(*tailCall); ok {
+					return nil, e
+				}
+				return nil, e
+			}
+			body = body.cdr
+		}
+		// Tail call optimization: instead of recursively calling eval,
+		// return a tailCall instruction. The eval loop will catch it
+		// and continue with the new form/environment without growing
+		// the Go stack.
+		return nil, &tailCall{form: body.car, env: newEnv}
+	case VGeneric:
+		argSlice := toSlice(args)
+		evArgs := make([]*Value, len(argSlice))
+		for i, a := range argSlice {
+			v, e := eval(a, env)
+			if e != nil {
+				return nil, e
+			}
+			evArgs[i] = v
+		}
+
+		// Filter applicable methods by specializers
+		var applicable []genMethod
+		for _, m := range fn.genMethods {
+			if methodApplicable(m, evArgs) {
+				applicable = append(applicable, m)
+			}
+		}
+
+		// Separate methods by qualifier
+		var primary, before, after, around []genMethod
+		for _, m := range applicable {
+			switch m.qualifier {
+			case ":before":
+				before = append(before, m)
+			case ":after":
+				after = append(after, m)
+			case ":around":
+				around = append(around, m)
+			default:
+				primary = append(primary, m)
+			}
+		}
+
+		// Sort primary methods by specificity (most specific first)
+		for i := 0; i < len(primary); i++ {
+			for j := i + 1; j < len(primary); j++ {
+				if methodSpecificity(primary[j], evArgs) < methodSpecificity(primary[i], evArgs) {
+					primary[i], primary[j] = primary[j], primary[i]
+				}
+			}
+		}
+
+		// Sort before methods by specificity (most specific first)
+		for i := 0; i < len(before); i++ {
+			for j := i + 1; j < len(before); j++ {
+				if methodSpecificity(before[j], evArgs) < methodSpecificity(before[i], evArgs) {
+					before[i], before[j] = before[j], before[i]
+				}
+			}
+		}
+
+		// Sort after methods by specificity (least specific first for after)
+		for i := 0; i < len(after); i++ {
+			for j := i + 1; j < len(after); j++ {
+				if methodSpecificity(after[j], evArgs) > methodSpecificity(after[i], evArgs) {
+					after[i], after[j] = after[j], after[i]
+				}
+			}
+		}
+
+		// Sort around methods by specificity (most specific first)
+		for i := 0; i < len(around); i++ {
+			for j := i + 1; j < len(around); j++ {
+				if methodSpecificity(around[j], evArgs) < methodSpecificity(around[i], evArgs) {
+					around[i], around[j] = around[j], around[i]
+				}
+			}
+		}
+
+		// Build effective method: around methods wrapping before/primary/after chain
+		execBeforePrimaryAfter := func() (*Value, error) {
+			// Execute :before methods (most-specific first)
+			for _, m := range before {
+				menv := NewEnv(m.env)
+				for j, p := range m.params {
+					if j < len(evArgs) {
+						menv.Set(p, evArgs[j])
+					}
+				}
+				if m.body != nil {
+					bodyList := m.body
+					for !isNil(bodyList) {
+						_, e := eval(bodyList.car, menv)
+						if e != nil {
+							return nil, e
+						}
+						bodyList = bodyList.cdr
+					}
+				}
+			}
+
+			// Execute primary method
+			var result *Value = vnil()
+			if len(primary) > 0 {
+				pm := primary[0]
+				pEnv := NewEnv(pm.env)
+				for j, p := range pm.params {
+					if j < len(evArgs) {
+						pEnv.Set(p, evArgs[j])
+					}
+				}
+				// Bind call-next-method as a closure over remaining methods
+				if len(primary) > 1 {
+					remaining := primary[1:]
+					cnmFn := &Value{
+						typ: VPrim,
+						fn: func(ignored []*Value) (*Value, error) {
+							return callNextMethodChain(remaining, evArgs)
+						},
+					}
+					pEnv.Set("call-next-method", cnmFn)
+					pEnv.Set("next-method-p", &Value{
+						typ: VPrim,
+						fn: func(ignored []*Value) (*Value, error) {
+							return vbool(true), nil
+						},
+					})
+				} else {
+					pEnv.Set("call-next-method", &Value{
+						typ: VPrim,
+						fn: func(args2 []*Value) (*Value, error) {
+							return nil, fmt.Errorf("call-next-method: no next method")
+						},
+					})
+					pEnv.Set("next-method-p", &Value{
+						typ: VPrim,
+						fn: func(ignored []*Value) (*Value, error) {
+							return vbool(false), nil
+						},
+					})
+				}
+				if pm.body != nil {
+					bodyList := pm.body
+					for !isNil(bodyList) {
+						r, e := eval(bodyList.car, pEnv)
+						if e != nil {
+							return nil, e
+						}
+						result = r
+						bodyList = bodyList.cdr
+					}
+				}
+			}
+
+			// Execute :after methods (least-specific first)
+			for _, m := range after {
+				aEnv := NewEnv(m.env)
+				for j, p := range m.params {
+					if j < len(evArgs) {
+						aEnv.Set(p, evArgs[j])
+					}
+				}
+				if m.body != nil {
+					bodyList := m.body
+					for !isNil(bodyList) {
+						_, e := eval(bodyList.car, aEnv)
+						if e != nil {
+							return nil, e
+						}
+						bodyList = bodyList.cdr
+					}
+				}
+			}
+
+			return result, nil
+		}
+
+		// Start with the before/primary/after chain as the innermost "next"
+		nextMethodFn := execBeforePrimaryAfter
+
+		// Wrap around methods from least-specific to most-specific
+		for i := len(around) - 1; i >= 0; i-- {
+			am := around[i]
+			prevNext := nextMethodFn
+			nextMethodFn = func() (*Value, error) {
+				aEnv := NewEnv(am.env)
+				for j, p := range am.params {
+					if j < len(evArgs) {
+						aEnv.Set(p, evArgs[j])
+					}
+				}
+				aEnv.Set("call-next-method", &Value{
+					typ: VPrim,
+					fn: func(args2 []*Value) (*Value, error) {
+						return prevNext()
+					},
+				})
+				aEnv.Set("next-method-p", &Value{
+					typ: VPrim,
+					fn: func(ignored []*Value) (*Value, error) {
+						return vbool(true), nil
+					},
+				})
+				var result *Value = vnil()
+				if am.body != nil {
+					bodyList := am.body
+					for !isNil(bodyList) {
+						r, e := eval(bodyList.car, aEnv)
+						if e != nil {
+							return nil, e
+						}
+						result = r
+						bodyList = bodyList.cdr
+					}
+				}
+				return result, nil
+			}
+		}
+
+		// Execute the outermost effective method
+		return nextMethodFn()
+	case VMacro:
+		expanded, e := expandMacro(fn, args, env)
+		if e != nil {
+			return nil, e
+		}
+		return eval(expanded, env)
+	default:
+		return nil, fmt.Errorf("not a procedure: %s", typeStr(fn))
+	}
+}
+
+func expandMacro(m *Value, args *Value, env *Env) (*Value, error) {
+	newEnv := NewEnv(m.env)
+	argSlice := toSlice(args)
+	// Bind &whole if present
+	if m.whole != "" {
+		// Reconstruct the whole form: (macro-name . args)
+		wholeForm := cons(vsym(m.str), args)
+		newEnv.Set(m.whole, wholeForm)
+	}
+	if m.rest != "" {
+		for i, p := range m.params {
+			if i < len(argSlice) {
+				newEnv.Set(p, argSlice[i])
+			} else {
+				newEnv.Set(p, vnil())
+			}
+		}
+		newEnv.Set(m.rest, listFromSlice(argSlice[len(m.params):]))
+	} else {
+		for i, p := range m.params {
+			if i < len(argSlice) {
+				newEnv.Set(p, argSlice[i])
+			} else {
+				newEnv.Set(p, vnil())
+			}
+		}
+	}
+	body := m.body
+	if isNil(body) {
+		return vnil(), nil
+	}
+	result := vnil()
+	for !isNil(body) {
+		v, e := eval(body.car, newEnv)
+		if e != nil {
+			return nil, e
+		}
+		result = v
+		body = body.cdr
+	}
+	return result, nil
+}
+
+func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
+	if !isPair(v) {
+		return v, nil
+	}
+	// (unquote expr) at depth 0
+	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote" && depth == 0 {
+		return eval(v.cdr.car, env)
+	}
+	// (unquote-splicing expr) at depth 0 - not valid here
+	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote-splicing" && depth == 0 {
+		return nil, fmt.Errorf("unquote-splicing outside list")
+	}
+	// (quasiquote expr)
+	if v.car != nil && v.car.typ == VSym && v.car.str == "quasiquote" {
+		return evalQuasiquote(v.cdr.car, depth+1, env)
+	}
+	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote" && depth > 0 {
+		return list(vsym("quasiquote"), list(vsym("unquote"), v.cdr.car)), nil
+	}
+	// Build list
+	var result *Value = vnil()
+	var tail *Value
+	iter := v
+	seen := make(map[*Value]bool)
+	for isPair(iter) {
+		if seen[iter] {
+			return nil, fmt.Errorf("quasiquote: circular list detected")
+		}
+		seen[iter] = true
+		elem := iter.car
+		if isPair(elem) && elem.car != nil && elem.car.typ == VSym && elem.car.str == "unquote-splicing" && depth == 0 {
+			if elem.cdr == nil || elem.cdr.typ != VPair {
+				return nil, fmt.Errorf("unquote-splicing: malformed form")
+			}
+			splice, e := eval(elem.cdr.car, env)
+			if e != nil {
+				return nil, e
+			}
+			// splice the list with cycle detection
+			spliceSeen := make(map[*Value]bool)
+			for !isNil(splice) {
+				if spliceSeen[splice] {
+					return nil, fmt.Errorf("quasiquote: circular list in spliced value")
+				}
+				spliceSeen[splice] = true
+				pair := cons(splice.car, vnil())
+				if result.typ == VNil {
+					result = pair
+					tail = pair
+				} else {
+					tail.cdr = pair
+					tail = pair
+				}
+				splice = splice.cdr
+			}
+		} else {
+			ev, e := evalQuasiquote(elem, depth, env)
+			if e != nil {
+				return nil, e
+			}
+			pair := cons(ev, vnil())
+			if result.typ == VNil {
+				result = pair
+				tail = pair
+			} else {
+				tail.cdr = pair
+				tail = pair
+			}
+		}
+		iter = iter.cdr
+	}
+	// dotted tail
+	if !isNil(iter) {
+		if tail != nil {
+			tail.cdr = iter
+		} else {
+			result = iter
+		}
+	}
+	return result, nil
+}
+
+func parseParams(v *Value) ([]string, string, error) {
+	if v.typ == VSym {
+		return nil, v.str, nil
+	}
+	var params []string
+	seen := make(map[*Value]bool)
+	for !isNil(v) {
+		if seen[v] {
+			return nil, "", fmt.Errorf("bad lambda parameter list: circular")
+		}
+		seen[v] = true
+		if v.car != nil && v.car.typ == VSym {
+			params = append(params, v.car.str)
+			v = v.cdr
+		} else {
+			break
+		}
+	}
+	if !isNil(v) && v.typ == VSym {
+		return params, v.str, nil
+	}
+	if !isNil(v) {
+		return nil, "", fmt.Errorf("bad lambda parameter list")
+	}
+	return params, "", nil
+}
+
+// parseMacroParams handles &whole, &rest, &body, &environment lambda list keywords
+func parseMacroParams(v *Value) (params []string, rest string, whole string, envSym string, err error) {
+	// Check for &whole at the beginning
+	if v.typ == VPair && v.car != nil && v.car.typ == VSym && (v.car.str == "&whole" || v.car.str == "&WHOLE") {
+		rest := v.cdr
+		if !isNil(rest) && rest.typ == VPair && rest.car != nil && rest.car.typ == VSym {
+			whole = rest.car.str
+			v = rest.cdr
+		} else if !isNil(rest) && rest.typ == VSym {
+			whole = rest.str
+			v = vnil()
+		}
+	}
+	seen := make(map[*Value]bool)
+	for !isNil(v) {
+		if seen[v] {
+			return nil, "", whole, envSym, fmt.Errorf("bad macro parameter list: circular")
+		}
+		seen[v] = true
+		if v.car != nil && v.car.typ == VSym {
+			s := v.car.str
+			if s == "&rest" || s == "&body" || s == "&REST" || s == "&BODY" {
+				// Next symbol is the rest param name
+				restV := v.cdr
+				if !isNil(restV) && restV.typ == VPair && restV.car != nil && restV.car.typ == VSym {
+					rest = restV.car.str
+					v = restV.cdr
+				} else if !isNil(restV) && restV.typ == VSym {
+					rest = restV.str
+					v = vnil()
+				} else {
+					return nil, "", whole, envSym, fmt.Errorf("macro: need name after %s", s)
+				}
+				continue
+			}
+			if s == "&environment" || s == "&ENVIRONMENT" {
+				envV := v.cdr
+				if !isNil(envV) && envV.typ == VPair && envV.car != nil && envV.car.typ == VSym {
+					envSym = envV.car.str
+					v = envV.cdr
+				} else if !isNil(envV) && envV.typ == VSym {
+					envSym = envV.str
+					v = vnil()
+				}
+				continue
+			}
+			params = append(params, s)
+		} else {
+			break
+		}
+		v = v.cdr
+	}
+	if !isNil(v) && v.typ == VSym {
+		return params, v.str, whole, envSym, nil
+	}
+	if !isNil(v) {
+		return nil, "", whole, envSym, fmt.Errorf("bad macro parameter list")
+	}
+	return params, rest, whole, envSym, nil
+}
+
+func typeStr(v *Value) string {
+	switch v.typ {
+	case VNil:
+		return "nil"
+	case VNum:
+		return "number"
+	case VRat:
+		return "rational"
+	case VComplex:
+		return "complex"
+	case VStr:
+		return "string"
+	case VSym:
+		return "symbol"
+	case VBool:
+		return "boolean"
+	case VPair:
+		return "pair"
+	case VPrim:
+		return "procedure"
+	case VFunc:
+		return "procedure"
+	case VMacro:
+		return "macro"
+	case VClass:
+		return "class"
+	case VGeneric:
+		return "generic"
+	case VInstance:
+		return "instance"
+	case VVHash:
+		return "hash-table"
+	case VThread:
+		return "thread"
+	case VLock:
+		return "lock"
+	case VChar:
+		return "character"
+	case VStream:
+		return "stream"
+	case VMultiVal:
+		return "multi-value"
+	case VPackage:
+		return "package"
+	case VReadtable:
+		return "readtable"
+	default:
+		return "unknown"
+	}
+}
+
+// -------- Builtins --------
+type builtinDef struct {
+	name string
+	fn   NativeFunc
+}
+
+var builtins = []builtinDef{
+	{"+", builtinAdd},
+	{"-", builtinSub},
+	{"*", builtinMul},
+	{"/", builtinDiv},
+	{"=", builtinEq},
+	{"/=", builtinNe},
+	{"<", builtinLt},
+	{">", builtinGt},
+	{"<=", builtinLe},
+	{">=", builtinGe},
+	{"cons", builtinCons},
+	{"car", builtinCar},
+	{"cdr", builtinCdr},
+	{"set-car!", builtinSetCar},
+	{"set-cdr!", builtinSetCdr},
+	{"car-setf", builtinSetCarAsSetter},
+	{"cdr-setf", builtinSetCdrAsSetter},
+	{"set-car!", builtinSetCar},
+	{"list", builtinList},
+	{"rest", builtinRest},
+	{"first", builtinFirst},
+	{"second", builtinSecond},
+	{"third", builtinThird},
+	{"fourth", builtinFourth},
+	{"fifth", builtinFifth},
+	{"sixth", builtinSixth},
+	{"seventh", builtinSeventh},
+	{"eighth", builtinEighth},
+	{"ninth", builtinNinth},
+	{"tenth", builtinTenth},
+	{"null?", builtinNullP},
+	{"pair?", builtinPairP},
+	{"consp", builtinPairP},
+	{"number?", builtinNumP},
+	{"string?", builtinStrP},
+	{"package?", builtinPackageP},
+	{"readtablep", builtinReadtableP},
+	{"make-readtable", builtinMakeReadtable},
+	{"copy-readtable", builtinCopyReadtable},
+	{"readtable-case", builtinReadtableCase},
+	{"set-readtable-case", builtinSetReadtableCase},
+	{"set-macro-character", builtinSetMacroCharacter},
+	{"get-macro-character", builtinGetMacroCharacter},
+	{"make-dispatch-macro-character", builtinMakeDispatchMacroCharacter},
+	{"set-dispatch-macro-character", builtinSetDispatchMacroCharacter},
+	{"get-dispatch-macro-character", builtinGetDispatchMacroCharacter},
+	{"symbol?", builtinSymP},
+	{"bool?", builtinBoolP},
+	{"procedure?", builtinProcP},
+	{"characterp", builtinCharP},
+	{"char", builtinChar},
+	{"char-setf", builtinCharSetf},
+	{"char=", builtinCharEq},
+	{"char<", builtinCharLt},
+	{"char>", builtinCharGt},
+	{"char<=", builtinCharLe},
+	{"char>=", builtinCharGe},
+	{"code-char", builtinCodeChar},
+	{"char-code", builtinCharCode},
+	{"name-char", builtinNameChar},
+	{"char-name", builtinCharName},
+	{"eq?", builtinEqvP},
+	{"eqv?", builtinEqvP},
+	{"equal?", builtinEqualP},
+	{"length", builtinLength},
+	{"display", builtinDisplay},
+	{"newline", builtinNewline},
+	{"print", builtinPrint},
+	{"prin1", builtinPrin1},
+	{"princ", builtinPrincl},
+	{"terpri", builtinTerpri},
+	{"fresh-line", builtinFreshLine},
+	{"write-to-string", builtinWriteToString},
+	{"read", builtinRead},
+	{"read-from-string", builtinReadFromString},
+	{"read-line", builtinReadLine},
+	{"read-char", builtinReadChar},
+	{"peek-char", builtinPeekChar},
+	{"unread-char", builtinUnreadChar},
+	{"write-char", builtinWriteChar},
+	{"write-string", builtinWriteString},
+	{"write-line", builtinWriteLine},
+	{"read-byte", builtinReadByte},
+	{"write-byte", builtinWriteByte},
+	{"read-sequence", builtinReadSequence},
+	{"write-sequence", builtinWriteSequence},
+	{"open", builtinOpen},
+	{"close", builtinClose},
+	{"open-input-file", builtinOpenInputStream},
+	{"open-output-file", builtinOpenOutputStream},
+	{"make-string-input-stream", builtinMakeStringInputStream},
+	{"make-string-output-stream", builtinMakeStringOutputStream},
+	{"get-output-stream-string", builtinGetStringOutput},
+	{"streamp", builtinStreamP},
+	{"stream-input-p", builtinStreamInputP},
+	{"input-stream-p", builtinStreamInputP},
+	{"stream-output-p", builtinStreamOutputP},
+	{"output-stream-p", builtinStreamOutputP},
+	{"interactive-stream-p", builtinInteractiveStreamP},
+	{"listen", builtinListen},
+	{"clear-input", builtinClearInput},
+	{"force-output", builtinForceOutput},
+	{"clear-output", builtinClearOutput},
+	{"finish-output", builtinFinishOutput},
+	{"y-or-n-p", builtinYOrNP},
+	{"yes-or-no-p", builtinYesOrNoP},
+	{"make-synonym-stream", builtinMakeSynonymStream},
+	{"make-broadcast-stream", builtinMakeBroadcastStream},
+	{"make-concatenated-stream", builtinMakeConcatenatedStream},
+	{"make-two-way-stream", builtinMakeTwoWayStream},
+	{"synonym-stream-p", builtinSynonymStreamP},
+	{"broadcast-stream-p", builtinBroadcastStreamP},
+	{"concatenated-stream-p", builtinConcatenatedStreamP},
+	{"two-way-stream-p", builtinTwoWayStreamP},
+	{"synonym-stream-symbol", builtinSynonymStreamSymbol},
+	{"broadcast-stream-streams", builtinBroadcastStreamStreams},
+	{"concatenated-stream-streams", builtinConcatenatedStreamStreams},
+	{"two-way-stream-input-stream", builtinTwoWayStreamInputStream},
+	{"two-way-stream-output-stream", builtinTwoWayStreamOutputStream},
+	{"string", builtinStr},
+	{"string-append", builtinStrAppend},
+	{"string-length", builtinStrLen},
+	{"number->string", builtinNumStr},
+	{"string-find", builtinStrFind},
+	{"substring", builtinSubstring},
+	{"string->number", builtinStrNum},
+	{"symbol->string", builtinSymStr},
+	{"symbol-name", builtinSymStr},
+	{"symbol-value", builtinSymbolValue},
+	{"symbol-function", builtinSymbolFunction},
+	{"symbol-plist", builtinSymbolPlist},
+	{"symbol-plist-setf", builtinSymbolPlistSetf},
+	{"boundp", builtinBoundp},
+	{"fboundp", builtinFboundp},
+	{"makunbound", builtinMakunbound},
+	{"fmakunbound", builtinFmakunbound},
+	{"string->symbol", builtinStrSym},
+	{"make-symbol", builtinStrSym},
+	{"error", builtinErr},
+	{"exit", builtinExit},
+	{"gensym", builtinGensym},
+	{"%loop-check", builtinLoopCheck},
+	{"type-of", builtinTypeOf},
+	{"describe", builtinDescribe},
+	{"documentation", builtinDocumentation},
+	{"apropos", builtinApropos},
+	{"apropos-list", builtinAproposList},
+	{"compile", builtinCompile},
+	{"compile-file", builtinCompileFile},
+	{"compile-file-pathname", builtinCompileFilePathname},
+	{"fdefinition", builtinFdefinition},
+	{"disassemble", builtinDisassemble},
+	{"parse-integer", builtinParseInteger},
+	{"digit-char-p", builtinDigitCharP},
+	{"alphanumericp", builtinAlphanumericP},
+	{"char-upcase", builtinCharUpcase},
+	{"char-downcase", builtinCharDowncase},
+	{"subtypep", builtinSubtypep},
+	{"typep", builtinTypep},
+	{"trace", builtinTrace},
+	{"untrace", builtinUntrace},
+	{"break", builtinBreak},
+	{"eval", builtinEval},
+	{"handler-eval", builtinHandlerEval},
+	{"eval-string", builtinEvalString},
+	{"funcall", builtinFuncall},
+	{"eq", builtinEqIdentity},
+	{"eql", builtinEql},
+	{"equal", builtinEqual},
+	{"equalp", builtinEqualp},
+	{"make-array", builtinMakeArray},
+	{"make-vector", builtinVector},
+	{"vector", builtinVector},
+	{"aref", builtinAref},
+	{"svref", builtinAref},
+	{"aref-setf", builtinSetAref},
+	{"svref-setf", builtinSetAref},
+	{"nth-setf", builtinNthSetf},
+	{"symbol-value-setf", builtinSymbolValueSetf},
+	{"elt-setf", builtinEltSetf},
+	{"arrayp", builtinArrayP},
+	{"vectorp", builtinVectorP},
+	{"array-dimensions", builtinArrayDimensions},
+	{"array-total-size", builtinArrayTotalSize},
+	{"array-rank", builtinArrayRank},
+	{"array-element-type", builtinArrayElementType},
+	{"fill-pointer", builtinFillPointer},
+	{"set-fill-pointer", builtinSetFillPointer},
+	{"vector-push", builtinVectorPush},
+	{"vector-pop", builtinVectorPop},
+	{"adjust-array", builtinAdjustArray},
+	{"null", builtinNull},
+	{"apply", builtinApply},
+	{"defined?", builtinDefinedP},
+	{"ffi", builtinFFI},
+	{"ffi-register", builtinFFIRegister},
+	{"make-package", builtinMakePackage},
+	{"in-package", builtinInPackage},
+	{"find-package", builtinFindPackage},
+	{"intern", builtinIntern},
+	{"export", builtinExport},
+	{"find-symbol", builtinFindSymbol},
+	{"keywordp", builtinKeywordP},
+	{"symbolp", builtinSymP},
+	{"copy-symbol", builtinCopySymbol},
+	{"get", builtinGet},
+	{"putprop", builtinPutprop},
+	{"remprop", builtinRemprop},
+	{"get-setf", builtinGetSetf},
+	{"symbol-package", builtinSymbolPackage},
+	{"package-name", builtinPackageName},
+	{"list-all-packages", builtinListAllPackages},
+	{"macroexpand", builtinMacroexpand},
+	{"macroexpand-1", builtinMacroexpand1},
+	{"provide", builtinProvide},
+	{"require", builtinRequire},
+	{"package-use-list", builtinPackageUseList},
+	{"package-used-by-list", builtinPackageUsedByList},
+	{"package-shadowing-import-list", builtinPackageShadowingImportList},
+	{"import", builtinImport},
+	{"use-package", builtinUsePackage},
+	{"shadow", builtinShadow},
+	{"unintern", builtinUnintern},
+	{"shadowing-import", builtinShadowingImport},
+	{"rename-package", builtinRenamePackage},
+	{"delete-package", builtinDeletePackage},
+	{"package-nicknames", builtinPackageNicknames},
+	{"unexport", builtinUnexport},
+	{"make-instance", builtinMakeInstance},
+	{"make-condition", builtinMakeCondition},
+	{"slot-value", builtinSlotValue},
+	{"slot-value-setf", builtinSlotValueSetf},
+	{"slot-set!", builtinSlotSet},
+	{"slot-boundp", builtinSlotBoundp},
+	{"slot-exists-p", builtinSlotExistsP},
+	{"slot-makunbound", builtinSlotMakunbound},
+	{"class-of", builtinClassOf},
+	{"class-name", builtinClassName},
+	{"find-class", builtinFindClass},
+	{"is-a?", builtinIsA},
+	{"class-slots", builtinClassSlots},
+	{"class-slot-defs", builtinClassSlotDefs},
+	{"instance?", builtinInstanceP},
+	{"make-hash-table", builtinMakeHashTable},
+	{"hash-table-p", builtinHashTableP},
+	{"gethash", builtinGethash},
+	{"gethash-setf", builtinSetGethash},
+	{"remhash", builtinRemhash},
+	{"clrhash", builtinClrhash},
+	{"hash-table-count", builtinHashTableCount},
+	{"maphash", builtinMaphash},
+	{"hash-table?", builtinHashTableP},
+	{"hash-table-size", builtinHashTableSize},
+	{"hash-table-rehash-size", builtinHashTableRehashSize},
+	{"hash-table-test", builtinHashTableTest},
+	{"sxhash", builtinSxhash},
+	{"hash-table-exists?", builtinHashTableExists},
+	// CL standard aliases for seq-* functions
+	{"reduce", builtinSeqReduce},
+	{"find", builtinSeqFind},
+	{"find-if", builtinSeqFindIf},
+	{"find-if-not", builtinSeqFindIfNot},
+	{"count", builtinSeqCount},
+	{"count-if", builtinSeqCountIf},
+	{"count-if-not", builtinSeqCountIfNot},
+	{"remove", builtinSeqRemove},
+	{"remove-if", builtinSeqRemoveIf},
+	{"remove-if-not", builtinSeqRemoveIfNot},
+	{"remove-duplicates", builtinSeqRemoveDuplicates},
+	{"substitute", builtinSeqSubstitute},
+	{"substitute-if", builtinSeqSubstituteIf},
+	{"substitute-if-not", builtinSeqSubstituteIfNot},
+	{"delete", builtinDelete},
+	{"delete-if", builtinDeleteIf},
+	{"delete-if-not", builtinDeleteIfNot},
+	{"delete-duplicates", builtinDeleteDuplicates},
+	{"nsubstitute", builtinNsubstitute},
+	{"nsubstitute-if", builtinNsubstituteIf},
+	{"nsubstitute-if-not", builtinSeqSubstituteIfNot}, // simplified: non-destructive
+	{"position-if", builtinSeqPositionIf},
+	{"position-if-not", builtinSeqPositionIfNot},
+	{"member-if-not", builtinMemberIfNot},
+	{"assoc-if-not", builtinAssocIfNot},
+	{"rassoc-if-not", builtinRassocIfNot},
+	// Push/pushnew
+	{"push", builtinPush},
+	{"pushnew", builtinPushnew},
+	// Vector push extend
+	{"vector-push-extend", builtinVectorPushExtend},
+	// Row-major aref
+	{"row-major-aref", builtinRowMajorAref},
+	// Random state
+	{"make-random-state", builtinMakeRandomState},
+	{"random-state-p", builtinRandomStateP},
+	{"copy-random-state", builtinCopyRandomState},
+	// Universal time
+	{"get-universal-time", builtinGetUniversalTime},
+	{"get-internal-real-time", builtinGetInternalRealTime},
+	{"get-internal-run-time", builtinGetInternalRunTime},
+	{"sleep", builtinSleep},
+	// CL bit aliases
+	{"bit-and", builtinBitAnd},
+	{"bit-ior", builtinBitIor},
+	{"bit-xor", builtinBitXor},
+	{"bit-not", builtinBitNot},
+	{"bit-eqv", builtinBitEqv},
+	{"bit-nand", builtinBitNand},
+	{"bit-nor", builtinBitNor},
+	{"bit-orc1", builtinBitOrc1},
+	{"bit-orc2", builtinBitOrc2},
+	{"seq-map", builtinSeqMap},
+	{"seq-reduce", builtinSeqReduce},
+	{"seq-sort", builtinSeqSort},
+	{"seq-remove-if", builtinSeqRemoveIf},
+	{"seq-remove-if-not", builtinSeqRemoveIfNot},
+	{"seq-count", builtinSeqCount},
+	{"seq-count-if", builtinSeqCountIf},
+	{"seq-count-if-not", builtinSeqCountIfNot},
+	{"seq-find", builtinSeqFind},
+	{"seq-position", builtinSeqPosition},
+	{"seq-find-if", builtinSeqFindIf},
+	{"seq-find-if-not", builtinSeqFindIfNot},
+	{"seq-position-if", builtinSeqPositionIf},
+	{"seq-position-if-not", builtinSeqPositionIfNot},
+	{"seq-substitute", builtinSeqSubstitute},
+	{"seq-substitute-if", builtinSeqSubstituteIf},
+	{"seq-substitute-if-not", builtinSeqSubstituteIfNot},
+	{"seq-remove", builtinSeqRemove},
+	{"seq-remove-duplicates", builtinSeqRemoveDuplicates},
+	{"seq-merge", builtinSeqMerge},
+	{"fill", builtinSeqFill},
+	{"search", builtinSeqSearch},
+	{"mismatch", builtinMismatch},
+	{"copy-seq", builtinSeqCopySeq},
+	{"nreverse", builtinSeqNReverse},
+	{"string-trim", builtinStringTrim},
+	{"string-left-trim", builtinStringLeftTrim},
+	{"string-right-trim", builtinStringRightTrim},
+	{"replace", builtinSeqReplace},
+	{"subseq", builtinSeqSubseq},
+	{"subseq-setf", builtinSubseqSetf},
+	{"concatenate", builtinSeqConcatenate},
+	{"mapcan", builtinMapcan},
+	{"mapcar", builtinMapcar},
+	{"some", builtinSome},
+	{"seq-some", builtinSome},
+	{"every", builtinEvery},
+	{"seq-every", builtinEvery},
+	{"notany", builtinNotany},
+	{"seq-notany", builtinNotany},
+	{"notevery", builtinNotevery},
+	{"seq-notevery", builtinNotevery},
+	{"nconc", builtinNconc},
+	{"adjoin", builtinAdjoin},
+	{"subst", builtinSubst},
+	{"sublis", builtinSublis},
+	{"subst-if", builtinSubstIf},
+	{"nsubst", builtinNsubst},
+	{"nsubst-if", builtinNsubstIf},
+	{"nsublis", builtinNsublis},
+	{"tree-equal", builtinTreeEqual},
+	{"map-into", builtinMapInto},
+	{"map", builtinMap},
+	{"stable-sort", builtinStableSort},
+	{"union", builtinUnion},
+	{"intersection", builtinIntersection},
+	{"set-difference", builtinSetDifference},
+	{"set-exclusive-or", builtinSetExclusiveOr},
+	{"nset-exclusive-or", builtinNsetExclusiveOr},
+	{"nunion", builtinUnion},
+	{"nintersection", builtinIntersection},
+	{"nset-difference", builtinSetDifference},
+	{"subsetp", builtinSubsetp},
+	{"copy-list", builtinCopyList},
+	{"copy-alist", builtinCopyAlist},
+	{"copy-tree", builtinCopyTree},
+	{"list-length", builtinListLength},
+	{"last", builtinLast},
+	{"last-pair", builtinLastPair},
+	{"butlast", builtinButlast},
+	{"nbutlast", builtinNbutlast},
+	{"pairlis", builtinPairlis},
+	{"assoc-if", builtinAssocIf},
+	{"member-if", builtinMemberIf},
+	{"member", builtinMember},
+	{"position", builtinPosition},
+	{"position-if", builtinPositionIf},
+	{"revappend", builtinRevappend},
+	{"ldiff", builtinLdiff},
+	{"tailp", builtinTailp},
+	{"nth-value", builtinNthValue},
+	{"string-upcase", builtinStrUpcase},
+	{"string-downcase", builtinStrDowncase},
+	{"string-capitalize", builtinStrCapitalize},
+	{"string=", builtinStrEqual},
+	{"string-equal", builtinStrEqualCI},
+	{"string<", builtinStrLess},
+	{"isqrt", builtinIsqrt},
+	{"format", builtinFormat},
+	{"make-thread", builtinMakeThread},
+	{"join-thread", builtinJoinThread},
+	{"make-lock", builtinMakeLock},
+	{"lock", builtinLock},
+	{"unlock", builtinUnlock},
+	{"condition-wait", builtinConditionWait},
+	{"condition-notify", builtinConditionNotify},
+	{"condition-broadcast", builtinConditionBroadcast},
+	{"atomic-incf", builtinAtomicIncf},
+	{"atomic-decf", builtinAtomicDecf},
+	{"atomic-get", builtinAtomicGet},
+	{"atomic-set", builtinAtomicSet},
+	{"sleep", builtinSleep},
+	{"values", builtinValues},
+	{"values-list", builtinValuesList},
+	{"error", builtinError},
+	{"cerror", builtinCError},
+	{"warn", builtinWarn},
+	{"signal", builtinSignal},
+	{"invoke-restart", builtinInvokeRestart},
+	{"abort", builtinAbort},
+	{"continue", builtinContinue},
+	{"muffle-warning", builtinMuffleWarning},
+	{"store-value", builtinStoreValue},
+	{"use-value", builtinUseValue},
+	{"compute-restarts", builtinComputeRestarts},
+	{"find-restart", builtinFindRestart},
+	{"make-condvar", builtinMakeCondVar},
+	{"thread?", builtinThreadP},
+	{"lock?", builtinLockP},
+	{"condvar?", builtinCondVarP},
+	{"identity", builtinIdentity},
+	{"complement", builtinComplement},
+	{"constantly", builtinConstantly},
+	{"parse-integer", builtinParseInteger},
+	{"getf", builtinGetf},
+	{"remf", builtinRemf},
+	{"get-properties", builtinGetProperties},
+	{"make-string", builtinMakeString},
+	{"make-list", builtinMakeList},
+	{"random", builtinRandom},
+	{"nstring-upcase", builtinNStringUpcase},
+	{"nstring-downcase", builtinNStringDowncase},
+	{"nstring-capitalize", builtinNStringCapitalize},
+	{"string-not-equal", builtinStringNotEqual},
+	{"string-greaterp", builtinStringGreaterp},
+	{"string-lessp", builtinStringLessp},
+	{"string-not-greaterp", builtinStringNotGreaterp},
+	{"string-not-lessp", builtinStringNotLessp},
+	{"write-to-string", builtinWriteToString},
+	{"prin1-to-string", builtinPrin1ToString},
+	{"princ-to-string", builtinPrincToString},
+	{"string-elt", builtinStringElt},
+	{"reverse", builtinReverse},
+	{"replace", builtinReplace},
+	{"acons", builtinAcons},
+	{"rassoc", builtinRassoc},
+	{"rassoc-if", builtinRassocIf},
+	{"nth", builtinNth},
+	{"nthcdr", builtinNthCdr},
+	{"string/=", builtinStringNotEq},
+	{"string>", builtinStringGreater},
+	{"string<=", builtinStringLe},
+	{"string>=", builtinStringGe},
+	{"abs", builtinAbs},
+	{"max", builtinMax},
+	{"min", builtinMin},
+	{"mod", builtinMod},
+	{"rem", builtinRem},
+	{"floor", builtinFloor},
+	{"ceiling", builtinCeiling},
+	{"truncate", builtinTruncate},
+	{"round", builtinRound},
+	{"signum", builtinSignum},
+	{"gcd", builtinGCD},
+	{"lcm", builtinLCM},
+	{"log", builtinLog},
+	{"sqrt", builtinSqrt},
+	{"expt", builtinExpt},
+	{"sin", builtinSin},
+	{"cos", builtinCos},
+	{"tan", builtinTan},
+	{"atan", builtinAtan},
+	{"atan2", builtinAtan2},
+	{"exp", builtinExp},
+	{"sinh", builtinSinh},
+	{"cosh", builtinCosh},
+	{"tanh", builtinTanh},
+	{"evenp", builtinEvenp},
+	{"oddp", builtinOddp},
+	{"plusp", builtinPlusp},
+	{"minusp", builtinMinusp},
+	{"zerop", builtinZerop},
+	{"1+", builtinOnePlus},
+	{"1-", builtinOneMinus},
+	{"digit-char", builtinDigitChar},
+	{"alphanumericp", builtinAlphanumericp},
+	{"alpha-char-p", builtinAlphaCharP},
+	{"graphic-char-p", builtinGraphicCharP},
+	{"upper-case-p", builtinUpperCaseP},
+	{"lower-case-p", builtinLowerCaseP},
+	{"both-case-p", builtinBothCaseP},
+	{"char-equal", builtinCharEqual},
+	{"char-not-equal", builtinCharNotEqual},
+	{"char-lessp", builtinCharLessp},
+	{"char-greaterp", builtinCharGreaterp},
+	{"char-not-lessp", builtinCharNotLessp},
+	{"char-not-greaterp", builtinCharNotGreaterp},
+	{"char/=", builtinCharNotEq},
+	{"char<=", builtinCharLe},
+	{"char>=", builtinCharGe},
+	{"nreconc", builtinNreconc},
+	{"maplist", builtinMaplist},
+	{"mapc", builtinMapc},
+	{"mapl", builtinMapl},
+	{"mapcon", builtinMapcon},
+	{"list*", builtinListStar},
+	{"realpart", builtinRealpart},
+	{"imagpart", builtinImagpart},
+	{"conjugate", builtinConjugate},
+	{"phase", builtinPhase},
+	{"cis", builtinCis},
+	{"complex", builtinComplex},
+	{"integerp", builtinIntegerp},
+	{"floatp", builtinFloatp},
+	{"rationalp", builtinRationalp},
+	{"realp", builtinRealp},
+	{"complexp", builtinComplexp},
+	{"float", builtinFloat},
+	{"rational", builtinRational},
+	{"numerator", builtinNumerator},
+	{"denominator", builtinDenominator},
+	{"ash", builtinAsh},
+	{"logand", builtinLogand},
+	{"logior", builtinLogior},
+	{"logxor", builtinLogxor},
+	{"lognot", builtinLognot},
+	{"logcount", builtinLogcount},
+	{"logbitp", builtinLogbitp},
+	{"logtest", builtinLogtest},
+	{"integer-length", builtinIntegerLength},
+	{"byte", builtinByte},
+	{"byte-size", builtinByteSize},
+	{"byte-position", builtinBytePosition},
+	{"ldb", builtinLdb},
+	{"dpb", builtinDpb},
+	{"boole", builtinBoole},
+	{"coerce", builtinCoerce},
+	// Pathname operations
+	{"make-pathname", builtinMakePathname},
+	{"pathname", builtinPathname},
+	{"pathname-host", builtinPathnameHost},
+	{"pathname-device", builtinPathnameDevice},
+	{"pathname-directory", builtinPathnameDirectory},
+	{"pathname-name", builtinPathnameName},
+	{"pathname-type", builtinPathnameType},
+	{"pathname-version", builtinPathnameVersion},
+	{"namestring", builtinNamestring},
+	{"file-namestring", builtinFileNamestring},
+	{"directory-namestring", builtinDirectoryNamestring},
+	{"host-namestring", builtinHostNamestring},
+	{"enough-namestring", builtinEnoughNamestring},
+	{"merge-pathnames", builtinMergePathnames},
+	{"pathnamep", builtinPathnamep},
+	{"probe-file", builtinProbeFile},
+	{"delete-file", builtinDeleteFile},
+	{"rename-file", builtinRenameFile},
+	{"file-author", builtinFileAuthor},
+	{"file-write-date", builtinFileWriteDate},
+	{"ensure-directories-exist", builtinEnsureDirectoriesExist},
+	{"directory-pathname-p", builtinDirectoryPathnameP},
+	{"wild-pathname-p", builtinWildPathnameP},
+	{"pathname-match-p", builtinPathnameMatchP},
+	{"logical-pathname", builtinLogicalPathname},
+	{"directory", builtinDirectory},
+	{"file-length", builtinFileLength},
+	{"file-position", builtinFilePosition},
+	{"truename", builtinTruename},
+}
+
+// -------- Pathname helpers --------
+
+func vpathname(p *LispPathname) *Value {
+	v := gcv()
+	v.typ = VPathname
+	v.pathname = p
+	return v
+}
+
+func isPathname(v *Value) bool {
+	return v.typ == VPathname
+}
+
+func vpkg(p *Package) *Value {
+	v := gcv()
+	v.typ = VPackage
+	v.pkg = p
+	return v
+}
+
+func isPackage(v *Value) bool {
+	return v != nil && v.typ == VPackage
+}
+
+func vrt(rt *Readtable) *Value {
+	v := gcv()
+	v.typ = VReadtable
+	v.readtable = rt
+	return v
+}
+
+func isReadtable(v *Value) bool {
+	return v != nil && v.typ == VReadtable
+}
+
+func getCurrentReadtable() *Readtable {
+	if currentReadtable != nil {
+		return currentReadtable
+	}
+	return standardReadtable
+}
+
+func resolveReadtable(v *Value) *Readtable {
+	if v == nil || isNil(v) {
+		return getCurrentReadtable()
+	}
+	if v.typ == VReadtable {
+		return v.readtable
+	}
+	return getCurrentReadtable()
+}
+
+func getPathname(v *Value) *LispPathname {
+	if v.typ == VPathname {
+		return v.pathname
+	}
+	if v.typ == VStr {
+		return parsePathnameString(v.str)
+	}
+	return nil
+}
+
+func parsePathnameString(s string) *LispPathname {
+	p := &LispPathname{version: "newest"}
+	// Handle Windows paths (e.g., C:/)
+	if len(s) >= 2 && s[1] == ':' {
+		p.device = s[:2]
+		s = s[2:]
+	}
+	// Determine absolute vs relative
+	if len(s) > 0 && (s[0] == '/' || s[0] == '\\') {
+		p.directory = list(vsym(":absolute"))
+		// Skip leading separators
+		for len(s) > 0 && (s[0] == '/' || s[0] == '\\') {
+			s = s[1:]
+		}
+	} else {
+		p.directory = list(vsym(":relative"))
+	}
+	// Split directory components
+	parts := []string{}
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '/' || s[i] == '\\' {
+			if i > start {
+				parts = append(parts, s[start:i])
+			}
+			start = i + 1
+		}
+	}
+	// Last part may contain name.type
+	last := s[start:]
+	if len(parts) > 0 || len(last) > 0 {
+		// Check if last part has a dot (extension separator)
+		dotIdx := -1
+		for j := len(last) - 1; j >= 0; j-- {
+			if last[j] == '.' {
+				dotIdx = j
+				break
+			}
+		}
+		if dotIdx > 0 {
+			p.name = last[:dotIdx]
+			p.ftype = last[dotIdx+1:]
+		} else if dotIdx == 0 {
+			p.ftype = last[1:]
+		} else {
+			p.name = last
+		}
+	}
+	// Build directory list
+	dirList := p.directory
+	for _, part := range parts {
+		dirList = appendToList(dirList, vsym(part))
+	}
+	p.directory = dirList
+	return p
+}
+
+func pathnameToString(p *LispPathname) string {
+	var b strings.Builder
+	if p.device != "" {
+		b.WriteString(p.device)
+	}
+	// Directory
+	if p.directory != nil && !isNil(p.directory) {
+		dir := p.directory
+		if !isNil(dir) && dir.car != nil && dir.car.typ == VSym {
+			if dir.car.str == ":absolute" {
+				b.WriteString("/")
+			}
+			dir = dir.cdr
+		}
+		for !isNil(dir) && dir.typ == VPair {
+			if dir.car != nil && dir.car.typ == VSym {
+				b.WriteString(dir.car.str)
+				b.WriteString("/")
+			} else if dir.car != nil && dir.car.typ == VStr {
+				b.WriteString(dir.car.str)
+				b.WriteString("/")
+			}
+			dir = dir.cdr
+		}
+	}
+	// Name
+	b.WriteString(p.name)
+	// Type
+	if p.ftype != "" {
+		b.WriteString(".")
+		b.WriteString(p.ftype)
+	}
+	return b.String()
+}
+
+func appendToList(lst *Value, elem *Value) *Value {
+	if isNil(lst) {
+		return cons(elem, vnil())
+	}
+	// Iterate to find last cons cell
+	cur := lst
+	for cur.typ == VPair && !isNil(cur.cdr) && cur.cdr.typ == VPair {
+		cur = cur.cdr
+	}
+	cur.cdr = cons(elem, vnil())
+	return lst
+}
+
+func builtinMakePathname(args []*Value) (*Value, error) {
+	p := &LispPathname{version: "newest"}
+	for i := 0; i+1 < len(args); i += 2 {
+		key := args[i]
+		val := args[i+1]
+		if key.typ != VSym || len(key.str) == 0 || key.str[0] != ':' {
+			continue
+		}
+		switch key.str[1:] {
+		case "host":
+			if val.typ == VStr {
+				p.host = val.str
+			}
+		case "device":
+			if val.typ == VStr {
+				p.device = val.str
+			}
+		case "directory":
+			p.directory = val
+		case "name":
+			if val.typ == VStr {
+				p.name = val.str
+			} else if val.typ == VSym {
+				p.name = val.str
+			}
+		case "type":
+			if val.typ == VStr {
+				p.ftype = val.str
+			} else if val.typ == VSym {
+				p.ftype = val.str
+			}
+		case "version":
+			if val.typ == VSym {
+				p.version = val.str
+			} else if val.typ == VStr {
+				p.version = val.str
+			}
+		}
+	}
+	return vpathname(p), nil
+}
+
+func builtinPathname(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("pathname: need a pathname designator")
+	}
+	v := args[0]
+	if v.typ == VPathname {
+		return v, nil
+	}
+	if v.typ == VStr {
+		return vpathname(parsePathnameString(v.str)), nil
+	}
+	if v.typ == VStream && v.stream != nil && v.stream.path != "" {
+		return vpathname(parsePathnameString(v.stream.path)), nil
+	}
+	return nil, fmt.Errorf("pathname: cannot convert to pathname")
+}
+
+func builtinPathnameHost(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	p := getPathname(args[0])
+	if p == nil || p.host == "" {
+		return vnil(), nil
+	}
+	return vstr(p.host), nil
+}
+
+func builtinPathnameDevice(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	p := getPathname(args[0])
+	if p == nil || p.device == "" {
+		return vnil(), nil
+	}
+	return vstr(p.device), nil
+}
+
+func builtinPathnameDirectory(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	p := getPathname(args[0])
+	if p == nil || p.directory == nil {
+		return vnil(), nil
+	}
+	return p.directory, nil
+}
+
+func builtinPathnameName(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	p := getPathname(args[0])
+	if p == nil || p.name == "" {
+		return vnil(), nil
+	}
+	return vstr(p.name), nil
+}
+
+func builtinPathnameType(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	p := getPathname(args[0])
+	if p == nil || p.ftype == "" {
+		return vnil(), nil
+	}
+	return vstr(p.ftype), nil
+}
+
+func builtinPathnameVersion(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vsym(":newest"), nil
+	}
+	return vsym(p.version), nil
+}
+
+func builtinNamestring(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vstr(""), nil
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vstr(""), nil
+	}
+	return vstr(pathnameToString(p)), nil
+}
+
+func builtinFileNamestring(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vstr(""), nil
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vstr(""), nil
+	}
+	var b strings.Builder
+	b.WriteString(p.name)
+	if p.ftype != "" {
+		b.WriteString(".")
+		b.WriteString(p.ftype)
+	}
+	return vstr(b.String()), nil
+}
+
+func builtinDirectoryNamestring(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vstr(""), nil
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vstr(""), nil
+	}
+	var b strings.Builder
+	if p.device != "" {
+		b.WriteString(p.device)
+	}
+	if p.directory != nil && !isNil(p.directory) {
+		dir := p.directory
+		if !isNil(dir) && dir.car != nil && dir.car.typ == VSym {
+			if dir.car.str == ":absolute" {
+				b.WriteString("/")
+			}
+			dir = dir.cdr
+		}
+		for !isNil(dir) && dir.typ == VPair {
+			if dir.car != nil && dir.car.typ == VSym {
+				b.WriteString(dir.car.str)
+				b.WriteString("/")
+			} else if dir.car != nil && dir.car.typ == VStr {
+				b.WriteString(dir.car.str)
+				b.WriteString("/")
+			}
+			dir = dir.cdr
+		}
+	}
+	return vstr(b.String()), nil
+}
+
+func builtinHostNamestring(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vstr(""), nil
+	}
+	p := getPathname(args[0])
+	if p == nil || p.host == "" {
+		return vstr(""), nil
+	}
+	return vstr(p.host), nil
+}
+
+func builtinEnoughNamestring(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vstr(""), nil
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vstr(""), nil
+	}
+	var b strings.Builder
+	b.WriteString(p.name)
+	if p.ftype != "" {
+		b.WriteString(".")
+		b.WriteString(p.ftype)
+	}
+	return vstr(b.String()), nil
+}
+
+func builtinMergePathnames(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("merge-pathnames: need a pathname")
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		p = &LispPathname{version: "newest"}
+	}
+	var dp *LispPathname
+	if len(args) >= 2 {
+		dp = getPathname(args[1])
+	}
+	if dp == nil {
+		dp = &LispPathname{version: "newest"}
+	}
+	result := &LispPathname{version: "newest"}
+	result.host = p.host
+	if result.host == "" {
+		result.host = dp.host
+	}
+	result.device = p.device
+	if result.device == "" {
+		result.device = dp.device
+	}
+	result.directory = p.directory
+	if result.directory == nil || isNil(result.directory) {
+		result.directory = dp.directory
+	}
+	result.name = p.name
+	if result.name == "" {
+		result.name = dp.name
+	}
+	result.ftype = p.ftype
+	if result.ftype == "" {
+		result.ftype = dp.ftype
+	}
+	result.version = p.version
+	if result.version == "" {
+		result.version = dp.version
+	}
+	return vpathname(result), nil
+}
+
+func builtinPathnamep(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(args[0].typ == VPathname), nil
+}
+
+func builtinProbeFile(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("probe-file: need a pathname")
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vnil(), nil
+	}
+	path := pathnameToString(p)
+	if _, err := os.Stat(path); err == nil {
+		return vpathname(p), nil
+	}
+	return vnil(), nil
+}
+
+func builtinDirectory(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vnil(), nil
+	}
+	path := pathnameToString(p)
+	matches, err := filepath.Glob(path)
+	if err != nil {
+		return vnil(), nil
+	}
+	result := vnil()
+	for i := len(matches) - 1; i >= 0; i-- {
+		pp := parsePathnameString(matches[i])
+		result = cons(vpathname(pp), result)
+	}
+	return result, nil
+}
+
+func builtinFileLength(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("file-length: need a stream")
+	}
+	v := args[0]
+	if v.typ == VStream && v.stream != nil && v.stream.file != nil {
+		fi, err := v.stream.file.Stat()
+		if err != nil {
+			return vnil(), nil
+		}
+		return vnum(float64(fi.Size())), nil
+	}
+	return vnil(), nil
+}
+
+func builtinFilePosition(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("file-position: need a stream")
+	}
+	v := args[0]
+	if v.typ != VStream || v.stream == nil {
+		return vnil(), nil
+	}
+	if len(args) < 2 {
+		if v.stream.file != nil {
+			pos, err := v.stream.file.Seek(0, 1)
+			if err != nil {
+				return vnil(), nil
+			}
+			return vnum(float64(pos)), nil
+		}
+		return vnil(), nil
+	}
+	pos := int64(toNum(args[1]))
+	if v.stream.file != nil {
+		_, err := v.stream.file.Seek(pos, 0)
+		if err != nil {
+			return vnil(), nil
+		}
+		return vnum(float64(pos)), nil
+	}
+	return vnil(), nil
+}
+
+func builtinTruename(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("truename: need a pathname")
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vnil(), nil
+	}
+	path := pathnameToString(p)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return vnil(), nil
+	}
+	return vpathname(parsePathnameString(abs)), nil
+}
+
+// -------- Additional pathname functions --------
+
+// directory-pathname-p returns true if pathname has no name/type/version
+func builtinDirectoryPathnameP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vbool(false), nil
+	}
+	return vbool(p.name == "" && p.ftype == "" && p.version == ""), nil
+}
+
+// wild-pathname-p checks if pathname contains wildcard components
+func builtinWildPathnameP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vbool(false), nil
+	}
+	// Check for :wild in components, or * in name/type
+	if p.name == "*" || p.ftype == "*" || p.version == "*" {
+		return vbool(true), nil
+	}
+	if p.directory != nil && !isNil(p.directory) {
+		for d := p.directory; !isNil(d) && d.typ == VPair; d = d.cdr {
+			if d.car != nil && d.car.typ == VSym && d.car.str == ":wild" {
+				return vbool(true), nil
+			}
+			if d.car != nil && d.car.typ == VStr && d.car.str == "*" {
+				return vbool(true), nil
+			}
+		}
+	}
+	return vbool(false), nil
+}
+
+// pathname-match-p checks if pathname matches a wildcard pattern
+func builtinPathnameMatchP(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(false), nil
+	}
+	pathP := getPathname(args[0])
+	patternP := getPathname(args[1])
+	if pathP == nil || patternP == nil {
+		return vbool(false), nil
+	}
+	// Simple matching: * matches anything, otherwise exact match
+	if patternP.name == "*" || patternP.name == pathP.name {
+		if patternP.ftype == "*" || patternP.ftype == pathP.ftype {
+			return vbool(true), nil
+		}
+	}
+	return vbool(false), nil
+}
+
+// file-author returns the author of a file
+func builtinFileAuthor(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("file-author: need a pathname")
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vnil(), nil
+	}
+	path := pathnameToString(p)
+	_, err := os.Stat(path)
+	if err != nil {
+		return vnil(), nil
+	}
+	// Go doesn't natively support file author on all platforms; return nil
+	return vnil(), nil
+}
+
+// file-write-date returns the modification time as universal time
+func builtinFileWriteDate(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("file-write-date: need a pathname")
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vnil(), nil
+	}
+	path := pathnameToString(p)
+	info, err := os.Stat(path)
+	if err != nil {
+		return vnil(), nil
+	}
+	// Convert to Unix timestamp (Lisp universal time is seconds since 1900-01-01)
+	modTime := info.ModTime().Unix()
+	// Universal time epoch: 1900-01-01 00:00:00 UTC
+	unixEpoch := int64(2208988800) // seconds from 1900 to 1970
+	return vnum(float64(modTime + unixEpoch)), nil
+}
+
+// builtinRenameFile renames a file
+func builtinRenameFile(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("rename-file: need old and new pathname")
+	}
+	oldP := getPathname(args[0])
+	newP := getPathname(args[1])
+	if oldP == nil || newP == nil {
+		return vnil(), nil
+	}
+	oldPath := pathnameToString(oldP)
+	newPath := pathnameToString(newP)
+	err := os.Rename(oldPath, newPath)
+	if err != nil {
+		return vnil(), nil
+	}
+	oldAbs, _ := filepath.Abs(oldPath)
+	newAbs, _ := filepath.Abs(newPath)
+	return list(vpathname(parsePathnameString(newAbs)), vpathname(parsePathnameString(newAbs)), vpathname(parsePathnameString(oldAbs))), nil
+}
+
+// builtinDeleteFile deletes a file
+func builtinDeleteFile(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("delete-file: need a pathname")
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vbool(false), nil
+	}
+	path := pathnameToString(p)
+	err := os.Remove(path)
+	if err != nil {
+		return vbool(false), nil
+	}
+	return vbool(true), nil
+}
+
+// ensure-directories-exist ensures parent directories exist for a pathname
+func builtinEnsureDirectoriesExist(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("ensure-directories-exist: need a pathname")
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return vnil(), nil
+	}
+	path := pathnameToString(p)
+	dir := filepath.Dir(path)
+	err := os.MkdirAll(dir, 0755)
+	if err != nil {
+		return vbool(false), nil
+	}
+	return vpathname(p), nil
+}
+
+// logical-pathname translates a logical pathname to physical
+func builtinLogicalPathname(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("logical-pathname: need a pathname")
+	}
+	v := args[0]
+	var pathStr string
+	if v.typ == VStr {
+		pathStr = v.str
+	} else if v.typ == VPathname {
+		pathStr = pathnameToString(v.pathname)
+	}
+	// Treat as physical and return as-is for now
+	return vpathname(parsePathnameString(pathStr)), nil
+}
+
+func toNum(v *Value) float64 {
+	switch v.typ {
+	case VNum:
+		return v.num
+	case VRat:
+		return float64(v.irat) / float64(v.iden)
+	case VComplex:
+		return v.num
+	case VBigInt:
+		f, _ := new(big.Float).SetInt(v.bigInt).Float64()
+		return f
+	}
+	return 0
+}
+
+// isNumeric returns true if v is a numeric type
+func isNumeric(v *Value) bool {
+	return v.typ == VNum || v.typ == VRat || v.typ == VComplex || v.typ == VBigInt
+}
+
+// toRatParts extracts rational form. isInt indicates VNum with integer value.
+func toRatParts(v *Value) (n, d int64, isInt bool) {
+	switch v.typ {
+	case VRat:
+		return v.irat, v.iden, true
+	case VNum:
+		if v.num == math.Trunc(v.num) && !math.IsInf(v.num, 0) && v.num >= -9e15 && v.num <= 9e15 {
+			return int64(v.num), 1, true
+		}
+	case VBigInt:
+		if v.bigInt.IsInt64() {
+			return v.bigInt.Int64(), 1, true
+		}
+	}
+	return 0, 0, false
+}
+
+// toComplexParts extracts real and imaginary parts from any numeric value.
+func toComplexParts(v *Value) (r, i float64) {
+	switch v.typ {
+	case VComplex:
+		return v.num, v.imag
+	case VRat:
+		return float64(v.irat) / float64(v.iden), 0
+	default:
+		return toNum(v), 0
+	}
+}
+
+// needComplex checks if any arg is a complex number.
+func needComplex(args []*Value) bool {
+	for _, a := range args {
+		if a.typ == VComplex {
+			return true
+		}
+	}
+	return false
+}
+
+// needRat checks if any arg is a rational (and none are complex).
+func needRat(args []*Value) bool {
+	for _, a := range args {
+		if a.typ == VRat || a.typ == VBigInt {
+			return true
+		}
+	}
+	return false
+}
+
+// isBigIntInt checks if any arg is a VBigInt.
+func isBigIntInt(args []*Value) bool {
+	for _, a := range args {
+		if a.typ == VBigInt {
+			return true
+		}
+	}
+	return false
+}
+
+// toBigInt converts a Value to *big.Int (0 if not integer).
+func toBigInt(v *Value) *big.Int {
+	switch v.typ {
+	case VNum:
+		if v.num == math.Trunc(v.num) && !math.IsInf(v.num, 0) {
+			return big.NewInt(int64(v.num))
+		}
+	case VRat:
+		if v.iden == 1 {
+			return big.NewInt(v.irat)
+		}
+	case VBigInt:
+		return new(big.Int).Set(v.bigInt)
+	}
+	return nil
+}
+
+// compareNumeric returns -1 if a < b, 0 if a == b, 1 if a > b.
+// Uses big.Int when any operand is VBigInt for exact comparison.
+func compareNumeric(a, b *Value) int {
+	if a.typ == VBigInt || b.typ == VBigInt {
+		ai := toBigInt(a)
+		bi := toBigInt(b)
+		if ai != nil && bi != nil {
+			return ai.Cmp(bi)
+		}
+		// If one can't be converted to int, fall through to float
+	}
+	af := toNum(a)
+	bf := toNum(b)
+	if af < bf {
+		return -1
+	}
+	if af > bf {
+		return 1
+	}
+	return 0
+}
+
+func builtinAdd(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return vnum(0), nil
+	}
+	// Type check: all args must be numeric
+	for _, a := range args {
+		if !isNumeric(a) {
+			return nil, fmt.Errorf("+: not a number: %s", toString(a))
+		}
+	}
+	if needComplex(args) {
+		r, i := 0.0, 0.0
+		for _, a := range args {
+			ar, ai := toComplexParts(a)
+			r += ar
+			i += ai
+		}
+		return vcomplex(r, i), nil
+	}
+	// Try big.Int if any arg is VBigInt or if rational arithmetic might overflow
+	if isBigIntInt(args) {
+		result := new(big.Int)
+		for _, a := range args {
+			bi := toBigInt(a)
+			if bi != nil {
+				result.Add(result, bi)
+				continue
+			}
+			// Not an exact integer - fall back to float
+			f, _ := new(big.Float).SetInt(result).Float64()
+			for _, a2 := range args {
+				f += toNum(a2)
+			}
+			return vnum(f), nil
+		}
+		return vbigint(result), nil
+	}
+	if needRat(args) {
+		// Track as rational
+		n, d := int64(0), int64(1)
+		hasFloat := false
+		for _, a := range args {
+			an, ad, isInt := toRatParts(a)
+			if !isInt {
+				hasFloat = true
+				break
+			}
+			n = n*ad + an*d
+			d = d * ad
+			g := gcd(n, d)
+			if g < 0 {
+				g = -g
+			}
+			n /= g
+			d /= g
+		}
+		if hasFloat {
+			r := 0.0
+			for _, a := range args {
+				r += toNum(a)
+			}
+			return vnum(r), nil
+		}
+		return vrat(n, d), nil
+	}
+	r := 0.0
+	for _, a := range args {
+		r += toNum(a)
+	}
+	return vnum(r), nil
+}
+
+func builtinSub(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return vnum(0), nil
+	}
+	for _, a := range args {
+		if !isNumeric(a) {
+			return nil, fmt.Errorf("-: not a number: %s", toString(a))
+		}
+	}
+	if needComplex(args) {
+		ar, ai := toComplexParts(args[0])
+		if len(args) == 1 {
+			return vcomplex(-ar, -ai), nil
+		}
+		for _, a := range args[1:] {
+			br, bi := toComplexParts(a)
+			ar -= br
+			ai -= bi
+		}
+		return vcomplex(ar, ai), nil
+	}
+	if isBigIntInt(args) {
+		result := toBigInt(args[0])
+		if result == nil {
+			f := toNum(args[0])
+			for _, a := range args[1:] {
+				f -= toNum(a)
+			}
+			return vnum(f), nil
+		}
+		for _, a := range args[1:] {
+			bi := toBigInt(a)
+			if bi != nil {
+				result.Sub(result, bi)
+			} else {
+				f, _ := new(big.Float).SetInt(result).Float64()
+				for _, a2 := range args {
+					f -= toNum(a2)
+				}
+				return vnum(f), nil
+			}
+		}
+		return vbigint(result), nil
+	}
+	if len(args) == 1 {
+		if args[0].typ == VRat {
+			return vrat(-args[0].irat, args[0].iden), nil
+		}
+		return vnum(-toNum(args[0])), nil
+	}
+	if needRat(args) {
+		n0, d0, isInt0 := toRatParts(args[0])
+		hasFloat := !isInt0
+		for _, a := range args[1:] {
+			an, ad, isInt := toRatParts(a)
+			if !isInt {
+				hasFloat = true
+				break
+			}
+			n0 = n0*ad - an*d0
+			d0 = d0 * ad
+			g := gcd(n0, d0)
+			if g < 0 {
+				g = -g
+			}
+			n0 /= g
+			d0 /= g
+		}
+		if hasFloat {
+			r := toNum(args[0])
+			for _, a := range args[1:] {
+				r -= toNum(a)
+			}
+			return vnum(r), nil
+		}
+		return vrat(n0, d0), nil
+	}
+	r := toNum(args[0])
+	for _, a := range args[1:] {
+		r -= toNum(a)
+	}
+	return vnum(r), nil
+}
+
+func builtinMul(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return vnum(1), nil
+	}
+	for _, a := range args {
+		if !isNumeric(a) {
+			return nil, fmt.Errorf("*: not a number: %s", toString(a))
+		}
+	}
+	if needComplex(args) {
+		r, i := 1.0, 0.0 // start with 1+0i
+		for _, a := range args {
+			ar, ai := toComplexParts(a)
+			// (r + i*i) * (ar + ai*i) = (r*ar - i*ai) + (r*ai + i*ar)*i
+			newR := r*ar - i*ai
+			newI := r*ai + i*ar
+			r, i = newR, newI
+		}
+		return vcomplex(r, i), nil
+	}
+	if isBigIntInt(args) {
+		result := big.NewInt(1)
+		for _, a := range args {
+			bi := toBigInt(a)
+			if bi != nil {
+				result.Mul(result, bi)
+				continue
+			}
+			f, _ := new(big.Float).SetInt(result).Float64()
+			for _, a2 := range args {
+				f *= toNum(a2)
+			}
+			return vnum(f), nil
+		}
+		return vbigint(result), nil
+	}
+	if needRat(args) {
+		n, d := int64(1), int64(1)
+		hasFloat := false
+		for _, a := range args {
+			an, ad, isInt := toRatParts(a)
+			if !isInt {
+				hasFloat = true
+				break
+			}
+			n *= an
+			d *= ad
+			g := gcd(n, d)
+			if g < 0 {
+				g = -g
+			}
+			n /= g
+			d /= g
+		}
+		if hasFloat {
+			r := 1.0
+			for _, a := range args {
+				r *= toNum(a)
+			}
+			return vnum(r), nil
+		}
+		return vrat(n, d), nil
+	}
+	// All args are VNum — check if they are all integer-valued
+	// If so, use big.Int to avoid overflow
+	allInt := true
+	for _, a := range args {
+		if a.typ != VNum || a.num != math.Trunc(a.num) || math.IsInf(a.num, 0) {
+			allInt = false
+			break
+		}
+	}
+	if allInt {
+		result := big.NewInt(1)
+		for _, a := range args {
+			bi := big.NewInt(int64(a.num))
+			result.Mul(result, bi)
+		}
+		return vbigint(result), nil
+	}
+	r := 1.0
+	for _, a := range args {
+		r *= toNum(a)
+	}
+	return vnum(r), nil
+}
+
+func builtinDiv(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return vnum(1), nil
+	}
+	for _, a := range args {
+		if !isNumeric(a) {
+			return nil, fmt.Errorf("/: not a number: %s", toString(a))
+		}
+	}
+	if needComplex(args) {
+		ar, ai := toComplexParts(args[0])
+		if len(args) == 1 {
+			// 1 / (ar + ai*i) = ar/(ar²+ai²) - ai/(ar²+ai²)*i
+			den := ar*ar + ai*ai
+			if den == 0 {
+				return nil, fmt.Errorf("division by zero")
+			}
+			return vcomplex(ar/den, -ai/den), nil
+		}
+		for _, a := range args[1:] {
+			br, bi := toComplexParts(a)
+			den := br*br + bi*bi
+			if den == 0 {
+				return nil, fmt.Errorf("division by zero")
+			}
+			// (ar + ai*i) / (br + bi*i) = (ar*br + ai*bi)/den + (ai*br - ar*bi)/den * i
+			newR := (ar*br + ai*bi) / den
+			newI := (ai*br - ar*bi) / den
+			ar, ai = newR, newI
+		}
+		return vcomplex(ar, ai), nil
+	}
+	if len(args) == 1 {
+		if args[0].typ == VBigInt {
+			if args[0].bigInt.Sign() == 0 {
+				return nil, fmt.Errorf("division by zero")
+			}
+			return vnum(1.0 / toNum(args[0])), nil
+		}
+		if args[0].typ == VRat {
+			if args[0].irat == 0 {
+				return nil, fmt.Errorf("division by zero")
+			}
+			// 1 / (a/b) = b/a
+			n := args[0].iden
+			d := args[0].irat
+			if d < 0 {
+				n = -n
+				d = -d
+			}
+			return vrat(n, d), nil
+		}
+		if toNum(args[0]) == 0 {
+			return nil, fmt.Errorf("division by zero")
+		}
+		return vnum(1.0 / toNum(args[0])), nil
+	}
+	if isBigIntInt(args) {
+		num := toBigInt(args[0])
+		den := big.NewInt(1)
+		if num == nil {
+			r := toNum(args[0])
+			for _, a := range args[1:] {
+				if toNum(a) == 0 {
+					return nil, fmt.Errorf("division by zero")
+				}
+				r /= toNum(a)
+			}
+			return vnum(r), nil
+		}
+		for _, a := range args[1:] {
+			bi := toBigInt(a)
+			if bi == nil {
+				r := toNum(args[0])
+				for _, a2 := range args[1:] {
+					if toNum(a2) == 0 {
+						return nil, fmt.Errorf("division by zero")
+					}
+					r /= toNum(a2)
+				}
+				return vnum(r), nil
+			}
+			if bi.Sign() == 0 {
+				return nil, fmt.Errorf("division by zero")
+			}
+			den.Mul(den, bi)
+		}
+		g := new(big.Int).GCD(nil, nil, num, den)
+		if g.Sign() != 0 {
+			num.Quo(num, g)
+			den.Quo(den, g)
+		}
+		if den.Sign() < 0 {
+			num.Neg(num)
+			den.Neg(den)
+		}
+		if den.IsInt64() && den.Int64() == 1 {
+			return vbigint(num), nil
+		}
+		// Result is not an integer: try to reduce to int64 rational
+		if num.IsInt64() && den.IsInt64() {
+			return vrat(num.Int64(), den.Int64()), nil
+		}
+		// Fallback: return as float
+		f, _ := new(big.Float).Quo(
+			new(big.Float).SetInt(num),
+			new(big.Float).SetInt(den),
+		).Float64()
+		return vnum(f), nil
+	}
+	if needRat(args) {
+		n0, d0, isInt0 := toRatParts(args[0])
+		hasFloat := !isInt0
+		for _, a := range args[1:] {
+			an, ad, isInt := toRatParts(a)
+			if !isInt {
+				hasFloat = true
+				break
+			}
+			if an == 0 {
+				return nil, fmt.Errorf("division by zero")
+			}
+			// (n0/d0) / (an/ad) = n0*ad / (d0*an)
+			n0 *= ad
+			d0 *= an
+			if d0 < 0 {
+				n0 = -n0
+				d0 = -d0
+			}
+			g := gcd(n0, d0)
+			if g < 0 {
+				g = -g
+			}
+			n0 /= g
+			d0 /= g
+		}
+		if hasFloat {
+			r := toNum(args[0])
+			for _, a := range args[1:] {
+				if toNum(a) == 0 {
+					return nil, fmt.Errorf("division by zero")
+				}
+				r /= toNum(a)
+			}
+			return vnum(r), nil
+		}
+		return vrat(n0, d0), nil
+	}
+	r := toNum(args[0])
+	for _, a := range args[1:] {
+		if toNum(a) == 0 {
+			return nil, fmt.Errorf("division by zero")
+		}
+		r /= toNum(a)
+	}
+	return vnum(r), nil
+}
+
+func builtinEq(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(true), nil
+	}
+	for i := 1; i < len(args); i++ {
+		if compareNumeric(args[i-1], args[i]) != 0 {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinNe(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(false), nil
+	}
+	for i := 0; i < len(args); i++ {
+		for j := i + 1; j < len(args); j++ {
+			if compareNumeric(args[i], args[j]) == 0 {
+				return vbool(false), nil
+			}
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinLt(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(true), nil
+	}
+	for i := 1; i < len(args); i++ {
+		if compareNumeric(args[i-1], args[i]) >= 0 {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinGt(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(true), nil
+	}
+	for i := 1; i < len(args); i++ {
+		if compareNumeric(args[i-1], args[i]) <= 0 {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinLe(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(true), nil
+	}
+	for i := 1; i < len(args); i++ {
+		if compareNumeric(args[i-1], args[i]) > 0 {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinGe(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(true), nil
+	}
+	for i := 1; i < len(args); i++ {
+		if compareNumeric(args[i-1], args[i]) < 0 {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinCons(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("cons: need 2 arguments")
+	}
+	return cons(args[0], args[1]), nil
+}
+
+func builtinCar(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("car: need 1 argument")
+	}
+	v := args[0]
+	if v != nil && v.typ == VMultiVal {
+		return primaryValue(v), nil
+	}
+	if !isPair(v) {
+		return nil, fmt.Errorf("car: not a pair")
+	}
+	return v.car, nil
+}
+
+func builtinCdr(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("cdr: need 1 argument")
+	}
+	if !isPair(args[0]) {
+		return nil, fmt.Errorf("cdr: not a pair")
+	}
+	return args[0].cdr, nil
+}
+
+func builtinSetCar(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("set-car!: need pair and value")
+	}
+	if !isPair(args[0]) {
+		return nil, fmt.Errorf("set-car!: not a pair")
+	}
+	args[0].car = args[1]
+	return args[1], nil
+}
+
+func builtinSetCdr(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("set-cdr!: need pair and value")
+	}
+	if !isPair(args[0]) {
+		return nil, fmt.Errorf("set-cdr!: not a pair")
+	}
+	args[0].cdr = args[1]
+	return args[1], nil
+}
+
+// builtinSetCar is used for (setf (car x) val) -> (car-setf val x)
+func builtinSetCarAsSetter(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("setf (car): need 2 arguments")
+	}
+	val := args[0]
+	cons := args[1]
+	if !isPair(cons) {
+		return nil, fmt.Errorf("setf (car): not a pair")
+	}
+	cons.car = val
+	return val, nil
+}
+
+// builtinSetCdrAsSetter is used for (setf (cdr x) val) -> (cdr-setf val x)
+func builtinSetCdrAsSetter(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("setf (cdr): need 2 arguments")
+	}
+	val := args[0]
+	cons := args[1]
+	if !isPair(cons) {
+		return nil, fmt.Errorf("setf (cdr): not a pair")
+	}
+	cons.cdr = val
+	return val, nil
+}
+
+func builtinList(args []*Value) (*Value, error) {
+	return listFromSlice(args), nil
+}
+
+// -------- List accessors --------
+func builtinRest(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	if args[0] == nil || args[0].typ != VPair {
+		return vnil(), nil
+	}
+	return args[0].cdr, nil
+}
+func builtinFirst(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	if v.typ == VPair {
+		return v.car, nil
+	}
+	return vnil(), nil
+}
+func builtinSecond(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	for i := 0; i < 1; i++ {
+		if v == nil || v.typ != VPair {
+			return vnil(), nil
+		}
+		v = v.cdr
+	}
+	if v != nil && v.typ == VPair {
+		return v.car, nil
+	}
+	return vnil(), nil
+}
+func builtinThird(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	for i := 0; i < 2; i++ {
+		if v == nil || v.typ != VPair {
+			return vnil(), nil
+		}
+		v = v.cdr
+	}
+	if v != nil && v.typ == VPair {
+		return v.car, nil
+	}
+	return vnil(), nil
+}
+func builtinFourth(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	for i := 0; i < 3; i++ {
+		if v == nil || v.typ != VPair {
+			return vnil(), nil
+		}
+		v = v.cdr
+	}
+	if v != nil && v.typ == VPair {
+		return v.car, nil
+	}
+	return vnil(), nil
+}
+func builtinFifth(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	for i := 0; i < 4; i++ {
+		if v == nil || v.typ != VPair {
+			return vnil(), nil
+		}
+		v = v.cdr
+	}
+	if v != nil && v.typ == VPair {
+		return v.car, nil
+	}
+	return vnil(), nil
+}
+func builtinSixth(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	for i := 0; i < 5; i++ {
+		if v == nil || v.typ != VPair {
+			return vnil(), nil
+		}
+		v = v.cdr
+	}
+	if v != nil && v.typ == VPair {
+		return v.car, nil
+	}
+	return vnil(), nil
+}
+func builtinSeventh(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	for i := 0; i < 6; i++ {
+		if v == nil || v.typ != VPair {
+			return vnil(), nil
+		}
+		v = v.cdr
+	}
+	if v != nil && v.typ == VPair {
+		return v.car, nil
+	}
+	return vnil(), nil
+}
+func builtinEighth(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	for i := 0; i < 7; i++ {
+		if v == nil || v.typ != VPair {
+			return vnil(), nil
+		}
+		v = v.cdr
+	}
+	if v != nil && v.typ == VPair {
+		return v.car, nil
+	}
+	return vnil(), nil
+}
+func builtinNinth(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	for i := 0; i < 8; i++ {
+		if v == nil || v.typ != VPair {
+			return vnil(), nil
+		}
+		v = v.cdr
+	}
+	if v != nil && v.typ == VPair {
+		return v.car, nil
+	}
+	return vnil(), nil
+}
+func builtinTenth(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	for i := 0; i < 9; i++ {
+		if v == nil || v.typ != VPair {
+			return vnil(), nil
+		}
+		v = v.cdr
+	}
+	if v != nil && v.typ == VPair {
+		return v.car, nil
+	}
+	return vnil(), nil
+}
+
+func builtinNullP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("null?: need 1 argument")
+	}
+	return vbool(isNil(args[0])), nil
+}
+
+func builtinPairP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("pair?: need 1 argument")
+	}
+	return vbool(isPair(args[0])), nil
+}
+
+func builtinNumP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("number?: need 1 argument")
+	}
+	return vbool(args[0].typ == VNum || args[0].typ == VRat || args[0].typ == VComplex), nil
+}
+
+func builtinStrP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("string?: need 1 argument")
+	}
+	return vbool(args[0].typ == VStr), nil
+}
+
+func builtinSymP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("symbol?: need 1 argument")
+	}
+	return vbool(args[0].typ == VSym), nil
+}
+
+func builtinBoolP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("boolean?: need 1 argument")
+	}
+	return vbool(args[0].typ == VBool), nil
+}
+
+func builtinProcP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("procedure?: need 1 argument")
+	}
+	return vbool(args[0].typ == VPrim || args[0].typ == VFunc), nil
+}
+
+func builtinCharP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("character?: need 1 argument")
+	}
+	return vbool(args[0].typ == VChar), nil
+}
+
+func builtinChar(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("char: need string and index")
+	}
+	if args[0].typ != VStr {
+		return nil, fmt.Errorf("char: expected a string")
+	}
+	if args[1].typ != VNum {
+		return nil, fmt.Errorf("char: expected an integer")
+	}
+	idx := int(args[1].num)
+	s := args[0].str
+	runes := []rune(s)
+	if idx < 0 || idx >= len(runes) {
+		return nil, fmt.Errorf("char: index %d out of range", idx)
+	}
+	return vchar(runes[idx]), nil
+}
+
+func builtinCharSetf(args []*Value) (*Value, error) {
+	// (char-setf newchar string index)
+	if len(args) < 3 {
+		return nil, fmt.Errorf("char-setf: need newchar, string, and index")
+	}
+	newChar := args[0]
+	s := args[1]
+	idx := args[2]
+	if newChar.typ != VChar {
+		return nil, fmt.Errorf("char-setf: expected a character for new value")
+	}
+	if s.typ != VStr {
+		return nil, fmt.Errorf("char-setf: expected a string")
+	}
+	if idx.typ != VNum {
+		return nil, fmt.Errorf("char-setf: expected an integer index")
+	}
+	i := int(idx.num)
+	runes := []rune(s.str)
+	if i < 0 || i >= len(runes) {
+		return nil, fmt.Errorf("char-setf: index %d out of range", i)
+	}
+	runes[i] = newChar.ch
+	s.str = string(runes)
+	return newChar, nil
+}
+
+func charCompare(op string, args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("char%s: expected at least 2 characters", op)
+	}
+	runes := make([]rune, len(args))
+	for i, a := range args {
+		if a.typ != VChar {
+			return nil, fmt.Errorf("char%s: expected a character", op)
+		}
+		runes[i] = a.ch
+	}
+	for i := 0; i < len(runes)-1; i++ {
+		a, b := runes[i], runes[i+1]
+		switch op {
+		case "=":
+			if a != b {
+				return vbool(false), nil
+			}
+		case "<":
+			if !(a < b) {
+				return vbool(false), nil
+			}
+		case ">":
+			if !(a > b) {
+				return vbool(false), nil
+			}
+		case "<=":
+			if !(a <= b) {
+				return vbool(false), nil
+			}
+		case ">=":
+			if !(a >= b) {
+				return vbool(false), nil
+			}
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinCharEq(args []*Value) (*Value, error) { return charCompare("=", args) }
+func builtinCharLt(args []*Value) (*Value, error) { return charCompare("<", args) }
+func builtinCharGt(args []*Value) (*Value, error) { return charCompare(">", args) }
+func builtinCharLe(args []*Value) (*Value, error) { return charCompare("<=", args) }
+func builtinCharGe(args []*Value) (*Value, error) { return charCompare(">=", args) }
+
+func builtinCodeChar(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("code-char: need an integer")
+	}
+	if args[0].typ != VNum {
+		return nil, fmt.Errorf("code-char: expected an integer")
+	}
+	n := int(args[0].num)
+	if n < 0 || n > 0x10FFFF {
+		return vnil(), nil
+	}
+	return vchar(rune(n)), nil
+}
+
+func builtinCharCode(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("char-code: need a character")
+	}
+	if args[0].typ != VChar {
+		return nil, fmt.Errorf("char-code: expected a character")
+	}
+	return vnum(float64(args[0].ch)), nil
+}
+
+// Standard character names
+var charNameMap = map[string]rune{
+	"space":     ' ',
+	"newline":   '\n',
+	"tab":       '\t',
+	"return":    '\r',
+	"backspace": '\x08',
+	"bell":      '\x07',
+	"page":      '\f',
+	"escape":    '\x1b',
+	"rubout":    '\x7f',
+	"null":      '\x00',
+}
+
+func builtinNameChar(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("name-char: need a string")
+	}
+	name := args[0]
+	var nameStr string
+	switch name.typ {
+	case VStr:
+		nameStr = name.str
+	case VSym:
+		nameStr = name.str
+	case VChar:
+		// If already a char, return it
+		return name, nil
+	default:
+		return vnil(), nil
+	}
+	nameStr = strings.ToLower(nameStr)
+	if ch, ok := charNameMap[nameStr]; ok {
+		return vchar(ch), nil
+	}
+	return vnil(), nil
+}
+
+func builtinCharName(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VChar {
+		return nil, fmt.Errorf("char-name: expected a character")
+	}
+	ch := args[0].ch
+	// Check named characters (return capitalized name per CL spec)
+	for name, r := range charNameMap {
+		if r == ch {
+			// Capitalize first letter
+			return vstr(strings.ToUpper(name[:1]) + name[1:]), nil
+		}
+	}
+	// For control characters
+	if ch < 32 && ch >= 0 {
+		return vstr("control"), nil
+	}
+	if ch == 127 {
+		return vstr("rubout"), nil
+	}
+	return vnil(), nil
+}
+
+func eqVal(a, b *Value) bool {
+	return eqValSeen(a, b, make(map[[2]uintptr]bool))
+}
+
+func eqValSeen(a, b *Value, seen map[[2]uintptr]bool) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if a.typ != b.typ {
+		return false
+	}
+	switch a.typ {
+	case VNum:
+		return a.num == b.num
+	case VRat:
+		return a.irat == b.irat && a.iden == b.iden
+	case VComplex:
+		return a.num == b.num && a.imag == b.imag
+	case VStr:
+		return a.str == b.str
+	case VSym:
+		return a.str == b.str
+	case VChar:
+		return a.ch == b.ch
+	case VPackage:
+		return a.pkg == b.pkg
+	case VReadtable:
+		return a.readtable == b.readtable
+	case VBool, VNil, VVHash:
+		return a == b
+	case VPair:
+		ka := [2]uintptr{uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(b))}
+		if seen[ka] {
+			return true
+		}
+		seen[ka] = true
+		return eqValSeen(a.car, b.car, seen) && eqValSeen(a.cdr, b.cdr, seen)
+	case VArray:
+		if a.array == nil || b.array == nil {
+			return a.array == b.array
+		}
+		if len(a.array.elements) != len(b.array.elements) {
+			return false
+		}
+		for i := range a.array.elements {
+			if !eqValSeen(a.array.elements[i], b.array.elements[i], seen) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// typeMatches checks if a value matches a type name for typecase.
+func typeMatches(v *Value, typeName string) bool {
+	switch typeName {
+	case "number", "integer", "float", "rational", "real", "complex":
+		if v.typ == VNum || v.typ == VRat || v.typ == VComplex || v.typ == VBigInt {
+			if typeName == "integer" {
+				return v.typ == VNum && v.num == math.Trunc(v.num) || v.typ == VRat || v.typ == VBigInt
+			}
+			if typeName == "float" {
+				return v.typ == VNum && v.num != math.Trunc(v.num)
+			}
+			if typeName == "rational" {
+				return v.typ == VRat || v.typ == VNum || v.typ == VBigInt
+			}
+			if typeName == "real" {
+				return v.typ == VNum || v.typ == VRat || v.typ == VBigInt
+			}
+			if typeName == "complex" {
+				return v.typ == VComplex
+			}
+			return true
+		}
+		return false
+	case "string":
+		return v.typ == VStr
+	case "symbol":
+		return v.typ == VSym
+	case "character":
+		return v.typ == VChar
+	case "list", "cons":
+		return v.typ == VPair
+	case "null", "nil":
+		return v.typ == VNil
+	case "boolean":
+		return v.typ == VBool
+	case "vector", "hash-table":
+		return v.typ == VVHash
+	case "function", "procedure":
+		return v.typ == VFunc || v.typ == VPrim
+	case "atom":
+		return v.typ != VPair
+	default:
+		// Check if it's a class name
+		if v.typ == VInstance && v.instClass != nil && v.instClass.str == typeName {
+			return true
+		}
+		return false
+	}
+}
+
+// bindPattern binds a destructuring pattern to a value in the given env.
+func bindPattern(pattern *Value, val *Value, env *Env) error {
+	return bindPatternRec(pattern, val, env, make(map[*Value]bool))
+}
+
+func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) error {
+	if pattern.typ == VSym {
+		// Simple variable: bind the whole value
+		env.Set(pattern.str, val)
+		return nil
+	}
+	if pattern.typ != VPair {
+		return fmt.Errorf("destructuring-bind: invalid pattern")
+	}
+	// List pattern: bind each element
+	vp := pattern
+	vv := val
+	localSeen := make(map[*Value]bool)
+	for !isNil(vp) {
+		if localSeen[vp] {
+			return fmt.Errorf("destructuring-bind: circular pattern")
+		}
+		localSeen[vp] = true
+		// Check for dotted pair (rest parameter)
+		if vp.typ == VSym {
+			env.Set(vp.str, vv)
+			return nil
+		}
+		if isNil(vv) {
+			// Not enough values — bind remaining to nil
+			if vp.typ != VPair || vp.car == nil || vp.car.typ != VSym {
+				return fmt.Errorf("destructuring: malformed var pattern")
+			}
+			env.Set(vp.car.str, vnil())
+		} else {
+			if err := bindPatternRec(vp.car, vv.car, env, seen); err != nil {
+				return err
+			}
+		}
+		vp = vp.cdr
+		if !isNil(vp) && vp.typ == VSym {
+			// Dotted pair: (a b . rest)
+			env.Set(vp.str, vv.cdr)
+			return nil
+		}
+		vv = vv.cdr
+	}
+	return nil
+}
+
+func builtinEqvP(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("eqv?: need 2 arguments")
+	}
+	a, b := args[0], args[1]
+	if a.typ != b.typ {
+		return vbool(false), nil
+	}
+	switch a.typ {
+	case VNum:
+		return vbool(a.num == b.num), nil
+	case VRat:
+		return vbool(a.str == b.str), nil
+	case VComplex:
+		return vbool(a.str == b.str), nil
+	case VStr:
+		return vbool(a.str == b.str), nil
+	case VChar:
+		return vbool(a.ch == b.ch), nil
+	case VPackage:
+		return vbool(a.pkg == b.pkg), nil
+	case VReadtable:
+		return vbool(a.readtable == b.readtable), nil
+	default:
+		return vbool(a == b), nil
+	}
+}
+
+func builtinEqualP(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("equal?: need 2 arguments")
+	}
+	return vbool(eqVal(args[0], args[1])), nil
+}
+
+func builtinLength(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("length: need argument")
+	}
+	v := primaryValue(args[0])
+	if v.typ != VPair && v.typ != VNil && v.typ != VStr {
+		return nil, fmt.Errorf("length: %s is not a sequence", toString(v))
+	}
+	return vnum(float64(lengthSafe(v))), nil
+}
+
+func lengthSafe(v *Value) int64 {
+	if v.typ == VStr {
+		return int64(utf8.RuneCountInString(v.str))
+	}
+	n := int64(0)
+	visited := make(map[*Value]bool)
+	for !isNil(v) && v.typ == VPair {
+		if visited[v] {
+			break // circular list
+		}
+		visited[v] = true
+		n++
+		v = v.cdr
+	}
+	return n
+}
+
+func builtinDisplay(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("display: need 1 argument")
+	}
+	fmt.Print(toString(args[0]))
+	return args[0], nil
+}
+
+func builtinNewline(args []*Value) (*Value, error) {
+	fmt.Println()
+	return vnil(), nil
+}
+
+func builtinWriteToString(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("write-to-string: need argument")
+	}
+	return vstr(writeToString(primaryValue(args[0]))), nil
+}
+
+func builtinRead(args []*Value) (*Value, error) {
+	if len(args) > 0 {
+		// stream argument - return nil for now
+		return vnil(), nil
+	}
+	r := bufio.NewReader(os.Stdin)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return vnil(), nil
+	}
+	return parseExpr(strings.TrimSpace(line))
+}
+
+func builtinStr(args []*Value) (*Value, error) {
+	var b strings.Builder
+	for _, a := range args {
+		if a.typ == VStr {
+			b.WriteString(a.str)
+		} else {
+			b.WriteString(toString(a))
+		}
+	}
+	return vstr(b.String()), nil
+}
+
+func builtinStrAppend(args []*Value) (*Value, error) {
+	var b strings.Builder
+	for _, a := range args {
+		if a.typ != VStr {
+			return nil, fmt.Errorf("string-append: expected string")
+		}
+		b.WriteString(a.str)
+	}
+	return vstr(b.String()), nil
+}
+
+func builtinStrLen(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("string-length: need string")
+	}
+	if args[0].typ != VStr {
+		return nil, fmt.Errorf("string-length: expected string")
+	}
+	return vnum(float64(len(args[0].str))), nil
+}
+
+func builtinStrFind(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-find: need char/string and string")
+	}
+	if args[1].typ != VStr {
+		return nil, fmt.Errorf("string-find: second arg must be a string")
+	}
+	var searchStr string
+	if args[0].typ == VChar {
+		searchStr = string(args[0].ch)
+	} else if args[0].typ == VStr {
+		searchStr = args[0].str
+	} else {
+		return nil, fmt.Errorf("string-find: first arg must be string or character")
+	}
+	idx := strings.Index(args[1].str, searchStr)
+	if idx < 0 {
+		return vnil(), nil
+	}
+	return vnum(float64(idx)), nil
+}
+
+func builtinSubstring(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("substring: need string and start index")
+	}
+	if args[0].typ != VStr {
+		return nil, fmt.Errorf("substring: expected string")
+	}
+	s := args[0].str
+	runes := []rune(s)
+	start, err := safeToNum(args[1], "substring")
+	if err != nil {
+		return nil, err
+	}
+	startInt := int(start)
+	var endInt int
+	if len(args) >= 3 {
+		en, err := safeToNum(args[2], "substring")
+		if err != nil {
+			return nil, err
+		}
+		endInt = int(en)
+	} else {
+		endInt = len(runes)
+	}
+	// Bounds checking
+	if startInt < 0 {
+		return nil, fmt.Errorf("substring: start index %d out of range [0..%d]", startInt, len(runes))
+	}
+	if endInt < 0 {
+		return nil, fmt.Errorf("substring: end index %d out of range [0..%d]", endInt, len(runes))
+	}
+	if endInt > len(runes) {
+		return nil, fmt.Errorf("substring: end index %d out of range [0..%d]", endInt, len(runes))
+	}
+	if startInt > endInt {
+		return nil, fmt.Errorf("substring: start index %d greater than end index %d", startInt, endInt)
+	}
+	return vstr(string(runes[startInt:endInt])), nil
+}
+
+func builtinNumStr(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("number->string: need a number")
+	}
+	s := strconv.FormatFloat(toNum(args[0]), 'g', -1, 64)
+	return vstr(s), nil
+}
+
+func builtinStrUpcase(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VStr {
+		return nil, fmt.Errorf("string-upcase: expected string")
+	}
+	s := args[0].str
+	runes := []rune(s)
+	start, end := 0, len(runes)
+	for i := 1; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":start":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "string-upcase :start")
+					if err != nil {
+						return nil, err
+					}
+					start = int(n)
+				}
+			case ":end":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "string-upcase :end")
+					if err != nil {
+						return nil, err
+					}
+					end = int(n)
+				}
+			}
+		}
+	}
+	if end > len(runes) {
+		end = len(runes)
+	}
+	for i := start; i < end; i++ {
+		runes[i] = unicode.ToUpper(runes[i])
+	}
+	return vstr(string(runes)), nil
+}
+
+func builtinStrDowncase(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VStr {
+		return nil, fmt.Errorf("string-downcase: expected string")
+	}
+	s := args[0].str
+	runes := []rune(s)
+	start, end := 0, len(runes)
+	for i := 1; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":start":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "string-downcase :start")
+					if err != nil {
+						return nil, err
+					}
+					start = int(n)
+				}
+			case ":end":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "string-downcase :end")
+					if err != nil {
+						return nil, err
+					}
+					end = int(n)
+				}
+			}
+		}
+	}
+	if end > len(runes) {
+		end = len(runes)
+	}
+	for i := start; i < end; i++ {
+		runes[i] = unicode.ToLower(runes[i])
+	}
+	return vstr(string(runes)), nil
+}
+
+func builtinStrNum(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("string->number: need a string argument")
+	}
+	if args[0].typ != VStr {
+		return nil, fmt.Errorf("string->number: expected a string")
+	}
+	f, err := strconv.ParseFloat(args[0].str, 64)
+	if err != nil {
+		return vnil(), nil
+	}
+	return vnum(f), nil
+}
+
+func builtinSymStr(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("symbol->string: need a symbol")
+	}
+	if args[0].typ != VSym {
+		return nil, fmt.Errorf("symbol->string: expected symbol")
+	}
+	return vstr(args[0].str), nil
+}
+
+func builtinStrSym(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("string->symbol: need a string")
+	}
+	if args[0].typ != VStr {
+		return nil, fmt.Errorf("string->symbol: expected string")
+	}
+	return vsym(args[0].str), nil
+}
+
+func builtinErr(args []*Value) (*Value, error) {
+	var msg string
+	for _, a := range args {
+		msg += toString(a)
+	}
+	return nil, fmt.Errorf(msg)
+}
+
+func builtinExit(args []*Value) (*Value, error) {
+	code := 0
+	if len(args) > 0 {
+		code = int(toNum(args[0]))
+	}
+	os.Exit(code)
+	return vnil(), nil
+}
+
+var gensymCounter int64 = 0
+
+func builtinGensym(args []*Value) (*Value, error) {
+	gensymCounter++
+	prefix := "G"
+	if len(args) > 0 {
+		prefix = args[0].str
+	}
+	return vsym(fmt.Sprintf("%s_%d", prefix, gensymCounter)), nil
+}
+
+func builtinLoopCheck(args []*Value) (*Value, error) {
+	loopIterationCount++
+	if loopIterationCount > maxLoopIterations {
+		loopIterationCount = 0
+		return nil, fmt.Errorf("loop iteration limit exceeded (%d)", maxLoopIterations)
+	}
+	return vnil(), nil
+}
+
+// -------- Symbol introspection --------
+func builtinSymbolValue(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("symbol-value: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("symbol-value: not a symbol")
+	}
+	val, err := globalEnv.Get(sym.str)
+	if err != nil {
+		return vnil(), nil
+	}
+	return val, nil
+}
+
+func builtinSymbolFunction(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("symbol-function: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("symbol-function: not a symbol")
+	}
+	val, err := globalEnv.Get(sym.str)
+	if err != nil {
+		return nil, fmt.Errorf("symbol-function: %s has no function", sym.str)
+	}
+	if val.typ == VPrim || val.typ == VFunc || val.typ == VGeneric || val.typ == VMacro {
+		return val, nil
+	}
+	return nil, fmt.Errorf("symbol-function: %s is not a function", sym.str)
+}
+
+func builtinSymbolPlist(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("symbol-plist: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("symbol-plist: not a symbol")
+	}
+	if sym.plist == nil {
+		return vnil(), nil
+	}
+	return sym.plist, nil
+}
+
+func builtinSymbolPlistSetf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("symbol-plist-setf: need value and symbol")
+	}
+	newVal := args[0]
+	sym := args[1]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("symbol-plist-setf: need a symbol")
+	}
+	sym.plist = newVal
+	return newVal, nil
+}
+
+func builtinBoundp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("boundp: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("boundp: not a symbol")
+	}
+	_, err := globalEnv.Get(sym.str)
+	return vbool(err == nil), nil
+}
+
+func builtinFboundp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("fboundp: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("fboundp: not a symbol")
+	}
+	val, err := globalEnv.Get(sym.str)
+	if err != nil {
+		return vbool(false), nil
+	}
+	return vbool(val.typ == VPrim || val.typ == VFunc || val.typ == VGeneric || val.typ == VMacro), nil
+}
+
+func builtinMakunbound(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("makunbound: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("makunbound: not a symbol")
+	}
+	delete(globalEnv.bindings, sym.str)
+	return sym, nil
+}
+
+func builtinFmakunbound(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("fmakunbound: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("fmakunbound: not a symbol")
+	}
+	delete(globalEnv.bindings, sym.str)
+	return sym, nil
+}
+
+func builtinTypeOf(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("type-of: need 1 argument")
+	}
+	return vsym(typeStr(args[0])), nil
+}
+
+func builtinDescribe(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("describe: need 1 argument")
+	}
+	obj := args[0]
+	var sb strings.Builder
+	sb.WriteString(toString(obj))
+	sb.WriteString(" is of type ")
+	sb.WriteString(typeStr(obj))
+	sb.WriteString("\n")
+	switch obj.typ {
+	case VNil:
+		sb.WriteString("It is the canonical false value (nil).\n")
+	case VBool:
+		if obj == globalEnv.bindings["#t"] {
+			sb.WriteString("It is the canonical true value (t).\n")
+		} else {
+			sb.WriteString("It is the canonical false value (nil).\n")
+		}
+	case VNum, VRat, VComplex:
+		sb.WriteString("Value: ")
+		sb.WriteString(toString(obj))
+		sb.WriteString("\nType: ")
+		sb.WriteString(typeStr(obj))
+		sb.WriteString("\n")
+	case VStr:
+		sb.WriteString("Value: ")
+		sb.WriteString(toString(obj))
+		sb.WriteString("\nLength: ")
+		sb.WriteString(strconv.Itoa(len(obj.str)))
+		sb.WriteString("\n")
+	case VChar:
+		sb.WriteString("Character: ")
+		sb.WriteString(toString(obj))
+		sb.WriteString("\nCode: ")
+		sb.WriteString(strconv.Itoa(int(obj.ch)))
+		sb.WriteString("\n")
+	case VSym:
+		sb.WriteString("Name: ")
+		sb.WriteString(obj.str)
+		sb.WriteString("\n")
+		if obj.fn != nil {
+			sb.WriteString("It has a function binding.\n")
+		}
+		val, err := globalEnv.Get(obj.str)
+		if err == nil {
+			sb.WriteString("Value: ")
+			sb.WriteString(toString(val))
+			sb.WriteString("\n")
+		}
+		if val != nil && val.typ == VMacro {
+			sb.WriteString("It is a macro.\n")
+		}
+	case VPair:
+		length := 0
+		cur := obj
+		for cur != nil && cur.typ == VPair {
+			length++
+			cur = cur.cdr
+		}
+		sb.WriteString("It is a cons of length ")
+		sb.WriteString(strconv.Itoa(length))
+		sb.WriteString(".\nCar: ")
+		sb.WriteString(toString(obj.car))
+		sb.WriteString("\nCdr: ")
+		sb.WriteString(toString(obj.cdr))
+		sb.WriteString("\n")
+	case VArray:
+		if len(obj.array.dims) == 1 && obj.array.fillPtr < 0 {
+			sb.WriteString("It is a vector.\n")
+		} else {
+			sb.WriteString("It is an array.\n")
+		}
+		sb.WriteString("Dimensions: ")
+		for i, d := range obj.array.dims {
+			if i > 0 {
+				sb.WriteString(" x ")
+			}
+			sb.WriteString(strconv.Itoa(d))
+		}
+		sb.WriteString("\n")
+	case VInstance:
+		if obj.instClass != nil {
+			sb.WriteString("It is an instance of class ")
+			sb.WriteString(obj.instClass.str)
+			sb.WriteString(".\nSlots:\n")
+			for name, val := range obj.instSlots {
+				sb.WriteString("  ")
+				sb.WriteString(name)
+				sb.WriteString(" = ")
+				sb.WriteString(toString(val))
+				sb.WriteString("\n")
+			}
+		}
+	case VClass:
+		if obj.str != "" {
+			sb.WriteString("It is a class named ")
+			sb.WriteString(obj.str)
+			sb.WriteString(".\n")
+		}
+		if obj.classParents != nil {
+			parents := make([]string, len(obj.classParents))
+			for i, p := range obj.classParents {
+				if p != nil && p.str != "" {
+					parents[i] = p.str
+				} else {
+					parents[i] = "(unknown)"
+				}
+			}
+			sb.WriteString("Superclasses: ")
+			for i, p := range parents {
+				if i > 0 {
+					sb.WriteString(" ")
+				}
+				sb.WriteString(p)
+			}
+			sb.WriteString("\n")
+		}
+	case VFunc:
+		sb.WriteString("It is a function.\n")
+		if obj.name != "" {
+			sb.WriteString("Name: ")
+			sb.WriteString(obj.name)
+			sb.WriteString("\n")
+		}
+		sb.WriteString("Arity: ")
+		sb.WriteString(strconv.Itoa(len(obj.params)))
+		sb.WriteString("\n")
+	case VPrim:
+		sb.WriteString("It is a built-in function.\n")
+	case VMacro:
+		sb.WriteString("It is a macro.\n")
+	case VStream:
+		sb.WriteString("It is a stream.\n")
+		if obj.stream.isInput {
+			sb.WriteString("Direction: input\n")
+		}
+		if obj.stream.isOutput {
+			sb.WriteString("Direction: output\n")
+		}
+	case VVHash:
+		sb.WriteString("It is a hash-table.\n")
+		sb.WriteString("Size: ")
+		sb.WriteString(strconv.Itoa(obj.hashTab.count))
+		sb.WriteString("\n")
+	}
+	return vstr(sb.String()), nil
+}
+
+// docstrings stores documentation strings: map[symbolName_docType] -> docstring
+var docstrings = make(map[string]string)
+
+func builtinDocumentation(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("documentation: need symbol and doc-type")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return vnil(), nil
+	}
+	docType := ""
+	if args[1].typ == VSym {
+		docType = args[1].str
+	}
+	key := sym.str + "_" + docType
+	if doc, ok := docstrings[key]; ok {
+		return vstr(doc), nil
+	}
+	return vnil(), nil
+}
+
+func builtinApropos(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("apropos: need a string")
+	}
+	searchStr := ""
+	if args[0].typ == VStr {
+		searchStr = args[0].str
+	} else if args[0].typ == VSym {
+		searchStr = args[0].str
+	} else {
+		searchStr = toString(args[0])
+	}
+	var results []*Value
+	for name := range globalEnv.bindings {
+		if strings.Contains(strings.ToLower(name), strings.ToLower(searchStr)) {
+			results = append(results, vsym(name))
+		}
+	}
+	// Sort results
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].str < results[j].str
+	})
+	return listFromSlice(results), nil
+}
+
+func builtinAproposList(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("apropos-list: need a string")
+	}
+	searchStr := ""
+	if args[0].typ == VStr {
+		searchStr = args[0].str
+	} else if args[0].typ == VSym {
+		searchStr = args[0].str
+	} else {
+		searchStr = toString(args[0])
+	}
+	var results []*Value
+	for name := range globalEnv.bindings {
+		if strings.Contains(strings.ToLower(name), strings.ToLower(searchStr)) {
+			results = append(results, vsym(name))
+		}
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].str < results[j].str
+	})
+	return listFromSlice(results), nil
+}
+
+func builtinCompile(args []*Value) (*Value, error) {
+	// (compile name &optional definition)
+	// In SBCL, compile returns (values compiled-fn warnings-p failure-p)
+	// For MicroLisp, we return the function as-is (it's already interpreted)
+	var name *Value
+	var def *Value
+	if len(args) >= 1 {
+		name = args[0]
+	}
+	if len(args) >= 2 {
+		def = args[1]
+	}
+	if name != nil && name.typ == VNil {
+		name = nil
+	}
+	if name != nil && name.typ == VSym && def != nil {
+		// Compile a lambda definition
+		if def.typ == VPair && def.car != nil && def.car.typ == VSym && def.car.str == "lambda" {
+			// It's a lambda, eval it and return
+			result, err := eval(def, globalEnv)
+			if err != nil {
+				return vnil(), nil
+			}
+			// Set the function binding
+			if name.typ == VSym {
+				globalEnv.Set(name.str, result)
+			}
+			// Return (values result nil nil)
+			return list(result, vnil(), vnil()), nil
+		}
+	}
+	if name != nil && name.typ == VSym {
+		// Look up existing function
+		val, err := globalEnv.Get(name.str)
+		if err == nil {
+			// Return (values val nil nil)
+			return list(val, vnil(), vnil()), nil
+		}
+	}
+	if def != nil && def.typ == VPair && def.car != nil && def.car.typ == VSym && def.car.str == "lambda" {
+		result, err := eval(def, globalEnv)
+		if err != nil {
+			return vnil(), nil
+		}
+		return list(result, vnil(), vnil()), nil
+	}
+	return vnil(), nil
+}
+
+func builtinDisassemble(args []*Value) (*Value, error) {
+	// (disassemble fn) -- returns a string describing the function
+	if len(args) < 1 {
+		return nil, fmt.Errorf("disassemble: need a function")
+	}
+	fn := primaryValue(args[0])
+	var sb strings.Builder
+	switch fn.typ {
+	case VNil:
+		sb.WriteString("#<NULL>\n")
+	case VPrim:
+		sb.WriteString("; This is a built-in function.\n")
+		sb.WriteString("; Disassembly not available for primitives.\n")
+	case VFunc:
+		sb.WriteString("; Lambda Expression:\n")
+		if fn.name != "" {
+			sb.WriteString("; Name: ")
+			sb.WriteString(fn.name)
+			sb.WriteString("\n")
+		}
+		sb.WriteString("; Parameters: (")
+		for i, p := range fn.params {
+			if i > 0 {
+				sb.WriteString(" ")
+			}
+			sb.WriteString(p)
+		}
+		if fn.rest != "" {
+			if len(fn.params) > 0 {
+				sb.WriteString(" &rest ")
+			} else {
+				sb.WriteString("&rest ")
+			}
+			sb.WriteString(fn.rest)
+		}
+		sb.WriteString(")\n")
+		sb.WriteString("; Environment: (closure)\n")
+		sb.WriteString("; Compiled: No (interpreted)\n")
+	case VMacro:
+		sb.WriteString("; This is a macro.\n")
+		sb.WriteString("; Name: ")
+		sb.WriteString(fn.name)
+		sb.WriteString("\n")
+	case VInstance:
+		if fn.instClass != nil {
+			sb.WriteString("; Instance of class: ")
+			sb.WriteString(fn.instClass.str)
+			sb.WriteString("\n")
+		}
+	default:
+		sb.WriteString("; Not a function.\n")
+	}
+	fmt.Print(sb.String())
+	return vnil(), nil
+}
+
+func builtinReplace(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("replace: need at least two sequences")
+	}
+	target := args[0]
+	source := args[1]
+	start1 := 0
+	end1 := -1
+	start2 := 0
+	end2 := -1
+	for i := 2; i+1 < len(args); i += 2 {
+		key := primaryValue(args[i])
+		if key.typ == VSym {
+			switch key.str {
+			case ":start1":
+				start1 = int(primaryValue(args[i+1]).num)
+			case ":end1":
+				end1 = int(primaryValue(args[i+1]).num)
+			case ":start2":
+				start2 = int(primaryValue(args[i+1]).num)
+			case ":end2":
+				end2 = int(primaryValue(args[i+1]).num)
+			}
+		}
+	}
+	switch target.typ {
+	case VStr:
+		ts := []rune(target.str)
+		tLen := len(ts)
+		if end1 < 0 || end1 > tLen {
+			end1 = tLen
+		}
+		if start1 < 0 {
+			start1 = 0
+		}
+		ss := []rune(source.str)
+		sLen := len(ss)
+		if end2 < 0 || end2 > sLen {
+			end2 = sLen
+		}
+		if start2 < 0 {
+			start2 = 0
+		}
+		j := start2
+		for i := start1; i < end1 && j < end2; i++ {
+			ts[i] = ss[j]
+			j++
+		}
+		target.str = string(ts)
+		return target, nil
+	case VArray:
+		te := target.array.elements
+		tLen := len(te)
+		if end1 < 0 || end1 > tLen {
+			end1 = tLen
+		}
+		if start1 < 0 {
+			start1 = 0
+		}
+		se := seqToList(source)
+		sLen := len(se)
+		if end2 < 0 || end2 > sLen {
+			end2 = sLen
+		}
+		if start2 < 0 {
+			start2 = 0
+		}
+		j := start2
+		for i := start1; i < end1 && j < end2; i++ {
+			te[i] = se[j]
+			j++
+		}
+		return target, nil
+	case VPair:
+		// For lists, rebuild with replaced portion
+		if end1 < 0 {
+			end1 = 999999
+		}
+		result := vnil()
+		var tail **Value = &result
+		idx := 0
+		srcList := seqToList(source)
+		sLen := len(srcList)
+		if end2 < 0 || end2 > sLen {
+			end2 = sLen
+		}
+		if start2 < 0 {
+			start2 = 0
+		}
+		for i := 0; i < start2; i++ {
+			// Copy source elements before replacement
+		}
+		cur := target
+		idx = 0
+		for !isNil(cur) && idx < start1 {
+			*tail = cons(cur.car, vnil())
+			tail = &((*tail).cdr)
+			cur = cur.cdr
+			idx++
+		}
+		// Skip target elements in range
+		for !isNil(cur) && idx < end1 {
+			cur = cur.cdr
+			idx++
+		}
+		// Insert source elements
+		for j := start2; j < end2 && j < sLen; j++ {
+			*tail = cons(srcList[j], vnil())
+			tail = &((*tail).cdr)
+		}
+		// Append remaining target
+		for !isNil(cur) {
+			*tail = cons(cur.car, vnil())
+			tail = &((*tail).cdr)
+			cur = cur.cdr
+		}
+		*tail = vnil()
+		return result, nil
+	default:
+		return nil, fmt.Errorf("replace: not a sequence")
+	}
+}
+
+func builtinParseInteger(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("parse-integer: need a string")
+	}
+	strVal := primaryValue(args[0])
+	var str string
+	if strVal.typ == VStr {
+		str = strVal.str
+	} else {
+		str = toString(strVal)
+	}
+	start := 0
+	end := -1
+	radix := 10
+	junkAllowed := false
+	for i := 1; i+1 < len(args); i += 2 {
+		key := primaryValue(args[i])
+		if key.typ == VSym {
+			switch key.str {
+			case ":start":
+				start = int(primaryValue(args[i+1]).num)
+			case ":end":
+				end = int(primaryValue(args[i+1]).num)
+			case ":radix":
+				radix = int(primaryValue(args[i+1]).num)
+			case ":junk-allowed":
+				junkAllowed = !isNil(args[i+1])
+			}
+		}
+	}
+	if end < 0 {
+		end = len(str)
+	}
+	s := strings.TrimSpace(str[start:end])
+	s = strings.ReplaceAll(s, "_", "")
+	if s == "" || s == "-" || s == "+" {
+		if junkAllowed {
+			return vnil(), nil
+		}
+		return nil, fmt.Errorf("parse-integer: no integer at position %d", start)
+	}
+	// Position: count from start, skip whitespace then count sign+digits
+	pos := start
+	for pos < len(str) && (str[pos] == ' ' || str[pos] == '\t' || str[pos] == '\n' || str[pos] == '\r') {
+		pos++
+	}
+	// s contains sign+digits (or just digits); len(s) counts all
+	pos += len(s)
+
+	n, err := strconv.ParseInt(s, radix, 64)
+	if err != nil {
+		// Try to parse as much as possible for junk-allowed
+		if junkAllowed {
+			// Find longest valid prefix of s
+			for l := len(s); l > 0; l-- {
+				partial, e2 := strconv.ParseInt(s[:l], radix, 64)
+				if e2 == nil {
+					p := start
+					for p < len(str) && (str[p] == ' ' || str[p] == '\t' || str[p] == '\n' || str[p] == '\r') {
+						p++
+					}
+					p += l
+					return multiVal(vnum(float64(partial)), vnum(float64(p))), nil
+				}
+			}
+			return vnil(), nil
+		}
+		return nil, fmt.Errorf("parse-integer: not an integer")
+	}
+	return multiVal(vnum(float64(n)), vnum(float64(pos))), nil
+}
+
+func builtinDigitCharP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	radix := 10
+	if len(args) > 1 {
+		radix = int(toNum(args[1]))
+	}
+	c := primaryValue(args[0])
+	if c.typ != VChar {
+		return vnil(), nil
+	}
+	d := unicode.ToLower(c.ch)
+	baseDigit := '0'
+	radixChar := rune('a' + radix - 10)
+	if d >= baseDigit && d < baseDigit+rune(radix) {
+		return vnum(float64(int(d - baseDigit))), nil
+	}
+	if d >= 'a' && d < radixChar {
+		return vnum(float64(int(d - 'a' + 10))), nil
+	}
+	return vnil(), nil
+}
+
+func builtinAlphanumericP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	c := primaryValue(args[0])
+	if c.typ == VChar {
+		return vbool(unicode.IsLetter(c.ch) || unicode.IsDigit(c.ch)), nil
+	}
+	return vbool(false), nil
+}
+
+func builtinCharUpcase(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("char-upcase: need a character")
+	}
+	c := primaryValue(args[0])
+	if c.typ != VChar {
+		return nil, fmt.Errorf("char-upcase: not a character")
+	}
+	return vchar(unicode.ToUpper(c.ch)), nil
+}
+
+func builtinCharDowncase(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("char-downcase: need a character")
+	}
+	c := primaryValue(args[0])
+	if c.typ != VChar {
+		return nil, fmt.Errorf("char-downcase: not a character")
+	}
+	return vchar(unicode.ToLower(c.ch)), nil
+}
+
+func builtinReadSequence(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("read-sequence: need sequence and stream")
+	}
+	seq := args[0]
+	stream := args[1]
+	if stream.typ != VStream {
+		return nil, fmt.Errorf("read-sequence: second argument must be a stream")
+	}
+	start := 0
+	end := -1
+	for i := 2; i+1 < len(args); i += 2 {
+		key := primaryValue(args[i])
+		if key.typ == VSym {
+			switch key.str {
+			case ":start":
+				start = int(primaryValue(args[i+1]).num)
+			case ":end":
+				end = int(primaryValue(args[i+1]).num)
+			}
+		}
+	}
+	switch seq.typ {
+	case VStr:
+		s := seq.str
+		runes := []rune(s)
+		total := len(runes)
+		if end < 0 || end > total {
+			end = total
+		}
+		if start < 0 {
+			start = 0
+		}
+		count := 0
+		for i := start; i < end; i++ {
+			r, err := stream.stream.readChar()
+			if err != nil {
+				break
+			}
+			runes[i] = r
+			count++
+		}
+		seq.str = string(runes)
+		return vnum(float64(start + count)), nil
+	case VArray:
+		arr := seq.array
+		total := len(arr.elements)
+		if end < 0 || end > total {
+			end = total
+		}
+		if start < 0 {
+			start = 0
+		}
+		count := 0
+		for i := start; i < end; i++ {
+			r, err := stream.stream.readChar()
+			if err != nil {
+				break
+			}
+			arr.elements[i] = vstr(string(r))
+			count++
+		}
+		return vnum(float64(start + count)), nil
+	case VPair:
+		lst := seq
+		seen := make(map[*Value]bool)
+		idx := 0
+		count := 0
+		for !isNil(lst) {
+			if seen[lst] {
+				break
+			}
+			seen[lst] = true
+			if idx >= start && (end < 0 || idx < end) {
+				r, err := stream.stream.readChar()
+				if err != nil {
+					break
+				}
+				lst.car = vstr(string(r))
+				count++
+			}
+			lst = lst.cdr
+			idx++
+		}
+		return vnum(float64(start + count)), nil
+	default:
+		return nil, fmt.Errorf("read-sequence: not a sequence")
+	}
+}
+
+func builtinWriteSequence(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("write-sequence: need a sequence")
+	}
+	seq := args[0]
+	stream := stdoutStream
+	if len(args) > 1 {
+		stream = args[1]
+		if stream.typ != VStream {
+			return nil, fmt.Errorf("write-sequence: not a stream")
+		}
+	}
+	start := 0
+	end := -1
+	for i := 2; i+1 < len(args); i += 2 {
+		key := primaryValue(args[i])
+		if key.typ == VSym {
+			switch key.str {
+			case ":start":
+				start = int(primaryValue(args[i+1]).num)
+			case ":end":
+				end = int(primaryValue(args[i+1]).num)
+			}
+		}
+	}
+	switch seq.typ {
+	case VStr:
+		s := seq.str
+		if end < 0 || end > len(s) {
+			end = len(s)
+		}
+		if start < 0 {
+			start = 0
+		}
+		if err := stream.stream.writeString(s[start:end]); err != nil {
+			return nil, err
+		}
+		stream.stream.flush()
+		return seq, nil
+	case VArray:
+		arr := seq.array
+		total := len(arr.elements)
+		if end < 0 || end > total {
+			end = total
+		}
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < end; i++ {
+			if err := stream.stream.writeString(toString(primaryValue(arr.elements[i]))); err != nil {
+				return nil, err
+			}
+		}
+		stream.stream.flush()
+		return seq, nil
+	case VPair:
+		lst := seq
+		seen := make(map[*Value]bool)
+		idx := 0
+		for !isNil(lst) {
+			if seen[lst] {
+				break
+			}
+			seen[lst] = true
+			if idx >= start && (end < 0 || idx < end) {
+				if err := stream.stream.writeString(toString(primaryValue(lst.car))); err != nil {
+					return nil, err
+				}
+			}
+			lst = lst.cdr
+			idx++
+		}
+		stream.stream.flush()
+		return seq, nil
+	default:
+		return nil, fmt.Errorf("write-sequence: not a sequence")
+	}
+}
+
+func builtinSubtypep(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return list(vbool(false), vbool(false)), nil
+	}
+	t1 := primaryValue(args[0]).str
+	t2 := primaryValue(args[1]).str
+	types := map[string][]string{"integer": {"rational", "real", "number", "atom", "t"}, "float": {"real", "number", "atom", "t"}, "rational": {"real", "number", "atom", "t"}, "complex": {"number", "atom", "t"}, "real": {"number", "atom", "t"}, "ratio": {"rational", "real", "number", "atom", "t"}, "fixnum": {"integer", "rational", "real", "number", "atom", "t"}, "bignum": {"integer", "rational", "real", "number", "atom", "t"}, "bit": {"integer", "rational", "real", "number", "atom", "t"}, "short-float": {"float", "real", "number", "atom", "t"}, "single-float": {"float", "real", "number", "atom", "t"}, "double-float": {"float", "real", "number", "atom", "t"}, "long-float": {"float", "real", "number", "atom", "t"}, "string": {"array", "vector", "sequence", "atom", "t"}, "simple-string": {"string", "array", "vector", "sequence", "atom", "t"}, "character": {"atom", "t"}, "base-char": {"standard-char", "character", "atom", "t"}, "standard-char": {"character", "atom", "t"}, "extended-char": {"character", "atom", "t"}, "symbol": {"atom", "t"}, "keyword": {"symbol", "atom", "t"}, "null": {"symbol", "list", "sequence", "atom", "t"}, "cons": {"list", "sequence", "t"}, "pair": {"cons", "list", "sequence", "t"}, "list": {"sequence", "t"}, "sequence": {"t"}, "vector": {"array", "sequence", "t"}, "simple-vector": {"vector", "array", "sequence", "t"}, "array": {"t"}, "function": {"t"}, "compiled-function": {"function", "t"}, "hash-table": {"t"}, "stream": {"t"}, "package": {"t"}, "pathname": {"t"}, "random-state": {"t"}, "readtable": {"t"}, "instance": {"t"}, "structure": {"instance", "t"}, "boolean": {"atom", "t"}}
+	if t1 == t2 {
+		return list(vbool(true), vbool(true)), nil
+	}
+	if subtypes, ok := types[t1]; ok {
+		for _, s := range subtypes {
+			if s == t2 {
+				return list(vbool(true), vbool(true)), nil
+			}
+		}
+	}
+	// Check CLOS class hierarchy
+	cls1 := findClass(t1)
+	cls2 := findClass(t2)
+	if cls1 != nil && cls2 != nil {
+		if classHasAncestor(cls1, t2) {
+			return list(vbool(true), vbool(true)), nil
+		}
+	}
+	return list(vbool(false), vbool(false)), nil
+}
+
+var traceTable = make(map[string]bool)
+var traceDepth = 0
+
+func builtinTrace(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("trace: need function name")
+	}
+	var result []*Value
+	for _, arg := range args {
+		v := primaryValue(arg)
+		name := ""
+		switch v.typ {
+		case VFunc, VPrim:
+			name = v.name
+		case VSym:
+			name = v.str
+		}
+		if name != "" {
+			traceTable[name] = true
+			result = append(result, vsym(name))
+		}
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinUntrace(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		names := make([]string, 0, len(traceTable))
+		for name := range traceTable {
+			names = append(names, name)
+		}
+		traceTable = make(map[string]bool)
+		result := make([]*Value, len(names))
+		for i, n := range names {
+			result[i] = vsym(n)
+		}
+		return listFromSlice(result), nil
+	}
+	var result []*Value
+	for _, arg := range args {
+		v := primaryValue(arg)
+		name := ""
+		switch v.typ {
+		case VFunc, VPrim:
+			name = v.name
+		case VSym:
+			name = v.str
+		}
+		if name != "" {
+			delete(traceTable, name)
+		}
+		result = append(result, vsym(name))
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinMakeCondVar(args []*Value) (*Value, error) {
+	cid := atomic.AddInt64(&nextCondID, 1)
+	condMu.Lock()
+	// Create a condition variable associated with no specific lock initially
+	// When wait is called with a lock, we associate the cond with that lock
+	condVars[cid] = sync.NewCond(&sync.Mutex{})
+	condMu.Unlock()
+	return &Value{typ: VCondition, num: float64(cid)}, nil
+}
+
+func builtinConditionWait(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("condition-wait: need condition and lock")
+	}
+	if args[0].typ != VCondition || args[1].typ != VLock {
+		return nil, fmt.Errorf("condition-wait: need condition and lock objects")
+	}
+	cid := int64(args[0].num)
+	lid := int64(args[1].num)
+	// Release the user lock, wait on condition, then reacquire
+	condMu.Lock()
+	cv, ok := condVars[cid]
+	condMu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("condition-wait: invalid condition")
+	}
+	// The condition variable uses its own internal mutex for signaling
+	cv.L.Lock()
+	// Signal that we're about to wait (release user lock)
+	lockMapMu.Lock()
+	userMu, ok2 := lockMutexMap[lid]
+	lockMapMu.Unlock()
+	if !ok2 {
+		return nil, fmt.Errorf("condition-wait: invalid lock")
+	}
+	userMu.Unlock() // Release the user lock
+	cv.Wait()       // Wait on condition
+	userMu.Lock()   // Reacquire the user lock
+	return vnil(), nil
+}
+
+func builtinConditionNotify(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VCondition {
+		return nil, fmt.Errorf("condition-notify: need a condition object")
+	}
+	cid := int64(args[0].num)
+	condMu.Lock()
+	cv, ok := condVars[cid]
+	condMu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("condition-notify: invalid condition")
+	}
+	cv.Signal()
+	return vnil(), nil
+}
+
+func builtinConditionBroadcast(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VCondition {
+		return nil, fmt.Errorf("condition-broadcast: need a condition object")
+	}
+	cid := int64(args[0].num)
+	condMu.Lock()
+	cv, ok := condVars[cid]
+	condMu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("condition-broadcast: invalid condition")
+	}
+	cv.Broadcast()
+	return vnil(), nil
+}
+
+// Thread/Lock/Condition predicates
+func builtinThreadP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(args[0].typ == VThread), nil
+}
+
+func builtinLockP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(args[0].typ == VLock), nil
+}
+
+func builtinCondVarP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(args[0].typ == VCondition), nil
+}
+
+// Atomic operations
+func builtinAtomicIncf(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("atomic-incf: need a reference")
+	}
+	delta := int64(1)
+	if len(args) >= 2 {
+		delta = int64(primaryValue(args[1]).num)
+	}
+	newVal := atomic.AddInt64(&atomicCounter, delta)
+	return vnum(float64(newVal)), nil
+}
+
+func builtinAtomicDecf(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("atomic-decf: need a reference")
+	}
+	delta := int64(1)
+	if len(args) >= 2 {
+		delta = int64(primaryValue(args[1]).num)
+	}
+	newVal := atomic.AddInt64(&atomicCounter, -delta)
+	return vnum(float64(newVal)), nil
+}
+
+func builtinAtomicGet(args []*Value) (*Value, error) {
+	return vnum(float64(atomic.LoadInt64(&atomicCounter))), nil
+}
+
+func builtinAtomicSet(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("atomic-set: need a value")
+	}
+	val := int64(primaryValue(args[0]).num)
+	atomic.StoreInt64(&atomicCounter, val)
+	return vnum(float64(val)), nil
+}
+
+func builtinEval(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("eval: need expression")
+	}
+	return eval(args[0], globalEnv)
+}
+
+func builtinEvalString(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("eval-string: need a string")
+	}
+	s := primaryValue(args[0])
+	if s.typ != VStr {
+		return nil, fmt.Errorf("eval-string: need a string, got %s", toString(s))
+	}
+	return evalString(s.str, globalEnv)
+}
+
+func builtinHandlerEval(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("handler-eval: need expression")
+	}
+	result, err := eval(args[0], globalEnv)
+	if err != nil {
+		// Signal as a condition so handler-case can catch it
+		return builtinError([]*Value{vstr(err.Error())})
+	}
+	return result, nil
+}
+
+func builtinFuncall(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("funcall: need function")
+	}
+	fn := args[0]
+	callArgs := args[1:]
+	return callFnOnSeq(fn, callArgs, globalEnv)
+}
+
+// eql: like eq, but numbers and characters with same value are equal
+func builtinEql(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(false), nil
+	}
+	return vbool(eqVal(args[0], args[1])), nil
+}
+
+// eq: identity equality (pointer/symbol)
+func builtinEqIdentity(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(false), nil
+	}
+	return vbool(args[0] == args[1]), nil
+}
+
+// equal: structural equality (recursive)
+func builtinEqual(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(false), nil
+	}
+	return vbool(eqVal(args[0], args[1])), nil
+}
+
+// equalp: case-insensitive string/char comparison, numeric equality, recursive
+func builtinEqualp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(false), nil
+	}
+	return vbool(equalpVal(args[0], args[1])), nil
+}
+
+func equalpVal(a, b *Value) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	// Numbers: same mathematical value
+	if isNumeric(a) && isNumeric(b) {
+		return equalpNumeric(a, b)
+	}
+	// Characters: case-insensitive
+	if a.typ == VChar && b.typ == VChar {
+		ac, bc := unicode.ToLower(a.ch), unicode.ToLower(b.ch)
+		return ac == bc
+	}
+	// Strings: case-insensitive
+	if a.typ == VStr && b.typ == VStr {
+		return strings.EqualFold(a.str, b.str)
+	}
+	// Lists: recursively compare
+	if a.typ == VPair && b.typ == VPair {
+		return equalpVal(a.car, b.car) && equalpVal(a.cdr, b.cdr)
+	}
+	// Symbols: case-insensitive
+	if a.typ == VSym && b.typ == VSym {
+		return strings.EqualFold(a.str, b.str)
+	}
+	// Arrays: element-wise comparison
+	if a.typ == VArray && b.typ == VArray {
+		return equalpArray(a, b)
+	}
+	// Otherwise use eql
+	return eqVal(a, b)
+}
+
+func equalpNumeric(a, b *Value) bool {
+	switch a.typ {
+	case VNum:
+		switch b.typ {
+		case VNum:
+			return a.num == b.num
+		case VRat:
+			return float64(a.num) == float64(b.irat)/float64(b.iden)
+		}
+	case VRat:
+		switch b.typ {
+		case VNum:
+			return float64(a.irat)/float64(a.iden) == b.num
+		case VRat:
+			return a.irat == b.irat && a.iden == b.iden
+		}
+	case VComplex:
+		if b.typ == VComplex {
+			return a.num == b.num && a.imag == b.imag
+		}
+	}
+
+	return false
+}
+
+// -------- Array helpers --------
+
+func equalpArray(a, b *Value) bool {
+	if len(a.array.dims) != len(b.array.dims) {
+		return false
+	}
+	for i := range a.array.dims {
+		if a.array.dims[i] != b.array.dims[i] {
+			return false
+		}
+	}
+	if len(a.array.elements) != len(b.array.elements) {
+		return false
+	}
+	for i := range a.array.elements {
+		if !equalpVal(a.array.elements[i], b.array.elements[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func arrayToString(v *Value) string {
+	if v.array == nil {
+		return "#<array nil>"
+	}
+	arr := v.array
+	if len(arr.dims) == 1 && arr.dims[0] == len(arr.elements) {
+		// 1-D array (vector)
+		parts := []string{"#("}
+		for i, elem := range arr.elements {
+			if i > 0 {
+				parts = append(parts, " ")
+			}
+			if elem.typ == VStr {
+				parts = append(parts, "\""+elem.str+"\"")
+			} else {
+				parts = append(parts, toString(elem))
+			}
+		}
+		parts = append(parts, ")")
+		return strings.Join(parts, "")
+	}
+	// Multi-dimensional array
+	dimStr := make([]string, len(arr.dims))
+	for i, d := range arr.dims {
+		dimStr[i] = strconv.Itoa(d)
+	}
+	return "#<" + strings.Join(dimStr, "x") + "-array>"
+}
+
+// Row-major index for given subscripts
+func arrayRowMajorIndex(arr *LispArray, indices []int) (int, error) {
+	if len(indices) != len(arr.dims) {
+		return 0, fmt.Errorf("array access: expected %d subscripts, got %d", len(arr.dims), len(indices))
+	}
+	idx := 0
+	stride := 1
+	for i := len(arr.dims) - 1; i >= 0; i-- {
+		if indices[i] < 0 || indices[i] >= arr.dims[i] {
+			return 0, fmt.Errorf("array index %d out of bounds [0..%d] for dimension %d", indices[i], arr.dims[i]-1, i)
+		}
+		idx += indices[i] * stride
+		stride *= arr.dims[i]
+	}
+	return idx, nil
+}
+
+// Total size of array
+func arrayTotalSize(dims []int) int {
+	size := 1
+	for _, d := range dims {
+		size *= d
+	}
+	return size
+}
+
+// null:
+
+// -------- Array builtins --------
+
+// arrayFillRecursive flattens nested lists into the flat elements array in row-major order.
+func arrayFillRecursive(contents *Value, dims []int, elements []*Value, idx *int, visited map[*Value]bool) {
+	if len(dims) == 1 {
+		// Leaf level: fill elements directly
+		for !isNil(contents) {
+			if *idx >= len(elements) {
+				return
+			}
+			if contents.typ == VPair {
+				if visited[contents] {
+					return // cycle detected
+				}
+				visited[contents] = true
+			}
+			elements[*idx] = contents.car
+			*idx++
+			contents = contents.cdr
+		}
+	} else {
+		// Nested: recurse into sublists
+		for !isNil(contents) {
+			if contents.typ == VPair {
+				if visited[contents] {
+					return // cycle detected
+				}
+				visited[contents] = true
+			}
+			subDims := dims[1:]
+			arrayFillRecursive(contents.car, subDims, elements, idx, visited)
+			contents = contents.cdr
+		}
+	}
+}
+
+func builtinMakeArray(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("make-array: need dimensions")
+	}
+	dimArg := args[0]
+	var dims []int
+	if dimArg.typ == VNum {
+		dims = []int{int(dimArg.num)}
+	} else if dimArg.typ == VPair {
+		for !isNil(dimArg) {
+			if dimArg.car == nil || dimArg.car.typ != VNum {
+				return nil, fmt.Errorf("make-array: dimension must be integer")
+			}
+			dims = append(dims, int(dimArg.car.num))
+			dimArg = dimArg.cdr
+		}
+	} else {
+		return nil, fmt.Errorf("make-array: dimensions must be integer or list")
+	}
+	if len(dims) == 0 {
+		return nil, fmt.Errorf("make-array: need at least one dimension")
+	}
+	for i, d := range dims {
+		if d < 0 {
+			return nil, fmt.Errorf("make-array: dimension %d is negative: %d", i, d)
+		}
+	}
+	// Parse keyword arguments
+	initialElement := vnil()
+	var initialContents *Value = nil
+	fillPointer := -1
+	adjustable := false
+	for i := 1; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":initial-element":
+				if i+1 < len(args) {
+					i++
+					initialElement = args[i]
+				}
+			case ":initial-contents":
+				if i+1 < len(args) {
+					i++
+					initialContents = args[i]
+				}
+			case ":fill-pointer":
+				if i+1 < len(args) {
+					i++
+					if args[i] == globalEnv.bindings["#t"] {
+						fillPointer = 0
+					} else if args[i].typ == VNum {
+						fillPointer = int(args[i].num)
+					}
+				}
+			case ":adjustable":
+				if i+1 < len(args) {
+					i++
+					adjustable = isTruthy(args[i])
+				}
+			}
+		}
+	}
+	size := arrayTotalSize(dims)
+	elements := make([]*Value, size)
+	if initialContents != nil {
+		idx := 0
+		arrayFillRecursive(initialContents, dims, elements, &idx, make(map[*Value]bool))
+		if idx < size {
+			// Fill remaining with nil
+			for i := idx; i < size; i++ {
+				elements[i] = vnil()
+			}
+		}
+	} else {
+		for i := range elements {
+			elements[i] = initialElement
+		}
+	}
+	arr := &LispArray{
+		dims:       dims,
+		elements:   elements,
+		fillPtr:    fillPointer,
+		adjustable: adjustable,
+	}
+	v := gcv()
+	v.typ = VArray
+	v.array = arr
+	return v, nil
+}
+
+func builtinAref(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("aref: need array and subscripts")
+	}
+	arr := args[0]
+	if arr.typ != VArray || arr.array == nil {
+		return nil, fmt.Errorf("aref: first argument must be an array")
+	}
+	indices := make([]int, len(args)-1)
+	for i := 1; i < len(args); i++ {
+		if args[i].typ != VNum {
+			return nil, fmt.Errorf("aref: subscript must be integer")
+		}
+		indices[i-1] = int(args[i].num)
+	}
+	idx, err := arrayRowMajorIndex(arr.array, indices)
+	if err != nil {
+		return nil, err
+	}
+	return arr.array.elements[idx], nil
+}
+
+func builtinSetAref(args []*Value) (*Value, error) {
+	// (set-aref value array subscripts...)
+	if len(args) < 3 {
+		return nil, fmt.Errorf("set-aref: need value, array, and subscripts")
+	}
+	val := args[0]
+	arr := args[1]
+	if arr.typ != VArray || arr.array == nil {
+		return nil, fmt.Errorf("set-aref: second argument must be an array")
+	}
+	indices := make([]int, len(args)-2)
+	for i := 2; i < len(args); i++ {
+		if args[i].typ != VNum {
+			return nil, fmt.Errorf("set-aref: subscript must be integer")
+		}
+		indices[i-2] = int(args[i].num)
+	}
+	idx, err := arrayRowMajorIndex(arr.array, indices)
+	if err != nil {
+		return nil, err
+	}
+	arr.array.elements[idx] = val
+	return val, nil
+}
+
+// builtinNthSetf is used for (setf (nth n list) val) -> (nth-setf val n list)
+func builtinNthSetf(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("setf (nth): need value, n, and list")
+	}
+	val := args[0]
+	n := args[1]
+	lst := args[2]
+	if n.typ != VNum {
+		return nil, fmt.Errorf("setf (nth): index must be a number")
+	}
+	idx := int(n.num)
+	if idx < 0 {
+		return nil, fmt.Errorf("setf (nth): index must be non-negative")
+	}
+	// Walk down to the nth element
+	target := lst
+	for i := 0; i < idx; i++ {
+		if !isPair(target) {
+			return nil, fmt.Errorf("setf (nth): index %d out of range", idx)
+		}
+		target = target.cdr
+	}
+	if !isPair(target) {
+		return nil, fmt.Errorf("setf (nth): index %d out of range", idx)
+	}
+	target.car = val
+	return val, nil
+}
+
+// builtinSymbolValueSetf is used for (setf (symbol-value sym) val)
+func builtinSymbolValueSetf(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("setf (symbol-value): need value, symbol, and optional env")
+	}
+	val := args[0]
+	sym := args[1]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("setf (symbol-value): second argument must be a symbol")
+	}
+	if _, err := globalEnv.Get(sym.str); err != nil {
+		return nil, fmt.Errorf("setf (symbol-value): symbol %s is unbound", sym.str)
+	}
+	globalEnv.Set(sym.str, val)
+	return val, nil
+}
+
+// builtinEltSetf is used for (setf (elt seq n) val)
+func builtinEltSetf(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("setf (elt): need value, sequence, and index")
+	}
+	val := args[0]
+	seq := args[1]
+	idx := args[2]
+	if idx.typ != VNum {
+		return nil, fmt.Errorf("setf (elt): index must be a number")
+	}
+	i := int(idx.num)
+	// Handle list sequences
+	if isPair(seq) || isNil(seq) {
+		target := seq
+		for j := 0; j < i; j++ {
+			if !isPair(target) {
+				return nil, fmt.Errorf("setf (elt): index %d out of range", i)
+			}
+			target = target.cdr
+		}
+		if !isPair(target) {
+			return nil, fmt.Errorf("setf (elt): index %d out of range", i)
+		}
+		target.car = val
+		return val, nil
+	}
+	// Handle string sequences
+	if seq.typ == VStr {
+		if i < 0 || i >= len(seq.str) {
+			return nil, fmt.Errorf("setf (elt): index %d out of range", i)
+		}
+		// Can't mutate strings in Go (immutable), return value anyway
+		return val, nil
+	}
+	return nil, fmt.Errorf("setf (elt): not a sequence")
+}
+
+func builtinVector(args []*Value) (*Value, error) {
+	arr := &LispArray{
+		dims:     []int{len(args)},
+		elements: make([]*Value, len(args)),
+		fillPtr:  -1,
+	}
+	copy(arr.elements, args)
+	v := gcv()
+	v.typ = VArray
+	v.array = arr
+	return v, nil
+}
+
+func builtinArrayP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(args[0].typ == VArray), nil
+}
+
+func builtinVectorP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(args[0].typ == VArray && len(args[0].array.dims) == 1), nil
+}
+
+func builtinArrayDimensions(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VArray || args[0].array == nil {
+		return nil, fmt.Errorf("array-dimensions: need an array")
+	}
+	result := vnil()
+	for i := len(args[0].array.dims) - 1; i >= 0; i-- {
+		result = cons(vnum(float64(args[0].array.dims[i])), result)
+	}
+	return result, nil
+}
+
+func builtinArrayTotalSize(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VArray || args[0].array == nil {
+		return nil, fmt.Errorf("array-total-size: need an array")
+	}
+	return vnum(float64(len(args[0].array.elements))), nil
+}
+
+func builtinArrayRank(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VArray || args[0].array == nil {
+		return nil, fmt.Errorf("array-rank: need an array")
+	}
+	return vnum(float64(len(args[0].array.dims))), nil
+}
+
+func builtinFillPointer(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VArray || args[0].array == nil {
+		return nil, fmt.Errorf("fill-pointer: need a vector with fill-pointer")
+	}
+	arr := args[0].array
+	if arr.fillPtr < 0 {
+		return nil, fmt.Errorf("fill-pointer: array has no fill-pointer")
+	}
+	return vnum(float64(arr.fillPtr)), nil
+}
+
+func builtinSetFillPointer(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("set-fill-pointer: need array and value")
+	}
+	arr := args[0]
+	if arr.typ != VArray || arr.array == nil {
+		return nil, fmt.Errorf("set-fill-pointer: first argument must be an array")
+	}
+	if arr.array.fillPtr < 0 {
+		return nil, fmt.Errorf("set-fill-pointer: array has no fill-pointer")
+	}
+	newVal := int(args[1].num)
+	if newVal < 0 || newVal > len(arr.array.elements) {
+		return nil, fmt.Errorf("set-fill-pointer: value %d out of range [0..%d]", newVal, len(arr.array.elements))
+	}
+	arr.array.fillPtr = newVal
+	return args[1], nil
+}
+
+func builtinVectorPush(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("vector-push: need element and vector")
+	}
+	newEl := args[0]
+	vec := args[1]
+	if vec.typ != VArray || vec.array == nil {
+		return nil, fmt.Errorf("vector-push: second argument must be a vector")
+	}
+	arr := vec.array
+	if arr.fillPtr < 0 {
+		return nil, fmt.Errorf("vector-push: vector has no fill-pointer")
+	}
+	if arr.fillPtr >= len(arr.elements) {
+		return vnil(), nil // no room
+	}
+	arr.elements[arr.fillPtr] = newEl
+	fp := arr.fillPtr
+	arr.fillPtr++
+	return vnum(float64(fp)), nil
+}
+
+func builtinVectorPop(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VArray || args[0].array == nil {
+		return nil, fmt.Errorf("vector-pop: need a vector")
+	}
+	arr := args[0].array
+	if arr.fillPtr <= 0 {
+		return nil, fmt.Errorf("vector-pop: fill-pointer is 0")
+	}
+	arr.fillPtr--
+	return arr.elements[arr.fillPtr], nil
+}
+
+func builtinArrayElementType(args []*Value) (*Value, error) {
+	// Simplified: always return T since we don't track element types
+	return vsym("T"), nil
+}
+
+func builtinAdjustArray(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("adjust-array: need array and new dimensions")
+	}
+	arr := args[0]
+	if arr.typ != VArray || arr.array == nil {
+		return nil, fmt.Errorf("adjust-array: first argument must be an array")
+	}
+	dimArg := args[1]
+	var newDims []int
+	if dimArg.typ == VNum {
+		newDims = []int{int(dimArg.num)}
+	} else if dimArg.typ == VPair {
+		for !isNil(dimArg) {
+			if dimArg.car == nil || dimArg.car.typ != VNum {
+				return nil, fmt.Errorf("adjust-array: dimension must be integer")
+			}
+			newDims = append(newDims, int(dimArg.car.num))
+			dimArg = dimArg.cdr
+		}
+	}
+	initialElement := vnil()
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym && args[i].str == ":initial-element" && i+1 < len(args) {
+			i++
+			initialElement = args[i]
+		}
+	}
+	newSize := arrayTotalSize(newDims)
+	newElements := make([]*Value, newSize)
+	copy(newElements, arr.array.elements)
+	for i := len(arr.array.elements); i < newSize; i++ {
+		newElements[i] = initialElement
+	}
+	arr.array.dims = newDims
+	arr.array.elements = newElements
+	return arr, nil
+}
+
+func builtinNull(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(true), nil
+	}
+	return vbool(isNil(args[0])), nil
+}
+
+func builtinApply(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("apply: need function and list")
+	}
+	fn := args[0]
+	// Resolve symbol to its function binding
+	if fn.typ == VSym {
+		val, err := globalEnv.Get(fn.str)
+		if err != nil {
+			return nil, fmt.Errorf("apply: %s has no function binding", fn.str)
+		}
+		fn = val
+	}
+	if fn.typ != VPrim && fn.typ != VFunc && fn.typ != VMacro && fn.typ != VGeneric {
+		return nil, fmt.Errorf("apply: first arg must be a procedure, got %s", typeStr(fn))
+	}
+	// Build argument list from args[1..]
+	// (apply proc arg1 ... argn list): last arg is the list, preceding are individual args
+	var argList *Value
+	if len(args) == 2 {
+		argList = args[1]
+	} else {
+		argList = args[len(args)-1] // last arg IS the list of remaining args
+		for i := len(args) - 2; i >= 1; i-- {
+			argList = cons(args[i], argList)
+		}
+	}
+	if argList.typ != VPair && argList.typ != VNil {
+		return nil, fmt.Errorf("apply: last arg must be a list")
+	}
+	// Extract already-evaluated arg slice
+	evalArgs := toSlice(argList)
+	switch fn.typ {
+	case VPrim:
+		return fn.fn(evalArgs)
+	case VFunc:
+		newEnv := NewEnv(fn.env)
+		if fn.rest != "" {
+			for i, p := range fn.params {
+				if i < len(evalArgs) {
+					newEnv.Set(p, evalArgs[i])
+				} else {
+					newEnv.Set(p, vnil())
+				}
+			}
+			newEnv.Set(fn.rest, listFromSlice(evalArgs[len(fn.params):]))
+		} else {
+			for i, p := range fn.params {
+				if i < len(evalArgs) {
+					newEnv.Set(p, evalArgs[i])
+				} else {
+					newEnv.Set(p, vnil())
+				}
+			}
+		}
+		body := fn.body
+		if isNil(body) {
+			return vnil(), nil
+		}
+		for body.typ == VPair && !isNil(body.cdr) {
+			_, e := eval(body.car, newEnv)
+			if e != nil {
+				return nil, e
+			}
+			body = body.cdr
+		}
+		return eval(body.car, newEnv)
+	case VMacro:
+		expanded, e := expandMacro(fn, argList, globalEnv)
+		if e != nil {
+			return nil, e
+		}
+		return eval(expanded, globalEnv)
+	}
+	return nil, fmt.Errorf("apply: unsupported procedure type")
+}
+
+func builtinDefinedP(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VSym {
+		return vbool(false), nil
+	}
+	_, err := globalEnv.Get(args[0].str)
+	return vbool(err == nil), nil
+}
+
+func builtinFdefinition(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("fdefinition: need a function name")
+	}
+	name := args[0]
+	if name.typ == VSym {
+		fn := globalEnvGetFunction(name.str)
+		if fn != nil {
+			return fn, nil
+		}
+		return nil, fmt.Errorf("fdefinition: %s is not a function", name.str)
+	}
+	return nil, fmt.Errorf("fdefinition: expected a symbol")
+}
+
+func builtinCompileFile(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("compile-file: need a pathname")
+	}
+	path := args[0]
+	var fileStr string
+	if path.typ == VStr {
+		fileStr = path.str
+	} else if path.typ == VPathname {
+		fileStr = pathnameToString(path.pathname)
+	} else {
+		return nil, fmt.Errorf("compile-file: need a pathname or string")
+	}
+	// Read and parse the file (MicroLisp has no native code compiler, so we just parse)
+	data, err := os.ReadFile(fileStr)
+	if err != nil {
+		return nil, fmt.Errorf("compile-file: could not read %s: %v", fileStr, err)
+	}
+	forms, perr := parseAll(string(data))
+	if perr != nil {
+		return nil, fmt.Errorf("compile-file: parse error in %s: %v", fileStr, perr)
+	}
+	for !isNil(forms) {
+		_, err := eval(forms.car, globalEnv)
+		if err != nil {
+			return nil, fmt.Errorf("compile-file: error in %s: %v", fileStr, err)
+		}
+		forms = forms.cdr
+	}
+	// Return output pathname (append .fas to input name)
+	outputPath := fileStr
+	if !strings.HasSuffix(outputPath, ".lisp") && !strings.HasSuffix(outputPath, ".lsp") {
+		outputPath += ".fas"
+	} else if strings.HasSuffix(outputPath, ".lisp") {
+		outputPath = outputPath[:len(outputPath)-5] + ".fas"
+	} else {
+		outputPath = outputPath[:len(outputPath)-4] + ".fas"
+	}
+	p := parsePathnameString(outputPath)
+	v := gcv()
+	v.typ = VPathname
+	v.pathname = p
+	return v, nil
+}
+
+func builtinCompileFilePathname(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("compile-file-pathname: need a pathname")
+	}
+	path := args[0]
+	var fileStr string
+	if path.typ == VStr {
+		fileStr = path.str
+	} else if path.typ == VPathname {
+		fileStr = pathnameToString(path.pathname)
+	} else {
+		return nil, fmt.Errorf("compile-file-pathname: need a pathname or string")
+	}
+	outputPath := fileStr
+	if strings.HasSuffix(outputPath, ".lisp") {
+		outputPath = outputPath[:len(outputPath)-5] + ".fas"
+	} else if strings.HasSuffix(outputPath, ".lsp") {
+		outputPath = outputPath[:len(outputPath)-4] + ".fas"
+	} else if !strings.HasSuffix(outputPath, ".fas") {
+		outputPath += ".fas"
+	}
+	p := parsePathnameString(outputPath)
+	v := gcv()
+	v.typ = VPathname
+	v.pathname = p
+	return v, nil
+}
+
+
+func globalEnvGetFunction(name string) *Value {
+	fn, _ := globalEnv.Get(name)
+	if fn != nil && (fn.typ == VFunc || fn.typ == VPrim || fn.typ == VMacro) {
+		return fn
+	}
+	return nil
+}
+
+// -------- FFI --------
+var ffiRegistry = map[string]interface{}{
+	"math/sin":   math.Sin,
+	"math/cos":   math.Cos,
+	"math/tan":   math.Tan,
+	"math/sqrt":  math.Sqrt,
+	"math/abs":   math.Abs,
+	"math/floor": math.Floor,
+	"math/ceil":  math.Ceil,
+	"math/round": math.Round,
+	"math/exp":   math.Exp,
+	"math/log":   math.Log,
+	"math/pow":   math.Pow,
+	"os/getenv":  os.Getenv,
+	"os/getpid":  os.Getpid,
+}
+
+func builtinFFI(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VStr {
+		return nil, fmt.Errorf("ffi: need string function name")
+	}
+	name := args[0].str
+	fn, ok := ffiRegistry[name]
+	if !ok {
+		return nil, fmt.Errorf("ffi: unknown function: %s", name)
+	}
+	fnVal := reflect.ValueOf(fn)
+	// Handle non-function registered values
+	if fnVal.Kind() != reflect.Func {
+		return reflectToLisp(fnVal), nil
+	}
+	fnType := fnVal.Type()
+	numIn := fnType.NumIn()
+	// if variadic...
+	callArgs := make([]reflect.Value, 0, len(args)-1)
+	for i := 1; i < len(args); i++ {
+		callArgs = append(callArgs, lispToReflect(args[i], fnType.In(min(i-1, numIn-1))))
+	}
+	// Handle variadic
+	if fnType.IsVariadic() {
+		fixedArgs := callArgs
+		if len(fixedArgs) > numIn-1 {
+			fixedArgs = callArgs[:numIn-1]
+			varArgs := callArgs[numIn-1:]
+			for _, va := range varArgs {
+				fixedArgs = append(fixedArgs, va)
+			}
+			callArgs = fixedArgs
+		}
+	}
+	results := fnVal.Call(callArgs)
+	if len(results) == 0 {
+		return vnil(), nil
+	}
+	return reflectToLisp(results[0]), nil
+}
+
+func builtinFFIRegister(args []*Value) (*Value, error) {
+	if len(args) < 2 || args[0].typ != VStr {
+		return nil, fmt.Errorf("ffi-register: need string name and value")
+	}
+	name := args[0].str
+	// We can only register basic types here from Lisp
+	// For Go functions, use the Go side
+	if args[1].typ == VNum {
+		ffiRegistry[name] = float64(toNum(args[1]))
+	} else if args[1].typ == VStr {
+		ffiRegistry[name] = args[1].str
+	} else {
+		return nil, fmt.Errorf("ffi-register: unsupported value type")
+	}
+	return vsym(name), nil
+}
+
+func builtinMacroexpand(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("macroexpand: need form")
+	}
+	form := args[0]
+	depth := 0
+	const maxMacroExpandDepth = 1000
+	for form.typ == VPair && form.car != nil && form.car.typ == VSym {
+		fn, err := globalEnv.Get(form.car.str)
+		if err != nil || fn.typ != VMacro {
+			break
+		}
+		depth++
+		if depth > maxMacroExpandDepth {
+			return nil, fmt.Errorf("macroexpand: expansion depth exceeded (%d)", maxMacroExpandDepth)
+		}
+		expanded, err := expandMacro(fn, form.cdr, globalEnv)
+		if err != nil {
+			return nil, fmt.Errorf("macroexpand: %s", err)
+		}
+		form = expanded
+	}
+	return form, nil
+}
+
+func builtinMacroexpand1(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("macroexpand-1: need form")
+	}
+	form := args[0]
+	if form.typ == VPair && form.car != nil && form.car.typ == VSym {
+		fn, err := globalEnv.Get(form.car.str)
+		if err == nil && fn.typ == VMacro {
+			expanded, err := expandMacro(fn, form.cdr, globalEnv)
+			if err != nil {
+				return nil, fmt.Errorf("macroexpand-1: %s", err)
+			}
+			return expanded, nil
+		}
+	}
+	return form, nil
+}
+
+func builtinMakePackage(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("make-package: need package name")
+	}
+	name := primaryValue(args[0]).str
+	pkg := makePackage(name)
+	return vpkg(pkg), nil
+}
+
+func builtinInPackage(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("in-package: need package name")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return nil, fmt.Errorf("in-package: package not found")
+	}
+	currentPackage = pkg
+	globalEnv.Set("*package*", vpkg(pkg))
+	return vpkg(pkg), nil
+}
+
+func builtinFindPackage(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("find-package: need package name")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return vnil(), nil
+	}
+	return vpkg(pkg), nil
+}
+
+func builtinIntern(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("intern: need symbol name")
+	}
+	name := primaryValue(args[0]).str
+	pkg := currentPackage
+	if len(args) >= 2 && !isNil(args[1]) {
+		pkg = resolvePackageFromDesignator(args[1])
+		if pkg == nil {
+			return nil, fmt.Errorf("intern: package not found")
+		}
+	}
+	return internSymbol(name, pkg), nil
+}
+
+func builtinExport(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("export: need symbol")
+	}
+	sym := primaryValue(args[0])
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("export: need symbol")
+	}
+	pkg := currentPackage
+	if len(args) >= 2 {
+		pkg2 := resolvePackageFromDesignator(primaryValue(args[1]))
+		if pkg2 != nil {
+			pkg = pkg2
+		}
+	}
+	symName := sym.str
+	// Strip keyword prefix
+	if isKeyword(symName) {
+		symName = keywordName(symName)
+	}
+	pkg.exports[symName] = true
+	// Also intern the symbol in the package
+	if _, ok := pkg.symbols[symName]; !ok {
+		pkg.symbols[symName] = sym
+	}
+	return sym, nil
+}
+
+func builtinFindSymbol(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("find-symbol: need string name")
+	}
+	name := primaryValue(args[0]).str
+	pkg := currentPackage
+	if len(args) >= 2 && !isNil(args[1]) {
+		pkg = resolvePackageFromDesignator(args[1])
+		if pkg == nil {
+			// Designator is not a valid package
+			return multiVal(vnil(), vnil()), nil
+		}
+	}
+	// Check internal symbols (including exported = external)
+	if sym, ok := pkg.symbols[name]; ok {
+		if pkg.exports[name] {
+			return multiVal(sym, vsym("EXTERNAL")), nil
+		}
+		return multiVal(sym, vsym("INTERNAL")), nil
+	}
+	// Check inherited via use-list
+	for _, used := range pkg.used {
+		if sym, ok := used.symbols[name]; ok && used.exports[name] {
+			return multiVal(sym, vsym("INHERITED")), nil
+		}
+	}
+	return multiVal(vnil(), vnil()), nil
+}
+
+func builtinKeywordP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	if args[0].typ == VSym {
+		kPkg := findPackage("KEYWORD")
+		if kPkg != nil {
+			if _, ok := kPkg.symbols[args[0].str]; ok {
+				return vbool(true), nil
+			}
+		}
+	}
+	return vbool(false), nil
+}
+
+func builtinPackageP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(isPackage(args[0])), nil
+}
+
+func builtinReadtableP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(isReadtable(args[0])), nil
+}
+
+func builtinMakeReadtable(args []*Value) (*Value, error) {
+	rt := &Readtable{
+		macroFns: make(map[rune]*macroEntry),
+		dispFns:  make(map[rune]*macroEntry),
+		caseMode: ":UPCASE",
+	}
+	return vrt(rt), nil
+}
+
+func builtinCopyReadtable(args []*Value) (*Value, error) {
+	src := currentReadtable
+	if len(args) >= 1 && isReadtable(args[0]) {
+		src = args[0].readtable
+	}
+	rt := &Readtable{
+		macroFns: make(map[rune]*macroEntry),
+		dispFns:  make(map[rune]*macroEntry),
+		caseMode: src.caseMode,
+	}
+	for k, v := range src.macroFns {
+		entry := *v
+		rt.macroFns[k] = &entry
+	}
+	for k, v := range src.dispFns {
+		entry := *v
+		rt.dispFns[k] = &entry
+	}
+	return vrt(rt), nil
+}
+
+func builtinReadtableCase(args []*Value) (*Value, error) {
+	if len(args) < 1 || !isReadtable(args[0]) {
+		return nil, fmt.Errorf("readtable-case: expected a readtable")
+	}
+	return mkKeyword(args[0].readtable.caseMode), nil
+}
+
+func builtinSetReadtableCase(args []*Value) (*Value, error) {
+	if len(args) < 2 || !isReadtable(args[0]) {
+		return nil, fmt.Errorf("set-readtable-case: expected readtable and case mode")
+	}
+	mode := args[1]
+	var modeStr string
+	if mode.typ == VSym && isKeyword(mode.str) {
+		modeStr = mode.str
+	} else if mode.typ == VStr {
+		modeStr = ":" + strings.ToUpper(mode.str)
+	} else {
+		return nil, fmt.Errorf("set-readtable-case: invalid case mode %v", mode)
+	}
+	switch modeStr {
+	case ":UPCASE", ":DOWNCASE", ":PRESERVE", ":INVERT":
+		args[0].readtable.caseMode = modeStr
+	default:
+		return nil, fmt.Errorf("set-readtable-case: invalid case mode %s (expected :UPCASE, :DOWNCASE, :PRESERVE, or :INVERT)", modeStr)
+	}
+	return mkKeyword(modeStr), nil
+}
+
+func builtinSetMacroCharacter(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("set-macro-character: need char and function")
+	}
+	var ch rune
+	if args[0].typ == VChar {
+		ch = args[0].ch
+	} else {
+		return nil, fmt.Errorf("set-macro-character: first argument must be a character")
+	}
+	fn := args[1]
+	if fn.typ != VFunc && fn.typ != VPrim {
+		return nil, fmt.Errorf("set-macro-character: second argument must be a function")
+	}
+	nonTerm := false
+	if len(args) >= 3 {
+		nonTerm = isTruthy(args[2])
+	}
+	rt := currentReadtable
+	if len(args) >= 4 && isReadtable(args[3]) {
+		rt = args[3].readtable
+	}
+	rt.macroFns[ch] = &macroEntry{
+		lispFn:      fn,
+		terminating: !nonTerm,
+	}
+	return vbool(true), nil
+}
+
+func builtinGetMacroCharacter(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("get-macro-character: need a character")
+	}
+	var ch rune
+	if args[0].typ == VChar {
+		ch = args[0].ch
+	} else {
+		return nil, fmt.Errorf("get-macro-character: argument must be a character")
+	}
+	rt := currentReadtable
+	if len(args) >= 2 && isReadtable(args[1]) {
+		rt = args[1].readtable
+	}
+	entry, ok := rt.macroFns[ch]
+	if !ok || entry == nil {
+		return vnil(), nil
+	}
+	if entry.goFn != nil {
+		// Return nil for Go-level macro functions (not introspectable as Lisp fns)
+		return vnil(), nil
+	}
+	if entry.lispFn != nil {
+		return entry.lispFn, nil
+	}
+	return vnil(), nil
+}
+
+func builtinMakeDispatchMacroCharacter(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("make-dispatch-macro-character: need a character")
+	}
+	var ch rune
+	if args[0].typ == VChar {
+		ch = args[0].ch
+	} else {
+		return nil, fmt.Errorf("make-dispatch-macro-character: first argument must be a character")
+	}
+	nonTerm := false
+	if len(args) >= 2 {
+		nonTerm = isTruthy(args[1])
+	}
+	rt := currentReadtable
+	if len(args) >= 3 && isReadtable(args[2]) {
+		rt = args[2].readtable
+	}
+	// Register the dispatch character itself as a macro
+	rt.macroFns[ch] = &macroEntry{
+		goFn:        nil, // dispatch handled in parser
+		terminating: !nonTerm,
+	}
+	// Initialize dispatch table if needed
+	if rt.dispFns == nil {
+		rt.dispFns = make(map[rune]*macroEntry)
+	}
+	return vbool(true), nil
+}
+
+func builtinSetDispatchMacroCharacter(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("set-dispatch-macro-character: need disp-char, sub-char, and function")
+	}
+	var dispCh rune
+	if args[0].typ == VChar {
+		dispCh = args[0].ch
+	} else {
+		return nil, fmt.Errorf("set-dispatch-macro-character: first argument must be a character")
+	}
+	var subCh rune
+	if args[1].typ == VChar {
+		subCh = args[1].ch
+	} else {
+		return nil, fmt.Errorf("set-dispatch-macro-character: second argument must be a character")
+	}
+	fn := args[2]
+	if fn.typ != VFunc && fn.typ != VPrim {
+		return nil, fmt.Errorf("set-dispatch-macro-character: third argument must be a function")
+	}
+	rt := currentReadtable
+	if len(args) >= 4 && isReadtable(args[3]) {
+		rt = args[3].readtable
+	}
+	_ = dispCh // dispCh validated above (ensures it's a character)
+	if rt.dispFns == nil {
+		rt.dispFns = make(map[rune]*macroEntry)
+	}
+	rt.dispFns[subCh] = &macroEntry{
+		lispFn:      fn,
+		terminating: false,
+	}
+	return vbool(true), nil
+}
+
+func builtinGetDispatchMacroCharacter(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("get-dispatch-macro-character: need disp-char and sub-char")
+	}
+	var dispCh rune
+	if args[0].typ == VChar {
+		dispCh = args[0].ch
+	} else {
+		return nil, fmt.Errorf("get-dispatch-macro-character: first argument must be a character")
+	}
+	var subCh rune
+	if args[1].typ == VChar {
+		subCh = args[1].ch
+	} else {
+		return nil, fmt.Errorf("get-dispatch-macro-character: second argument must be a character")
+	}
+	rt := currentReadtable
+	if len(args) >= 3 && isReadtable(args[2]) {
+		rt = args[2].readtable
+	}
+	_ = dispCh // dispCh validated above
+	if rt.dispFns == nil {
+		return vnil(), nil
+	}
+	entry, ok := rt.dispFns[subCh]
+	if !ok || entry == nil {
+		return vnil(), nil
+	}
+	if entry.lispFn != nil {
+		return entry.lispFn, nil
+	}
+	return vnil(), nil
+}
+
+func builtinSymbolPackage(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VSym {
+		return vnil(), nil
+	}
+	name := args[0].str
+	if isKeyword(name) {
+		kPkg := findPackage("KEYWORD")
+		if kPkg != nil {
+			return vpkg(kPkg), nil
+		}
+		return vnil(), nil
+	}
+	// Find which package this symbol belongs to
+	for _, pkg := range packages {
+		if _, ok := pkg.symbols[name]; ok {
+			return vpkg(pkg), nil
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinPackageName(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("package-name: need package designator")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return nil, fmt.Errorf("package-name: package not found")
+	}
+	return vstr(pkg.name), nil
+}
+
+func builtinListAllPackages(args []*Value) (*Value, error) {
+	result := vnil()
+	for _, pkg := range packages {
+		result = cons(vpkg(pkg), result)
+	}
+	return result, nil
+}
+
+func builtinRenamePackage(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("rename-package: need package and new-name")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return nil, fmt.Errorf("rename-package: package not found")
+	}
+	newName := strings.ToUpper(primaryValue(args[1]).str)
+
+	// Collect nicknames from options
+	var nicknames []string
+	for i := 2; i < len(args); i++ {
+		n := primaryValue(args[i]).str
+		if len(n) > 0 {
+			nicknames = append(nicknames, n)
+		}
+	}
+
+	// Remove old name from packages map
+	delete(packages, pkg.name)
+	for _, n := range pkg.nicknames {
+		delete(packages, n)
+	}
+
+	// Update package
+	pkg.name = newName
+	pkg.nicknames = nicknames
+	packages[newName] = pkg
+	for _, n := range nicknames {
+		packages[strings.ToUpper(n)] = pkg
+	}
+
+	return vpkg(pkg), nil
+}
+
+func builtinDeletePackage(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("delete-package: need package designator")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return vbool(false), nil
+	}
+	// Remove from packages map
+	delete(packages, pkg.name)
+	for _, n := range pkg.nicknames {
+		delete(packages, n)
+	}
+	// Can't delete if it has external symbols, but for simplicity just delete
+	return vbool(true), nil
+}
+
+func builtinPackageNicknames(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("package-nicknames: need package designator")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return nil, fmt.Errorf("package-nicknames: package not found")
+	}
+	result := vnil()
+	for i := len(pkg.nicknames) - 1; i >= 0; i-- {
+		result = cons(vsym(pkg.nicknames[i]), result)
+	}
+	return result, nil
+}
+
+func builtinUnexport(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("unexport: need symbols")
+	}
+	pkg := currentPackage
+	syms := args
+	if len(args) >= 2 {
+		pkg2 := resolvePackageFromDesignator(primaryValue(args[0]))
+		if pkg2 != nil {
+			pkg = pkg2
+			syms = args[1:]
+		}
+	}
+	for _, s := range syms {
+		symName := primaryValue(s).str
+		delete(pkg.exports, symName)
+	}
+	return vbool(true), nil
+}
+
+func builtinPackageUseList(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("package-use-list: need package designator")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return vnil(), nil
+	}
+	result := vnil()
+	for _, used := range pkg.used {
+		result = cons(vpkg(used), result)
+	}
+	return result, nil
+}
+
+func builtinPackageUsedByList(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("package-used-by-list: need package designator")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return vnil(), nil
+	}
+	var usedBy []*Package
+	for _, p := range packages {
+		for _, u := range p.used {
+			if u == pkg {
+				usedBy = append(usedBy, p)
+				break
+			}
+		}
+	}
+	result := vnil()
+	for _, p := range usedBy {
+		result = cons(vpkg(p), result)
+	}
+	return result, nil
+}
+
+func builtinPackageShadowingImportList(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("package-shadowing-import-list: need package designator")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return vnil(), nil
+	}
+	result := vnil()
+	for _, symName := range pkg.shadowingImps {
+		result = cons(vsym(symName), result)
+	}
+	return result, nil
+}
+
+func builtinProvide(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VSym {
+		return nil, fmt.Errorf("provide: need a module name (symbol)")
+	}
+	name := args[0].str
+	lispModules[name] = true
+
+	// Update *modules* list in global env
+	var list *Value
+	for m := range lispModules {
+		list = cons(vsym(m), list)
+	}
+	globalEnv.Set("*modules*", list)
+	return vsym(name), nil
+}
+
+func builtinRequire(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VSym {
+		return nil, fmt.Errorf("require: need a module name (symbol)")
+	}
+	name := args[0].str
+	if lispModules[name] {
+		return vsym(name), nil // already loaded
+	}
+
+	// Try to load <name>.lisp
+	filename := name + ".lisp"
+	_, err := loadFile(filename, globalEnv)
+	if err != nil {
+		return nil, fmt.Errorf("require: cannot load %s: %v", filename, err)
+	}
+
+	// Mark as loaded (loadFile may have called provide, but be safe)
+	if !lispModules[name] {
+		lispModules[name] = true
+		var list *Value
+		for m := range lispModules {
+			list = cons(vsym(m), list)
+		}
+		globalEnv.Set("*modules*", list)
+	}
+	return vsym(name), nil
+}
+
+func builtinImport(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VSym {
+		return nil, fmt.Errorf("import: need symbol")
+	}
+	pkg := currentPackage
+	if len(args) >= 2 {
+		pkg2 := resolvePackageFromDesignator(primaryValue(args[1]))
+		if pkg2 != nil {
+			pkg = pkg2
+		}
+	}
+	symName := primaryValue(args[0]).str
+	pkg.symbols[symName] = args[0]
+	return args[0], nil
+}
+
+func builtinUsePackage(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("use-package: need package name(s)")
+	}
+	pkgs := args[0]
+	// Accept a list of package names or a single symbol
+	if pkgs.typ == VPair {
+		for !isNil(pkgs) {
+			if err := useOnePackage(pkgs.car); err != nil {
+				return nil, err
+			}
+			pkgs = pkgs.cdr
+		}
+		return vbool(true), nil
+	}
+	if err := useOnePackage(pkgs); err != nil {
+		return nil, err
+	}
+	return vbool(true), nil
+}
+
+func useOnePackage(v *Value) error {
+	srcPkg := resolvePackageFromDesignator(primaryValue(v))
+	if srcPkg == nil {
+		return fmt.Errorf("use-package: package not found")
+	}
+	pkg := currentPackage
+	for symName, exported := range srcPkg.exports {
+		if exported {
+			if _, ok := pkg.symbols[symName]; !ok {
+				if sym, ok := srcPkg.symbols[symName]; ok {
+					pkg.symbols[symName] = sym
+				}
+			}
+		}
+	}
+	pkg.used = append(pkg.used, srcPkg)
+	return nil
+}
+
+func builtinShadow(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VSym {
+		return nil, fmt.Errorf("shadow: need symbol")
+	}
+	pkg := currentPackage
+	if len(args) >= 2 {
+		pkg2 := resolvePackageFromDesignator(primaryValue(args[1]))
+		if pkg2 != nil {
+			pkg = pkg2
+		}
+	}
+	symName := primaryValue(args[0]).str
+	pkg.symbols[symName] = args[0]
+	pkg.exports[symName] = true
+	return args[0], nil
+}
+
+func builtinUnintern(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VSym {
+		return nil, fmt.Errorf("unintern: need symbol")
+	}
+	pkg := currentPackage
+	if len(args) >= 2 && args[1].typ == VSym {
+		pkg = findPackage(args[1].str)
+		if pkg == nil {
+			return nil, fmt.Errorf("unintern: package not found")
+		}
+	}
+	symName := args[0].str
+	delete(pkg.symbols, symName)
+	delete(pkg.exports, symName)
+	return args[0], nil
+}
+
+func builtinShadowingImport(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("shadowing-import: need symbol or list")
+	}
+	pkg := currentPackage
+	if len(args) >= 2 && args[len(args)-1].typ == VSym {
+		lastArg := args[len(args)-1]
+		if p := findPackage(lastArg.str); p != nil {
+			pkg = p
+			args = args[:len(args)-1]
+		}
+	}
+	symbols := args
+	if len(args) == 1 && args[0].typ == VPair {
+		seen := make(map[*Value]bool)
+		for cur := args[0]; !isNil(cur) && cur.typ == VPair; cur = cur.cdr {
+			if seen[cur] { break }
+			seen[cur] = true
+			symbols = append(symbols, cur.car)
+		}
+		symbols = symbols[1:]
+	}
+	for _, sym := range symbols {
+		if sym.typ != VSym {
+			return nil, fmt.Errorf("shadowing-import: need symbol, got %s", typeStr(sym))
+		}
+		symName := sym.str
+		pkg.symbols[symName] = sym
+		pkg.exports[symName] = true
+		// Track shadowing imports
+		found := false
+		for _, s := range pkg.shadowingImps {
+			if s == symName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			pkg.shadowingImps = append(pkg.shadowingImps, symName)
+		}
+	}
+	return vsym("t"), nil
+}
+
+// -------- CLOS Builtins --------
+
+func builtinMakeInstance(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VSym {
+		return nil, fmt.Errorf("make-instance: need class name")
+	}
+	className := args[0].str
+	cv := findClass(className)
+	if cv == nil || cv.typ != VClass {
+		return nil, fmt.Errorf("make-instance: %s is not a class", className)
+	}
+	inst := gcv()
+	inst.typ = VInstance
+	inst.instClass = cv
+	inst.instSlots = make(map[string]*Value)
+
+	// Collect initarg mappings and initforms from slot definitions
+	// Walk the entire CPL so inherited slots are included
+	slotInitforms := make(map[string]*Value)
+	slotInitargs := make(map[string]string) // initarg keyword -> slotName
+	// Process each class in CPL (most-specific first)
+	for _, c := range cv.cpl {
+		if c.typ != VClass {
+			continue
+		}
+		for slotDef := c.body; !isNil(slotDef); slotDef = slotDef.cdr {
+			slotName := ""
+			if slotDef.car != nil && slotDef.car.typ == VSym {
+				slotName = slotDef.car.str
+				if _, ok := inst.instSlots[slotName]; !ok {
+					inst.instSlots[slotName] = nil // unbound sentinel
+				}
+			} else if slotDef.car != nil && slotDef.car.typ == VPair && slotDef.car.car != nil && slotDef.car.car.typ == VSym {
+				slotName = slotDef.car.car.str
+				if _, ok := inst.instSlots[slotName]; !ok {
+					inst.instSlots[slotName] = nil // unbound sentinel
+				}
+				// Parse slot options: :initform, :initarg
+				opts := slotDef.car.cdr
+				for !isNil(opts) && !isNil(opts.cdr) {
+					if opts.car != nil && opts.car.typ == VSym {
+						switch opts.car.str {
+						case ":initform":
+								if _, exists := slotInitforms[slotName]; !exists {
+									if opts.cdr == nil || opts.cdr.typ != VPair {
+										opts = opts.cdr.cdr
+										continue
+									}
+									if opts.cdr.car != nil {
+										initVal, e := eval(opts.cdr.car, globalEnv)
+										if e == nil {
+											slotInitforms[slotName] = initVal
+										}
+									}
+									opts = opts.cdr.cdr
+									continue
+								}
+						case ":initarg":
+							if opts.cdr != nil && opts.cdr.typ == VPair && opts.cdr.car != nil && opts.cdr.car.typ == VSym {
+								if _, exists := slotInitargs[opts.cdr.car.str]; !exists {
+									slotInitargs[opts.cdr.car.str] = slotName
+								}
+							}
+							opts = opts.cdr.cdr
+							continue
+						}
+					}
+					opts = opts.cdr
+				}
+			}
+		}
+		// Also add bare slot names from classSlots that weren't in body
+		for _, slot := range c.classSlots {
+			if _, ok := inst.instSlots[slot]; !ok {
+				inst.instSlots[slot] = nil // unbound sentinel
+			}
+		}
+	}
+	// Process keyword arguments (:initarg -> slot, or direct slot name for condition classes)
+	for i := 1; i < len(args)-1; i += 2 {
+		if args[i].typ == VSym {
+			key := args[i].str
+			if i+1 >= len(args) {
+				continue
+			}
+			if slotName, ok := slotInitargs[key]; ok {
+				inst.instSlots[slotName] = args[i+1]
+			} else if len(key) > 1 && key[0] == ':' {
+				// Direct slot name mapping (e.g., :datum -> datum)
+				slotName := key[1:]
+				if _, exists := inst.instSlots[slotName]; exists || args[0].typ == VSym {
+					inst.instSlots[slotName] = args[i+1]
+				}
+			}
+		}
+	}
+	// Apply initforms for slots not yet set (nil = unbound sentinel)
+	for slotName, initVal := range slotInitforms {
+		if inst.instSlots[slotName] == nil {
+			inst.instSlots[slotName] = initVal
+		}
+	}
+	return inst, nil
+}
+
+func builtinSlotValue(args []*Value) (*Value, error) {
+	if len(args) < 2 || args[0].typ != VInstance || args[1].typ != VSym {
+		return nil, fmt.Errorf("slot-value: need instance and slot name")
+	}
+	inst := args[0]
+	slotName := args[1].str
+	v, ok := inst.instSlots[slotName]
+	if !ok {
+		// Check parent class slots
+		for _, c := range inst.instClass.cpl {
+			if c.typ == VClass {
+				for _, s := range c.classSlots {
+					if s == slotName {
+						v, ok = inst.instSlots[s]
+						break
+					}
+				}
+			}
+		}
+	}
+	if !ok {
+		return nil, fmt.Errorf("slot-value: slot %s not found in %s", slotName, inst.instClass.str)
+	}
+	if v == nil {
+		return vnil(), nil // unbound slot returns nil for backward compat
+	}
+	return v, nil
+}
+
+func builtinSlotValueSetf(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("slot-value-setf: need value, instance, and slot name")
+	}
+	val := args[0]
+	inst := args[1]
+	slot := args[2]
+	if inst.typ != VInstance {
+		return nil, fmt.Errorf("slot-value-setf: second argument must be an instance")
+	}
+	if slot.typ != VSym {
+		return nil, fmt.Errorf("slot-value-setf: third argument must be a symbol")
+	}
+	inst.instSlots[slot.str] = val
+	return val, nil
+}
+
+func builtinSlotSet(args []*Value) (*Value, error) {
+	if len(args) < 3 || args[0].typ != VInstance || args[1].typ != VSym {
+		return nil, fmt.Errorf("slot-set!: need instance, slot name, and value")
+	}
+	inst := args[0]
+	slotName := args[1].str
+	inst.instSlots[slotName] = args[2]
+	return args[2], nil
+}
+
+func builtinSlotBoundp(args []*Value) (*Value, error) {
+	if len(args) < 2 || args[0].typ != VInstance || args[1].typ != VSym {
+		return nil, fmt.Errorf("slot-boundp: need instance and slot name")
+	}
+	inst := args[0]
+	slotName := args[1].str
+	v, ok := inst.instSlots[slotName]
+	if ok && v != nil {
+		return vbool(true), nil // slot exists in map and is not unbound sentinel
+	}
+	// Check CPL for inherited slot declarations
+	for _, c := range inst.instClass.cpl {
+		if c.typ == VClass {
+			for _, s := range c.classSlots {
+				if s == slotName {
+					v, ok = inst.instSlots[s]
+					return vbool(ok && v != nil), nil
+				}
+			}
+		}
+	}
+	return vbool(false), nil
+}
+
+func builtinSlotExistsP(args []*Value) (*Value, error) {
+	if len(args) < 2 || args[0].typ != VInstance || args[1].typ != VSym {
+		return nil, fmt.Errorf("slot-exists-p: need instance and slot name")
+	}
+	inst := args[0]
+	slotName := args[1].str
+	for _, c := range inst.instClass.cpl {
+		if c.typ == VClass {
+			for _, s := range c.classSlots {
+				if s == slotName {
+					return vbool(true), nil
+				}
+			}
+		}
+	}
+	return vbool(false), nil
+}
+
+func builtinSlotMakunbound(args []*Value) (*Value, error) {
+	if len(args) < 2 || args[0].typ != VInstance || args[1].typ != VSym {
+		return nil, fmt.Errorf("slot-makunbound: need instance and slot name")
+	}
+	inst := args[0]
+	slotName := args[1].str
+	inst.instSlots[slotName] = nil // unbound sentinel
+	return args[0], nil
+}
+
+func builtinClassName(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("class-name: need a class")
+	}
+	c := args[0]
+	if c.typ == VClass {
+		return vsym(c.str), nil
+	}
+	if c.typ == VSym {
+		if cls, ok := classRegistry[c.str]; ok {
+			return vsym(cls.str), nil
+		}
+		return nil, fmt.Errorf("class-name: %s is not a class", c.str)
+	}
+	return nil, fmt.Errorf("class-name: need a class or symbol")
+}
+
+func builtinFindClass(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("find-class: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("find-class: need a symbol")
+	}
+	if cls, ok := classRegistry[sym.str]; ok {
+		return cls, nil
+	}
+	return vnil(), nil
+}
+
+func builtinClassOf(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("class-of: need argument")
+	}
+	if args[0].typ == VInstance && args[0].instClass != nil {
+		return vsym(args[0].instClass.str), nil
+	}
+	// For non-instances, return a type symbol
+	return vsym(typeStr(args[0])), nil
+}
+
+func builtinIsA(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("is-a?: need obj and class-name")
+	}
+	obj := args[0]
+	if obj.typ != VInstance {
+		return vnil(), nil
+	}
+	var cls *Value
+	if args[1].typ == VSym {
+		var err error
+		cls, err = globalEnv.Get(args[1].str)
+		if err != nil || cls.typ != VClass {
+			return vnil(), nil
+		}
+	} else if args[1].typ == VClass {
+		cls = args[1]
+	} else {
+		return vnil(), nil
+	}
+	for _, c := range obj.instClass.cpl {
+		if c == cls {
+			return vbool(true), nil
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinClassSlots(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("class-slots: need class name")
+	}
+	var cls *Value = args[0]
+	// Support both VClass and VSym (symbol naming a class)
+	if cls.typ == VSym {
+		cls, _ = globalEnv.Get(cls.str)
+	}
+	if cls == nil || cls.typ != VClass {
+		return nil, fmt.Errorf("class-slots: not a class")
+	}
+	// Build a list of slot name symbols
+	var result *Value = vnil()
+	for i := len(cls.classSlots) - 1; i >= 0; i-- {
+		result = &Value{typ: VPair, car: vsym(cls.classSlots[i]), cdr: result}
+	}
+	return result, nil
+}
+
+func builtinClassSlotDefs(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("class-slot-defs: need class name")
+	}
+	var cls *Value = args[0]
+	if cls.typ == VSym {
+		cls, _ = globalEnv.Get(cls.str)
+	}
+	if cls == nil || cls.typ != VClass {
+		return nil, fmt.Errorf("class-slot-defs: not a class")
+	}
+	if cls.body != nil {
+		return cls.body, nil
+	}
+	return vnil(), nil
+}
+
+// methodApplicable checks if a method is applicable to the given evaluated arguments
+func methodApplicable(m genMethod, evArgs []*Value) bool {
+	if len(m.specializers) == 0 {
+		return true // unspecialized method applies to all
+	}
+	for i, sp := range m.specializers {
+		if sp == "" {
+			continue // no specializer for this param
+		}
+		if i >= len(evArgs) {
+			return false
+		}
+		arg := evArgs[i]
+		if arg.typ != VInstance {
+			return false
+		}
+		// Check if arg's class (or any ancestor) matches the specializer
+		found := false
+		for _, c := range arg.instClass.cpl {
+			if c.typ == VClass && c.str == sp {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// methodSpecificity returns a score for method specificity (lower = more specific)
+// Only meaningful for methods with specializers on the first argument
+func methodSpecificity(m genMethod, evArgs []*Value) int {
+	baseScore := 999
+	if len(m.specializers) > 0 && m.specializers[0] != "" && len(evArgs) > 0 {
+		if evArgs[0].typ == VInstance {
+			for i, c := range evArgs[0].instClass.cpl {
+				if c.typ == VClass && c.str == m.specializers[0] {
+					baseScore = i
+					break
+				}
+			}
+		}
+	}
+	// Parse numeric auxiliary qualifier (e.g., ":around 2" → 2)
+	// Higher number = more specific = lower score
+	if m.qualifier != "" {
+		parts := strings.Split(m.qualifier, " ")
+		if len(parts) == 2 {
+			if n, err := strconv.Atoi(parts[1]); err == nil {
+				baseScore -= n * 1000
+			}
+		}
+	}
+	return baseScore
+}
+
+// callNextMethodChain applies the next method(s) in a chain with the original arguments
+func callNextMethodChain(methods []genMethod, evArgs []*Value) (*Value, error) {
+	if len(methods) == 0 {
+		return nil, fmt.Errorf("call-next-method: no next method")
+	}
+	pm := methods[0]
+	pEnv := NewEnv(pm.env)
+	for j, p := range pm.params {
+		if j < len(evArgs) {
+			pEnv.Set(p, evArgs[j])
+		}
+	}
+	// Bind call-next-method for further chaining
+	if len(methods) > 1 {
+		remaining := methods[1:]
+		pEnv.Set("call-next-method", &Value{
+			typ: VPrim,
+			fn: func(ignored []*Value) (*Value, error) {
+				return callNextMethodChain(remaining, evArgs)
+			},
+		})
+		pEnv.Set("next-method-p", &Value{
+			typ: VPrim,
+			fn: func(ignored []*Value) (*Value, error) {
+				return vbool(true), nil
+			},
+		})
+	} else {
+		pEnv.Set("call-next-method", &Value{
+			typ: VPrim,
+			fn: func(args2 []*Value) (*Value, error) {
+				return nil, fmt.Errorf("call-next-method: no next method")
+			},
+		})
+		pEnv.Set("next-method-p", &Value{
+			typ: VPrim,
+			fn: func(ignored []*Value) (*Value, error) {
+				return vbool(false), nil
+			},
+		})
+	}
+	// Evaluate body (list of expressions)
+	var result *Value = vnil()
+	if pm.body != nil {
+		bodyList := pm.body
+		for !isNil(bodyList) {
+			r, e := eval(bodyList.car, pEnv)
+			if e != nil {
+				return nil, e
+			}
+			result = r
+			bodyList = bodyList.cdr
+		}
+	}
+	return result, nil
+}
+
+func builtinInstanceP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(args[0].typ == VInstance), nil
+}
+
+// -------- Hash Table support --------
+
+func sxhashVal(v *Value) uint64 {
+	return sxhashSeen(v, make(map[*Value]bool))
+}
+
+func sxhashSeen(v *Value, seen map[*Value]bool) uint64 {
+	if seen[v] {
+		return 0
+	}
+	seen[v] = true
+	switch v.typ {
+	case VNil:
+		return 0
+	case VBool:
+		if v == globalEnv.bindings["#t"] {
+			return 1
+		}
+		return 2
+	case VNum:
+		return uint64(math.Float64bits(v.num))
+	case VRat:
+		return uint64(v.irat)*31 + uint64(v.iden)
+	case VComplex:
+		return uint64(math.Float64bits(v.num))*31 + uint64(math.Float64bits(v.imag))
+	case VStr, VSym:
+		h := uint64(0)
+		for i := 0; i < len(v.str); i++ {
+			h = h*31 + uint64(v.str[i])
+		}
+		return h
+	case VPair:
+		return sxhashSeen(v.car, seen)*31 + sxhashSeen(v.cdr, seen)
+	case VVHash:
+		return 3 // pointer-based
+	default:
+		return 3
+	}
+}
+
+func hashTableKeyEqual(ht *HashTable, a, b *Value) bool {
+	if ht.testFn == nil || ht.testFn.typ == VSym {
+		// Default: use eqVal (like eql)
+		return eqVal(a, b)
+	}
+	// Call the test function with pre-evaluated arguments
+	result, err := callWithValueArgs(ht.testFn, []*Value{a, b})
+	if err != nil {
+		return false
+	}
+	return !isNil(result)
+}
+
+// callWithValueArgs calls a function with already-evaluated argument values
+func callWithValueArgs(fn *Value, args []*Value) (*Value, error) {
+	switch fn.typ {
+	case VPrim:
+		return fn.fn(args)
+	case VFunc:
+		newEnv := NewEnv(fn.env)
+		if fn.rest != "" {
+			for i, p := range fn.params {
+				if i < len(args) {
+					newEnv.Set(p, args[i])
+				} else {
+					newEnv.Set(p, vnil())
+				}
+			}
+			newEnv.Set(fn.rest, listFromSlice(args[len(fn.params):]))
+		} else {
+			for i, p := range fn.params {
+				if i < len(args) {
+					newEnv.Set(p, args[i])
+				} else {
+					return nil, fmt.Errorf("call: too few args for %s", fn.name)
+				}
+			}
+		}
+		body := fn.body
+		if isNil(body) {
+			return vnil(), nil
+		}
+		for body.typ == VPair && !isNil(body.cdr) {
+			_, e := eval(body.car, newEnv)
+			if e != nil {
+				return nil, e
+			}
+			body = body.cdr
+		}
+		return eval(body.car, newEnv)
+	default:
+		return nil, fmt.Errorf("call: not a function")
+	}
+}
+
+func builtinSxhash(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("sxhash: need argument")
+	}
+	return vnum(float64(sxhashVal(args[0]))), nil
+}
+
+func builtinMakeHashTable(args []*Value) (*Value, error) {
+	ht := &HashTable{
+		table:      make(map[uint64][]*hashEntry),
+		rehashSize: 1.5,
+	}
+	// Parse keyword args
+	for i := 0; i < len(args); i++ {
+		if args[i].typ == VSym && strings.HasPrefix(args[i].str, ":") {
+			switch args[i].str {
+			case ":test":
+				if i+1 < len(args) {
+					i++
+					tv := args[i]
+					if tv.typ != VSym && tv.typ != VPrim && tv.typ != VFunc && tv.typ != VGeneric {
+						return nil, fmt.Errorf("make-hash-table: :test must be a function or symbol")
+					}
+					ht.testFn = args[i]
+				}
+			case ":hash-function":
+				if i+1 < len(args) {
+					i++
+					ht.hashFn = args[i]
+				}
+			case ":rehash-size":
+				if i+1 < len(args) {
+					i++
+					rsz := toNum(primaryValue(args[i]))
+					if rsz > 0 {
+						ht.rehashSize = rsz
+					}
+				}
+			}
+		}
+	}
+	v := gcv()
+	v.typ = VVHash
+	v.hashTab = ht
+	return v, nil
+}
+
+func builtinHashTableP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(args[0].typ == VVHash), nil
+}
+
+func builtinGethash(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("gethash: need key and hash-table")
+	}
+	key := args[0]
+	ht := args[1]
+	defaultVal := vnil()
+	if len(args) > 2 {
+		defaultVal = args[2]
+	}
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return defaultVal, nil
+	}
+	h := sxhashVal(key)
+	bucket := ht.hashTab.table[h]
+	for _, entry := range bucket {
+		if hashTableKeyEqual(ht.hashTab, entry.key, key) {
+			return entry.value, nil
+		}
+	}
+	return defaultVal, nil
+}
+
+func builtinSetGethash(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("gethash-setf: need value, key, and hash-table")
+	}
+	val := args[0]
+	key := args[1]
+	ht := args[2]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return nil, fmt.Errorf("gethash-setf: not a hash table")
+	}
+	h := sxhashVal(key)
+	bucket := ht.hashTab.table[h]
+	for i, entry := range bucket {
+		if hashTableKeyEqual(ht.hashTab, entry.key, key) {
+			bucket[i].value = val
+			ht.hashTab.table[h] = bucket
+			return val, nil
+		}
+	}
+	// New entry
+	entry := &hashEntry{key: key, value: val}
+	ht.hashTab.table[h] = append(bucket, entry)
+	ht.hashTab.count++
+	return val, nil
+}
+
+func builtinRemhash(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("remhash: need key and hash-table")
+	}
+	key := args[0]
+	ht := args[1]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return vnil(), nil
+	}
+	h := sxhashVal(key)
+	bucket := ht.hashTab.table[h]
+	for i, entry := range bucket {
+		if hashTableKeyEqual(ht.hashTab, entry.key, key) {
+			ht.hashTab.table[h] = append(bucket[:i], bucket[i+1:]...)
+			ht.hashTab.count--
+			return vbool(true), nil
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinHashTableExists(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("hash-table-exists?: need hash-table and key")
+	}
+	ht := args[0]
+	key := args[1]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return vbool(false), nil
+	}
+	h := sxhashVal(key)
+	bucket := ht.hashTab.table[h]
+	for _, entry := range bucket {
+		if hashTableKeyEqual(ht.hashTab, entry.key, key) {
+			return vbool(true), nil
+		}
+	}
+	return vbool(false), nil
+}
+
+func builtinClrhash(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("clrhash: need hash-table")
+	}
+	ht := args[0]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return nil, fmt.Errorf("clrhash: not a hash table")
+	}
+	ht.hashTab.table = make(map[uint64][]*hashEntry)
+	ht.hashTab.count = 0
+	return args[0], nil
+}
+
+func builtinHashTableCount(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("hash-table-count: need hash-table")
+	}
+	ht := args[0]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return nil, fmt.Errorf("hash-table-count: not a hash table")
+	}
+	return vnum(float64(ht.hashTab.count)), nil
+}
+
+func builtinMaphash(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("maphash: need function and hash-table")
+	}
+	fn := args[0]
+	ht := args[1]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return nil, fmt.Errorf("maphash: not a hash table")
+	}
+	for _, bucket := range ht.hashTab.table {
+		for _, entry := range bucket {
+			callArgs := []*Value{entry.key, entry.value}
+			_, err := callWithValueArgs(fn, callArgs)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinHashTableSize(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("hash-table-size: need hash-table")
+	}
+	ht := args[0]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return nil, fmt.Errorf("hash-table-size: not a hash table")
+	}
+	return vnum(float64(ht.hashTab.count)), nil
+}
+
+func builtinHashTableTest(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("hash-table-test: need hash-table")
+	}
+	ht := args[0]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return nil, fmt.Errorf("hash-table-test: not a hash table")
+	}
+	if ht.hashTab.testFn != nil && !isNil(ht.hashTab.testFn) {
+		return ht.hashTab.testFn, nil
+	}
+	return vsym("eql"), nil
+}
+
+func builtinHashTableRehashSize(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("hash-table-rehash-size: need hash-table")
+	}
+	ht := args[0]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return nil, fmt.Errorf("hash-table-rehash-size: not a hash table")
+	}
+	return vnum(args[0].hashTab.rehashSize), nil
+}
+
+func builtinPush(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("push: need item and place")
+	}
+	item := args[0]
+	place := args[1]
+	if place.typ == VSym {
+		currentVal, err := globalEnv.Get(place.str)
+		if err != nil {
+			currentVal = vnil()
+		}
+		newVal := cons(item, currentVal)
+		globalEnv.Set(place.str, newVal)
+		return newVal, nil
+	}
+	return nil, fmt.Errorf("push: second argument must be a symbol")
+}
+
+func builtinPushnew(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("pushnew: need item and place")
+	}
+	item := args[0]
+	place := args[1]
+	testFn := vnil()
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym && args[i].str == ":test" && i+1 < len(args) {
+			testFn = args[i+1]
+			i++
+		}
+	}
+	if place.typ == VSym {
+		currentVal, err := globalEnv.Get(place.str)
+		if err != nil {
+			currentVal = vnil()
+		}
+		// Check if item already in list
+		for lst := currentVal; lst != nil && lst.typ == VPair; lst = lst.cdr {
+			if !isNil(testFn) {
+				res, err := callFnOnSeq(testFn, []*Value{item, lst.car}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+				if isTruthy(res) {
+					return currentVal, nil
+				}
+			} else {
+				if eqVal(item, lst.car) {
+					return currentVal, nil
+				}
+			}
+		}
+		newVal := cons(item, currentVal)
+		globalEnv.Set(place.str, newVal)
+		return newVal, nil
+	}
+	return nil, fmt.Errorf("pushnew: second argument must be a symbol")
+}
+
+func builtinVectorPushExtend(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("vector-push-extend: need element and vector")
+	}
+	newEl := args[0]
+	vec := args[1]
+	extension := -1
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym && args[i].str == ":extension" && i+1 < len(args) {
+			n, err := safeToNum(args[i+1], "vector-push-extend")
+			if err != nil {
+				return nil, err
+			}
+			extension = int(n)
+			i++
+		}
+	}
+	if vec.typ != VArray || vec.array == nil {
+		return nil, fmt.Errorf("vector-push-extend: second argument must be a vector")
+	}
+	arr := vec.array
+	if arr.fillPtr < 0 {
+		return nil, fmt.Errorf("vector-push-extend: vector has no fill-pointer")
+	}
+	if arr.fillPtr >= len(arr.elements) {
+		// Extend the vector
+		ext := extension
+		if ext <= 0 {
+			ext = len(arr.elements)
+			if ext < 16 {
+				ext = 16
+			}
+		}
+		newElems := make([]*Value, len(arr.elements)+ext)
+		copy(newElems, arr.elements)
+		for i := len(arr.elements); i < len(newElems); i++ {
+			newElems[i] = vnil()
+		}
+		arr.elements = newElems
+	}
+	arr.elements[arr.fillPtr] = newEl
+	fp := arr.fillPtr
+	arr.fillPtr++
+	return vnum(float64(fp)), nil
+}
+
+func builtinRowMajorAref(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("row-major-aref: need array and index")
+	}
+	arr := args[0]
+	idx := args[1]
+	if arr.typ != VArray || arr.array == nil {
+		return nil, fmt.Errorf("row-major-aref: first argument must be an array")
+	}
+	n, err := safeToNum(idx, "row-major-aref")
+	if err != nil {
+		return nil, err
+	}
+	i := int(n)
+	if i < 0 || i >= len(arr.array.elements) {
+		return nil, fmt.Errorf("row-major-aref: index %d out of bounds", i)
+	}
+	return arr.array.elements[i], nil
+}
+
+func builtinMakeRandomState(args []*Value) (*Value, error) {
+	v := gcv()
+	v.typ = VRandomState
+	if len(args) > 0 && !isNil(args[0]) {
+		// Copy from existing state
+		if args[0].typ == VRandomState && args[0].randState != nil {
+			v.randState = rand.New(rand.NewSource(args[0].randState.Int63()))
+		} else {
+			v.randState = rand.New(rand.NewSource(time.Now().UnixNano()))
+		}
+	} else {
+		v.randState = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+	return v, nil
+}
+
+func builtinRandomStateP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(args[0].typ == VRandomState), nil
+}
+
+func builtinCopyRandomState(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VRandomState {
+		return builtinMakeRandomState(args)
+	}
+	v := gcv()
+	v.typ = VRandomState
+	v.randState = rand.New(rand.NewSource(args[0].randState.Int63()))
+	return v, nil
+}
+
+func builtinGetUniversalTime(args []*Value) (*Value, error) {
+	// Universal time: seconds since 1900-01-01 00:00:00 GMT
+	t := time.Now()
+	unixSec := t.Unix()
+	// Offset from 1900 to 1970: 70 years worth of seconds
+	offset := int64(2208988800)
+	return vnum(float64(unixSec + offset)), nil
+}
+
+func builtinGetInternalRealTime(args []*Value) (*Value, error) {
+	return vnum(float64(time.Now().UnixNano() / int64(time.Millisecond))), nil
+}
+
+var processStartTime = time.Now()
+
+func builtinGetInternalRunTime(args []*Value) (*Value, error) {
+	return vnum(float64(time.Since(processStartTime).Milliseconds())), nil
+}
+
+// -------- Bit array operations --------
+
+func bitArrayOp(args []*Value, op string) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("bit-%s: need two bit arrays", op)
+	}
+	a := args[0]
+	b := args[1]
+	if a.typ != VArray || a.array == nil {
+		return nil, fmt.Errorf("bit-%s: first argument must be a bit array", op)
+	}
+	if b.typ != VArray || b.array == nil {
+		return nil, fmt.Errorf("bit-%s: second argument must be a bit array", op)
+	}
+	aElems := a.array.elements
+	bElems := b.array.elements
+	n := len(aElems)
+	if len(bElems) < n {
+		n = len(bElems)
+	}
+	result := make([]*Value, n)
+	for i := 0; i < n; i++ {
+		av := toNum(primaryValue(aElems[i]))
+		bv := toNum(primaryValue(bElems[i]))
+		var rv float64
+		switch op {
+		case "and":
+			if av != 0 && bv != 0 {
+				rv = 1
+			}
+		case "ior":
+			if av != 0 || bv != 0 {
+				rv = 1
+			}
+		case "xor":
+			if (av != 0) != (bv != 0) {
+				rv = 1
+			}
+		case "eqv":
+			if (av != 0) == (bv != 0) {
+				rv = 1
+			}
+		case "nand":
+			if !(av != 0 && bv != 0) {
+				rv = 1
+			}
+		case "nor":
+			if !(av != 0 || bv != 0) {
+				rv = 1
+			}
+		case "orc1":
+			if !(av != 0) || bv != 0 {
+				rv = 1
+			}
+		case "orc2":
+			if av != 0 || !(bv != 0) {
+				rv = 1
+			}
+		}
+		result[i] = vnum(rv)
+	}
+	v := gcv()
+	v.typ = VArray
+	v.array = &LispArray{
+		elements: result,
+		dims:     []int{n},
+		fillPtr:  -1,
+	}
+	return v, nil
+}
+
+func builtinBitAnd(args []*Value) (*Value, error)    { return bitArrayOp(args, "and") }
+func builtinBitIor(args []*Value) (*Value, error)    { return bitArrayOp(args, "ior") }
+func builtinBitXor(args []*Value) (*Value, error)    { return bitArrayOp(args, "xor") }
+func builtinBitEqv(args []*Value) (*Value, error)    { return bitArrayOp(args, "eqv") }
+func builtinBitNand(args []*Value) (*Value, error)   { return bitArrayOp(args, "nand") }
+func builtinBitNor(args []*Value) (*Value, error)    { return bitArrayOp(args, "nor") }
+func builtinBitOrc1(args []*Value) (*Value, error)   { return bitArrayOp(args, "orc1") }
+func builtinBitOrc2(args []*Value) (*Value, error)   { return bitArrayOp(args, "orc2") }
+
+func builtinBitNot(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("bit-not: need a bit array")
+	}
+	a := args[0]
+	if a.typ != VArray || a.array == nil {
+		return nil, fmt.Errorf("bit-not: argument must be a bit array")
+	}
+	result := make([]*Value, len(a.array.elements))
+	for i, el := range a.array.elements {
+		v := toNum(primaryValue(el))
+		if v != 0 {
+			result[i] = vnum(0)
+		} else {
+			result[i] = vnum(1)
+		}
+	}
+	rv := gcv()
+	rv.typ = VArray
+	rv.array = &LispArray{
+		elements: result,
+		dims:     []int{len(result)},
+		fillPtr:  -1,
+	}
+	return rv, nil
+}
+
+// -------- Sequence operations --------
+
+// seqParseKeys extracts keyword arguments from args[startIdx:]
+func seqParseKeys(args []*Value, startIdx int) (keyFn, testFn *Value, fromEnd bool, count, start, end int, initialVal *Value, err error) {
+	keyFn = vnil()
+	testFn = vnil()
+	count = -1
+	start = 0
+	end = -1
+	initialVal = vnil()
+	fromEnd = false
+	for i := startIdx; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":key":
+				if i+1 < len(args) {
+					i++
+					keyFn = args[i]
+				}
+			case ":test":
+				if i+1 < len(args) {
+					i++
+					testFn = args[i]
+				}
+			case ":from-end":
+				fromEnd = true
+			case ":count":
+				if i+1 < len(args) {
+					i++
+					n, e := safeToNum(args[i], "keyword :count")
+					if e != nil {
+						err = e
+						return
+					}
+					count = int(n)
+				}
+			case ":start":
+				if i+1 < len(args) {
+					i++
+					n, e := safeToNum(args[i], "keyword :start")
+					if e != nil {
+						err = e
+						return
+					}
+					start = int(n)
+				}
+			case ":end":
+				if i+1 < len(args) {
+					i++
+					n, e := safeToNum(args[i], "keyword :end")
+					if e != nil {
+						err = e
+						return
+					}
+					end = int(n)
+				}
+			case ":initial-value":
+				if i+1 < len(args) {
+					i++
+					initialVal = args[i]
+				}
+			}
+		}
+	}
+	return
+}
+
+// extractKeyFromRest extracts :key from the end of a sequence args slice.
+// Returns the keyFn (or nil) and a new slice without the :key keyword arg.
+func extractKeyFromRest(seqs []*Value) (*Value, []*Value) {
+	keyFn := (*Value)(nil)
+	// Scan from the end looking for :key keyword
+	for i := len(seqs) - 1; i >= 0; i-- {
+		if seqs[i].typ == VSym && seqs[i].str == ":key" && i+1 < len(seqs) {
+			keyFn = seqs[i+1]
+			// Build new slice without :key and its value
+			result := make([]*Value, 0, len(seqs)-2)
+			result = append(result, seqs[:i]...)
+			result = append(result, seqs[i+2:]...)
+			return keyFn, result
+		}
+	}
+	return nil, seqs
+}
+
+// seqToList converts a sequence (list or vector-like) to a Go []*Value slice.
+// For now, only lists are supported.
+func seqToList(v *Value) []*Value {
+	var result []*Value
+	seen := make(map[*Value]bool)
+	for !isNil(v) {
+		if v.typ == VPair {
+			if seen[v] {
+				break // circular list
+			}
+			seen[v] = true
+			result = append(result, v.car)
+			v = v.cdr
+		} else if v.typ == VStr {
+			// Convert string to list of character values (CL: coerce "abc" 'list → #\a #\b #\c)
+			for _, r := range v.str {
+				result = append(result, vchar(r))
+			}
+			break
+		} else if v.typ == VArray && v.array != nil {
+			n := len(v.array.elements)
+			if v.array.fillPtr >= 0 && v.array.fillPtr < n {
+				n = v.array.fillPtr
+			}
+			for i := 0; i < n; i++ {
+				result = append(result, v.array.elements[i])
+			}
+			break
+		} else {
+			break
+		}
+	}
+	return result
+}
+
+func callFnOnSeq(fn *Value, args []*Value, env *Env) (*Value, error) {
+	// Build argument list
+	argList := vnil()
+	for i := len(args) - 1; i >= 0; i-- {
+		argList = &Value{typ: VPair, car: args[i], cdr: argList}
+	}
+	// Resolve if it's a symbol naming a function
+	callFn := fn
+	if fn.typ == VSym {
+		resolved, err := env.Get(fn.str)
+		if err == nil {
+			callFn = resolved
+		} else {
+			return nil, fmt.Errorf("callFnOnSeq: undefined function %s", fn.str)
+		}
+	}
+	switch callFn.typ {
+	case VPrim:
+		return callFn.fn(args)
+	case VFunc:
+		// Direct apply without re-evaluating args
+		if callFn.name != "" && traceTable[callFn.name] {
+			indent := strings.Repeat("  ", traceDepth)
+			argStrs := make([]string, len(args))
+			for i, a := range args {
+				argStrs[i] = toString(primaryValue(a))
+			}
+			fmt.Printf("%s%d: (%s %s)\n", indent, traceDepth, callFn.name, strings.Join(argStrs, " "))
+
+			traceDepth++
+		}
+		newEnv := NewEnv(callFn.env)
+		if callFn.rest != "" {
+			for i, p := range callFn.params {
+				if i < len(args) {
+					newEnv.Set(p, args[i])
+				} else {
+					newEnv.Set(p, vnil())
+				}
+			}
+			newEnv.Set(callFn.rest, listFromSlice(args[len(callFn.params):]))
+		} else {
+			for i, p := range callFn.params {
+				if i < len(args) {
+					newEnv.Set(p, args[i])
+				} else {
+					newEnv.Set(p, vnil())
+				}
+			}
+		}
+		body := callFn.body
+		if isNil(body) {
+			ret := vnil()
+			if callFn.name != "" && traceTable[callFn.name] {
+				traceDepth--
+				indent := strings.Repeat("  ", traceDepth)
+				fmt.Printf("%s%d: <= %s\n", indent, traceDepth, toString(ret))
+
+			}
+			return ret, nil
+		}
+		for body.typ == VPair && !isNil(body.cdr) {
+			_, e := eval(body.car, newEnv)
+			if e != nil {
+				if _, ok := e.(*tailCall); ok {
+					return nil, e
+				}
+				return nil, e
+			}
+			body = body.cdr
+		}
+		// Evaluate the final expression, handling tail-call optimization
+		for {
+			ret, err := eval(body.car, newEnv)
+			if err == nil {
+				if callFn.name != "" && traceTable[callFn.name] {
+					traceDepth--
+					indent := strings.Repeat("  ", traceDepth)
+					fmt.Printf("%s%d: <= %s\n", indent, traceDepth, toString(ret))
+				}
+				return ret, nil
+			}
+			if tc, ok := err.(*tailCall); ok {
+				// TCO: update form/env and continue looping
+				body = tc.form
+				newEnv = tc.env
+				continue
+			}
+			return nil, err
+		}
+	default:
+		// Fallback: construct form and eval (for other function types)
+		return eval(&Value{typ: VPair, car: callFn, cdr: argList}, globalEnv)
+	}
+}
+
+func builtinSeqMap(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-map: need function and sequence")
+	}
+	fn := args[0]
+	seq := args[1]
+	elements := seqToList(seq)
+	var result []*Value
+	for _, el := range elements {
+		val, err := callFnOnSeq(fn, []*Value{el}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, val)
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinSeqReduce(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-reduce: need function and sequence")
+	}
+	fn := args[0]
+	keyFn, _, _, _, start, end, initialVal, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	seq := args[1]
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start >= end || len(elements) == 0 {
+		return initialVal, nil
+	}
+	acc := initialVal
+	startIdx := start
+	hasInitialValue := boolFromKey(":initial-value", args, 2)
+	if acc.typ == VNil && !hasInitialValue {
+		acc = elements[startIdx]
+		startIdx = start + 1
+	}
+	for i := startIdx; i < end; i++ {
+		v := elements[i]
+		if !isNil(keyFn) {
+			var err error
+			v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		var err error
+		acc, err = callFnOnSeq(fn, []*Value{acc, v}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return acc, nil
+}
+
+func boolFromKey(key string, args []*Value, startIdx int) bool {
+	for i := startIdx; i < len(args); i++ {
+		if args[i].typ == VSym && args[i].str == key {
+			return true
+		}
+	}
+	return false
+}
+
+func builtinSeqSort(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-sort: need sequence and predicate")
+	}
+	seq := args[0]
+	pred := args[1]
+	keyFn, _, _, _, _, _, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	// Simple insertion sort (stable)
+	for i := 1; i < len(elements); i++ {
+		for j := i; j > 0; j-- {
+			a, b := elements[j-1], elements[j]
+			if !isNil(keyFn) {
+				var err error
+				a, err = callFnOnSeq(keyFn, []*Value{a}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+				b, err = callFnOnSeq(keyFn, []*Value{b}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			cmp, err := callFnOnSeq(pred, []*Value{b, a}, globalEnv) // (pred b a) means b < a → swap
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(cmp) {
+				elements[j-1], elements[j] = elements[j], elements[j-1]
+			} else {
+				break
+			}
+		}
+	}
+	return listFromSlice(elements), nil
+}
+
+func builtinSeqRemoveIf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-remove-if: need predicate and sequence")
+	}
+	pred := args[0]
+	seq := args[1]
+	keyFn, _, _, count, start, end, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	var result []*Value
+	removed := 0
+	for i, el := range elements {
+		if i >= start && i < end && (count < 0 || removed < count) {
+			v := el
+			if !isNil(keyFn) {
+				var err error
+				v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			cmp, err := callFnOnSeq(pred, []*Value{v}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(cmp) {
+				removed++
+				continue
+			}
+		}
+		result = append(result, el)
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinSeqFind(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-find: need item and sequence")
+	}
+	item := args[0]
+	seq := args[1]
+	if err := checkSequenceArg(seq, "seq-find"); err != nil {
+		return nil, err
+	}
+	keyFn, testFn, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	if fromEnd {
+		for i := end - 1; i >= start; i-- {
+			if testItemMatch(item, elements[i], testFn, keyFn) {
+				return elements[i], nil
+			}
+		}
+	} else {
+		for i := start; i < end; i++ {
+			if testItemMatch(item, elements[i], testFn, keyFn) {
+				return elements[i], nil
+			}
+		}
+	}
+	return vnil(), nil
+}
+
+func testItemMatch(item, el *Value, testFn, keyFn *Value) bool {
+	a, b := el, item
+	if !isNil(keyFn) {
+		var err error
+		a, err = callFnOnSeq(keyFn, []*Value{a}, globalEnv)
+		if err != nil {
+			return false
+		}
+		b, err = callFnOnSeq(keyFn, []*Value{b}, globalEnv)
+		if err != nil {
+			return false
+		}
+	}
+	if !isNil(testFn) {
+		cmp, err := callFnOnSeq(testFn, []*Value{a, b}, globalEnv)
+		if err != nil {
+			return false
+		}
+		return isTruthy(cmp)
+	}
+	return eqVal(a, b)
+}
+
+func builtinSeqPosition(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-position: need item and sequence")
+	}
+	item := args[0]
+	seq := args[1]
+	keyFn, testFn, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	if fromEnd {
+		for i := end - 1; i >= start; i-- {
+			if testItemMatch(item, elements[i], testFn, keyFn) {
+				return vnum(float64(i)), nil
+			}
+		}
+	} else {
+		for i := start; i < end; i++ {
+			if testItemMatch(item, elements[i], testFn, keyFn) {
+				return vnum(float64(i)), nil
+			}
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinSeqSubstitute(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("seq-substitute: need new, old, and sequence")
+	}
+	newVal := args[0]
+	old := args[1]
+	seq := args[2]
+	keyFn, testFn, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	result := make([]*Value, len(elements))
+	copy(result, elements)
+	replaced := 0
+	if fromEnd {
+		for i := end - 1; i >= start; i-- {
+			if count >= 0 && replaced >= count {
+				break
+			}
+			if testItemMatch(old, elements[i], testFn, keyFn) {
+				result[i] = newVal
+				replaced++
+			}
+		}
+	} else {
+		for i := start; i < end; i++ {
+			if count >= 0 && replaced >= count {
+				break
+			}
+			if testItemMatch(old, elements[i], testFn, keyFn) {
+				result[i] = newVal
+				replaced++
+			}
+		}
+	}
+	return listFromSlice(result), nil
+}
+
+// -------- subseq, concatenate, mapcan --------
+
+func builtinSeqSubseq(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("subseq: need sequence and start")
+	}
+	seq := args[0]
+	start := int(primaryValue(args[1]).num)
+	// Handle strings specially: return a string, not a list
+	if seq.typ == VStr {
+		runes := []rune(seq.str)
+		end := len(runes)
+		if len(args) >= 3 && args[2].typ != VNil {
+			end = int(primaryValue(args[2]).num)
+		}
+		if start < 0 {
+			start = 0
+		}
+		if end < 0 {
+			end = len(runes)
+		}
+		if start > len(runes) {
+			start = len(runes)
+		}
+		if end > len(runes) {
+			end = len(runes)
+		}
+		if start >= end {
+			return vstr(""), nil
+		}
+		return vstr(string(runes[start:end])), nil
+	}
+	end := len(seqToList(seq))
+	if len(args) >= 3 && args[2].typ != VNil {
+		end = int(primaryValue(args[2]).num)
+	}
+	elements := seqToList(seq)
+	if end < 0 {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	if start > len(elements) {
+		start = len(elements)
+	}
+	if end > len(elements) {
+		end = len(elements)
+	}
+	if start >= end {
+		return vnil(), nil
+	}
+	return listFromSlice(elements[start:end]), nil
+}
+
+func builtinSubseqSetf(args []*Value) (*Value, error) {
+	if len(args) < 4 {
+		return nil, fmt.Errorf("subseq-setf: need newval, seq, start, end")
+	}
+	newval := primaryValue(args[0])
+	seq := primaryValue(args[1])
+	start := int(primaryValue(args[2]).num)
+	end := -1
+	if args[3].typ != VNil {
+		end = int(primaryValue(args[3]).num)
+	}
+	if seq.typ == VStr {
+		// For strings, construct the modified string and update in place
+		s := seq.str
+		runes := []rune(s)
+		if end < 0 || end > len(runes) {
+			end = len(runes)
+		}
+		if start < 0 {
+			start = 0
+		}
+		newStr := ""
+		if newval.typ == VStr {
+			newStr = newval.str
+		}
+		newRunes := []rune(newStr)
+		// Replace the range with newRunes (truncate or extend as needed)
+		replaceLen := len(newRunes)
+		if replaceLen > end-start {
+			replaceLen = end - start
+		}
+		// Build new string: before + newRunes + rest
+		result := string(runes[:start]) + newStr + string(runes[end:])
+		// Modify the string in place
+		seq.str = result
+		return newval, nil
+	}
+	// For lists, return as-is (modification of subseq is not meaningful)
+	return newval, nil
+}
+
+func builtinSeqConcatenate(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("concatenate: need result-type and sequences")
+	}
+	resultType := args[0]
+	if resultType.typ == VSym && resultType.str == "string" {
+		var result string
+		for i := 1; i < len(args); i++ {
+			if args[i].typ == VStr {
+				result += args[i].str
+			}
+		}
+		return vstr(result), nil
+	}
+	var result []*Value
+	for i := 1; i < len(args); i++ {
+		result = append(result, seqToList(args[i])...)
+	}
+	return listFromSlice(result), nil
+}
+
+// checkSequenceArg validates that v is a proper sequence for map functions.
+func checkSequenceArg(v *Value, funcName string) error {
+	v = primaryValue(v)
+	if v.typ != VPair && v.typ != VNil && v.typ != VStr && v.typ != VArray {
+		return fmt.Errorf("%s: expected a proper sequence", funcName)
+	}
+	return nil
+}
+
+// safeToNum returns the numeric value or an error for non-numeric types.
+func safeToNum(v *Value, funcName string) (float64, error) {
+	v = primaryValue(v)
+	if v.typ != VNum && v.typ != VBigInt && v.typ != VRat {
+		return 0, fmt.Errorf("%s: expected a number", funcName)
+	}
+	return toNum(v), nil
+}
+
+func builtinMapcan(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("mapcan: need function and at least one sequence")
+	}
+	fn := args[0]
+	seqs := args[1:]
+	for _, s := range seqs {
+		if err := checkSequenceArg(s, "mapcan"); err != nil {
+			return nil, err
+		}
+	}
+	lists := make([][]*Value, len(seqs))
+	for i, s := range seqs {
+		lists[i] = seqToList(s)
+	}
+	if len(lists) == 0 {
+		return vnil(), nil
+	}
+	maxLen := 0
+	for _, l := range lists {
+		if len(l) > maxLen {
+			maxLen = len(l)
+		}
+	}
+	var result []*Value
+	for i := 0; i < maxLen; i++ {
+		callArgs := make([]*Value, 0, len(lists))
+		for _, l := range lists {
+			if i < len(l) {
+				callArgs = append(callArgs, l[i])
+			}
+		}
+		callResult, err := callFnOnSeq(fn, callArgs, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, seqToList(callResult)...)
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinMapcar(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("mapcar: need function and at least one list")
+	}
+	fn := args[0]
+	seqs := args[1:]
+	for _, s := range seqs {
+		if err := checkSequenceArg(s, "mapcar"); err != nil {
+			return nil, err
+		}
+	}
+	lists := make([][]*Value, len(seqs))
+	for i, s := range seqs {
+		lists[i] = seqToList(s)
+	}
+	if len(lists) == 0 {
+		return vnil(), nil
+	}
+	maxLen := 0
+	for _, l := range lists {
+		if len(l) > maxLen {
+			maxLen = len(l)
+		}
+	}
+	var result []*Value
+	for i := 0; i < maxLen; i++ {
+		callArgs := make([]*Value, 0, len(lists))
+		for _, l := range lists {
+			if i < len(l) {
+				callArgs = append(callArgs, l[i])
+			}
+		}
+		callResult, err := callFnOnSeq(fn, callArgs, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, callResult)
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinMapInto(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("map-into: need result-sequence and function and sequence")
+	}
+	resultSeq := args[0]
+	fn := args[1]
+	seqs := args[2:]
+	for _, s := range seqs {
+		if err := checkSequenceArg(s, "map-into"); err != nil {
+			return nil, err
+		}
+	}
+	lists := make([][]*Value, len(seqs))
+	for i, s := range seqs {
+		lists[i] = seqToList(s)
+	}
+	maxLen := 0
+	for _, l := range lists {
+		if len(l) > maxLen {
+			maxLen = len(l)
+		}
+	}
+	var result []*Value
+	if resultSeq.typ == VStr {
+		var sb strings.Builder
+		for i := 0; i < maxLen; i++ {
+			callArgs := make([]*Value, 0, len(lists))
+			for _, l := range lists {
+				if i < len(l) {
+					callArgs = append(callArgs, l[i])
+				}
+			}
+			val, err := callFnOnSeq(fn, callArgs, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			sb.WriteString(toString(primaryValue(val)))
+		}
+		return vstr(sb.String()), nil
+	}
+	result = seqToList(resultSeq)
+	if len(result) == 0 && maxLen > 0 {
+		result = make([]*Value, maxLen)
+	}
+	for i := 0; i < maxLen && i < len(result); i++ {
+		callArgs := make([]*Value, 0, len(lists))
+		for _, l := range lists {
+			if i < len(l) {
+				callArgs = append(callArgs, l[i])
+			}
+		}
+		val, err := callFnOnSeq(fn, callArgs, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = val
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinMap(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("map: need result-type, function and sequences")
+	}
+	resultType := primaryValue(args[0])
+	fn := args[1]
+	seqs := args[2:]
+	if len(seqs) == 0 {
+		return nil, fmt.Errorf("map: need at least one sequence")
+	}
+	for _, s := range seqs {
+		if err := checkSequenceArg(s, "map"); err != nil {
+			return nil, err
+		}
+	}
+	lists := make([][]*Value, len(seqs))
+	for i, s := range seqs {
+		lists[i] = seqToList(s)
+	}
+	maxLen := 0
+	for _, l := range lists {
+		if len(l) > maxLen {
+			maxLen = len(l)
+		}
+	}
+	var result []*Value
+	for i := 0; i < maxLen; i++ {
+		callArgs := make([]*Value, 0, len(lists))
+		for _, l := range lists {
+			if i < len(l) {
+				callArgs = append(callArgs, l[i])
+			}
+		}
+		val, err := callFnOnSeq(fn, callArgs, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, val)
+	}
+	// Convert based on result-type
+	if isNil(resultType) || (resultType.typ == VSym && resultType.str == "nil") {
+		return vnil(), nil
+	}
+	if resultType.typ != VSym {
+		return nil, fmt.Errorf("map: result-type must be a symbol, got %v", resultType)
+	}
+	switch resultType.str {
+	case "list", "cons":
+		return listFromSlice(result), nil
+	case "vector":
+		av := gcv()
+		av.typ = VArray
+		av.array = &LispArray{dims: []int{len(result)}, elements: result, fillPtr: -1}
+		return av, nil
+	case "string":
+		var sb strings.Builder
+		for _, v := range result {
+			if v.typ == VChar {
+				sb.WriteRune(v.ch)
+			} else {
+				sb.WriteString(toString(primaryValue(v)))
+			}
+		}
+		return vstr(sb.String()), nil
+	default:
+		return nil, fmt.Errorf("map: unsupported result-type: %s", resultType.str)
+	}
+}
+
+func builtinRevappend(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("revappend: need two lists")
+	}
+	list1 := seqToList(args[0])
+	list2 := seqToList(args[1])
+	// Reverse list1 and append list2
+	for i, j := 0, len(list1)-1; i < j; i, j = i+1, j-1 {
+		list1[i], list1[j] = list1[j], list1[i]
+	}
+	result := make([]*Value, len(list1)+len(list2))
+	copy(result, list1)
+	copy(result[len(list1):], list2)
+	return listFromSlice(result), nil
+}
+
+func builtinLdiff(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("ldiff: need two lists")
+	}
+	list := args[0]
+	obj := args[1]
+	var result []*Value
+	seen := make(map[*Value]bool)
+	for !isNil(list) && list.typ == VPair {
+		if seen[list] {
+			break
+		}
+		seen[list] = true
+		if list == obj {
+			break
+		}
+		result = append(result, list.car)
+		list = list.cdr
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinTailp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(false), nil
+	}
+	sublist := args[0]
+	list := args[1]
+	seen := make(map[*Value]bool)
+	for !isNil(list) && list.typ == VPair {
+		if seen[list] {
+			break
+		}
+		seen[list] = true
+		if list == sublist {
+			return vbool(true), nil
+		}
+		list = list.cdr
+	}
+	return vbool(list == sublist), nil
+}
+
+func builtinNthValue(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("nth-value: need index and form")
+	}
+	n := int(toNum(args[0]))
+	form := args[1]
+	result, err := eval(form, globalEnv)
+	if err != nil {
+		return nil, err
+	}
+	// Get the nth value from a multiple-values result
+	// For simplicity, return the primary value for index 0, nil otherwise
+	if n == 0 {
+		return primaryValue(result), nil
+	}
+	return vnil(), nil
+}
+
+func builtinSome(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("some: need predicate and sequence")
+	}
+	fn := args[0]
+	seqs := args[1:]
+	keyFn, seqs := extractKeyFromRest(seqs)
+	lists := make([][]*Value, len(seqs))
+	for i, s := range seqs {
+		lists[i] = seqToList(s)
+	}
+	maxLen := 0
+	for _, l := range lists {
+		if len(l) > maxLen {
+			maxLen = len(l)
+		}
+	}
+	for i := 0; i < maxLen; i++ {
+		callArgs := make([]*Value, 0, len(lists))
+		for _, l := range lists {
+			if i < len(l) {
+				el := l[i]
+				if keyFn != nil {
+					el, _ = callFnOnSeq(keyFn, []*Value{el}, globalEnv)
+				}
+				callArgs = append(callArgs, el)
+			}
+		}
+		result, err := callFnOnSeq(fn, callArgs, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(result) {
+			return result, nil
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinEvery(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("every: need predicate and sequence")
+	}
+	fn := args[0]
+	seqs := args[1:]
+	keyFn, seqs := extractKeyFromRest(seqs)
+	lists := make([][]*Value, len(seqs))
+	for i, s := range seqs {
+		lists[i] = seqToList(s)
+	}
+	maxLen := 0
+	for _, l := range lists {
+		if len(l) > maxLen {
+			maxLen = len(l)
+		}
+	}
+	for i := 0; i < maxLen; i++ {
+		callArgs := make([]*Value, 0, len(lists))
+		for _, l := range lists {
+			if i < len(l) {
+				el := l[i]
+				if keyFn != nil {
+					el, _ = callFnOnSeq(keyFn, []*Value{el}, globalEnv)
+				}
+				callArgs = append(callArgs, el)
+			}
+		}
+		result, err := callFnOnSeq(fn, callArgs, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		if !isTruthy(result) {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinNotany(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("notany: need predicate and sequence")
+	}
+	fn := args[0]
+	seqs := args[1:]
+	keyFn, seqs := extractKeyFromRest(seqs)
+	lists := make([][]*Value, len(seqs))
+	for i, s := range seqs {
+		lists[i] = seqToList(s)
+	}
+	maxLen := 0
+	for _, l := range lists {
+		if len(l) > maxLen {
+			maxLen = len(l)
+		}
+	}
+	for i := 0; i < maxLen; i++ {
+		callArgs := make([]*Value, 0, len(lists))
+		for _, l := range lists {
+			if i < len(l) {
+				el := l[i]
+				if keyFn != nil {
+					el, _ = callFnOnSeq(keyFn, []*Value{el}, globalEnv)
+				}
+				callArgs = append(callArgs, el)
+			}
+		}
+		result, err := callFnOnSeq(fn, callArgs, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(result) {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinNotevery(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("notevery: need predicate and sequence")
+	}
+	fn := args[0]
+	seqs := args[1:]
+	keyFn, seqs := extractKeyFromRest(seqs)
+	lists := make([][]*Value, len(seqs))
+	for i, s := range seqs {
+		lists[i] = seqToList(s)
+	}
+	maxLen := 0
+	for _, l := range lists {
+		if len(l) > maxLen {
+			maxLen = len(l)
+		}
+	}
+	for i := 0; i < maxLen; i++ {
+		callArgs := make([]*Value, 0, len(lists))
+		for _, l := range lists {
+			if i < len(l) {
+				el := l[i]
+				if keyFn != nil {
+					el, _ = callFnOnSeq(keyFn, []*Value{el}, globalEnv)
+				}
+				callArgs = append(callArgs, el)
+			}
+		}
+		result, err := callFnOnSeq(fn, callArgs, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		if !isTruthy(result) {
+			return vbool(true), nil
+		}
+	}
+	return vbool(false), nil
+}
+
+func builtinNconc(args []*Value) (*Value, error) {
+	// nconc: destructive list concatenation
+	var result, tail *Value
+	for _, arg := range args {
+		if isNil(arg) {
+			continue
+		}
+		list := seqToList(arg)
+		if len(list) == 0 {
+			continue
+		}
+		if isNil(result) {
+			result = listFromSlice(list)
+			tail = result
+		} else {
+			tail.cdr = listFromSlice(list)
+		}
+		// Find new tail with cycle detection
+		seen := make(map[*Value]bool)
+		for !isNil(tail) && tail.typ == VPair && !isNil(tail.cdr) {
+			if seen[tail] {
+				break
+			}
+			seen[tail] = true
+			tail = tail.cdr
+		}
+	}
+	if isNil(result) {
+		return vnil(), nil
+	}
+	return result, nil
+}
+
+func builtinAdjoin(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("adjoin: need item and list")
+	}
+	item := args[0]
+	lst := args[1]
+	// Check if item is already in list
+	elements := seqToList(lst)
+	for _, el := range elements {
+		if eqVal(item, el) {
+			return lst, nil
+		}
+	}
+	return cons(item, lst), nil
+}
+
+func substHelper(new, old, tree *Value) *Value {
+	if eqVal(tree, old) {
+		return new
+	}
+	if tree.typ == VPair {
+		// Cycle detection: use map-based tracking to prevent infinite loops on circular structures
+		visited := make(map[*Value]bool)
+		return substHelperCycle(new, old, tree, visited)
+	}
+	return tree
+}
+
+func substHelperCycle(new, old, tree *Value, visited map[*Value]bool) *Value {
+	if eqVal(tree, old) {
+		return new
+	}
+	if tree.typ != VPair {
+		return tree
+	}
+	if visited[tree] {
+		return tree // cycle detected, stop recursion
+	}
+	visited[tree] = true
+	return cons(substHelperCycle(new, old, tree.car, visited), substHelperCycle(new, old, tree.cdr, visited))
+}
+
+func builtinSubst(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("subst: need new, old, and tree")
+	}
+	return substHelper(args[0], args[1], args[2]), nil
+}
+
+func sublisHelper(alist, tree *Value) *Value {
+	visited := make(map[*Value]bool)
+	return sublisHelperCycle(alist, tree, visited)
+}
+
+func sublisHelperCycle(alist, tree *Value, visited map[*Value]bool) *Value {
+	if tree.typ == VPair {
+		if visited[tree] {
+			return tree // cycle detected
+		}
+		visited[tree] = true
+		// Check if tree itself is a key in alist
+		for cur := alist; !isNil(cur) && cur.typ == VPair; cur = cur.cdr {
+			pair := cur.car
+			if pair.typ == VPair && eqVal(pair.car, tree) {
+				return pair.cdr
+			}
+		}
+		return cons(sublisHelperCycle(alist, tree.car, visited), sublisHelperCycle(alist, tree.cdr, visited))
+	}
+	// For atoms, check alist
+	for cur := alist; !isNil(cur) && cur.typ == VPair; cur = cur.cdr {
+		pair := cur.car
+		if pair.typ == VPair && eqVal(pair.car, tree) {
+			return pair.cdr
+		}
+	}
+	return tree
+}
+
+func builtinSublis(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("sublis: need alist and tree")
+	}
+	return sublisHelper(args[0], args[1]), nil
+}
+
+func builtinTreeEqual(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(false), nil
+	}
+	// Cycle detection to prevent infinite recursion on circular structures
+	visitedA := make(map[*Value]bool)
+	visitedB := make(map[*Value]bool)
+	var teq func(a, b *Value) bool
+	teq = func(a, b *Value) bool {
+		if a == b {
+			return true
+		}
+		if visitedA[a] || visitedB[b] {
+			return true // already compared, assume equal to avoid infinite loop
+		}
+		if a.typ == VPair {
+			visitedA[a] = true
+		}
+		if b.typ == VPair {
+			visitedB[b] = true
+		}
+		if a.typ == VPair && b.typ == VPair {
+			return teq(a.car, b.car) && teq(a.cdr, b.cdr)
+		}
+		if a.typ == VNil && b.typ == VNil {
+			return true
+		}
+		return eqVal(a, b)
+	}
+	return vbool(teq(args[0], args[1])), nil
+}
+
+// -------- subst-if --------
+func builtinSubstIf(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("subst-if: need new, predicate, and tree")
+	}
+	newVal := args[0]
+	pred := args[1]
+	tree := args[2]
+	visited := make(map[*Value]bool)
+	var helper func(t *Value) *Value
+	helper = func(t *Value) *Value {
+		if visited[t] {
+			return t
+		}
+		if t.typ == VPair {
+			visited[t] = true
+		}
+		result, err := callFnOnSeq(pred, []*Value{t}, globalEnv)
+		if err == nil && isTruthy(result) {
+			return newVal
+		}
+		if t.typ == VPair {
+			return cons(helper(t.car), helper(t.cdr))
+		}
+		return t
+	}
+	return helper(tree), nil
+}
+
+// -------- nsubst / nsubst-if / nsublis --------
+func builtinNsubst(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("nsubst: need new, old, and tree")
+	}
+	newVal := args[0]
+	old := args[1]
+	visited := make(map[*Value]bool)
+	var helper func(t *Value) *Value
+	helper = func(t *Value) *Value {
+		if eqVal(t, old) {
+			return newVal
+		}
+		if t.typ == VPair {
+			if visited[t] {
+				return t
+			}
+			visited[t] = true
+			t.car = helper(t.car)
+			t.cdr = helper(t.cdr)
+		}
+		return t
+	}
+	return helper(args[2]), nil
+}
+
+func builtinNsubstIf(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("nsubst-if: need new, predicate, and tree")
+	}
+	newVal := args[0]
+	pred := args[1]
+	visited := make(map[*Value]bool)
+	var helper func(t *Value) *Value
+	helper = func(t *Value) *Value {
+		result, err := callFnOnSeq(pred, []*Value{t}, globalEnv)
+		if err == nil && isTruthy(result) {
+			return newVal
+		}
+		if t.typ == VPair {
+			if visited[t] {
+				return t
+			}
+			visited[t] = true
+			t.car = helper(t.car)
+			t.cdr = helper(t.cdr)
+		}
+		return t
+	}
+	return helper(args[2]), nil
+}
+
+func builtinNsublis(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("nsublis: need alist and tree")
+	}
+	alist := args[0]
+	visited := make(map[*Value]bool)
+	var helper func(t *Value) *Value
+	helper = func(t *Value) *Value {
+		for cur := alist; !isNil(cur) && cur.typ == VPair; cur = cur.cdr {
+			pair := cur.car
+			if pair.typ == VPair && eqVal(pair.car, t) {
+				return pair.cdr
+			}
+		}
+		if t.typ == VPair {
+			if visited[t] {
+				return t
+			}
+			visited[t] = true
+			t.car = helper(t.car)
+			t.cdr = helper(t.cdr)
+		}
+		return t
+	}
+	return helper(args[1]), nil
+}
+
+// -------- multiple-value-list (builtin) --------
+func builtinMultipleValueList(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("multiple-value-list: need a form")
+	}
+	// This is a special form in CL, but as a builtin it receives
+	// already-evaluated args. We need to handle it as a special form.
+	// For now, just return the single value as a list.
+	return list(args[0]), nil
+}
+
+// -------- stable-sort (builtin) --------
+func builtinStableSort(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("stable-sort: need sequence and predicate")
+	}
+	seq := args[0]
+	pred := args[1]
+	keyFn := vnil()
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym && args[i].str == ":key" && i+1 < len(args) {
+			i++
+			keyFn = args[i]
+		}
+	}
+	elems := seqToList(seq)
+	// Insertion sort (stable)
+	for i := 1; i < len(elems); i++ {
+		key := elems[i]
+		var keyVal *Value
+		if !isNil(keyFn) {
+			var err error
+			keyVal, err = callFnOnSeq(keyFn, []*Value{key}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			keyVal = key
+		}
+		j := i - 1
+		for j >= 0 {
+			var jVal *Value
+			if !isNil(keyFn) {
+				var err error
+				jVal, err = callFnOnSeq(keyFn, []*Value{elems[j]}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				jVal = elems[j]
+			}
+			cmp, err := callFnOnSeq(pred, []*Value{keyVal, jVal}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if !isTruthy(cmp) {
+				break
+			}
+			elems[j+1] = elems[j]
+			j--
+		}
+		elems[j+1] = key
+	}
+	if seq.typ == VStr {
+		var sb strings.Builder
+		for _, v := range elems {
+			sb.WriteString(toString(v))
+		}
+		return vstr(sb.String()), nil
+	}
+	return listFromSlice(elems), nil
+}
+
+func builtinUnion(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("union: need two lists")
+	}
+	list1 := seqToList(args[0])
+	list2 := seqToList(args[1])
+	seen := make(map[string]bool)
+	var result []*Value
+	for _, v := range list1 {
+		key := toString(v)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, v)
+		}
+	}
+	for _, v := range list2 {
+		key := toString(v)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, v)
+		}
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinIntersection(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("intersection: need two lists")
+	}
+	list1 := seqToList(args[0])
+	list2 := seqToList(args[1])
+	set2 := make(map[string]bool)
+	for _, v := range list2 {
+		set2[toString(v)] = true
+	}
+	seen := make(map[string]bool)
+	var result []*Value
+	for _, v := range list1 {
+		key := toString(v)
+		if set2[key] && !seen[key] {
+			seen[key] = true
+			result = append(result, v)
+		}
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinSetDifference(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("set-difference: need two lists")
+	}
+	list1 := seqToList(args[0])
+	list2 := seqToList(args[1])
+	set2 := make(map[string]bool)
+	for _, v := range list2 {
+		set2[toString(v)] = true
+	}
+	var result []*Value
+	for _, v := range list1 {
+		if !set2[toString(v)] {
+			result = append(result, v)
+		}
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinSetExclusiveOr(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("set-exclusive-or: need two lists")
+	}
+	list1 := seqToList(args[0])
+	list2 := seqToList(args[1])
+	set1 := make(map[string]bool)
+	set2 := make(map[string]bool)
+	for _, v := range list1 {
+		set1[toString(v)] = true
+	}
+	for _, v := range list2 {
+		set2[toString(v)] = true
+	}
+	var result []*Value
+	for _, v := range list1 {
+		if !set2[toString(v)] {
+			result = append(result, v)
+		}
+	}
+	for _, v := range list2 {
+		if !set1[toString(v)] {
+			result = append(result, v)
+		}
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinNsetExclusiveOr(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("nset-exclusive-or: need two lists")
+	}
+	list1 := seqToList(args[0])
+	list2 := seqToList(args[1])
+	set1 := make(map[string]bool)
+	set2 := make(map[string]bool)
+	for _, v := range list1 {
+		set1[toString(v)] = true
+	}
+	for _, v := range list2 {
+		set2[toString(v)] = true
+	}
+	var result []*Value
+	for _, v := range list1 {
+		if !set2[toString(v)] {
+			result = append(result, v)
+		}
+	}
+	for _, v := range list2 {
+		if !set1[toString(v)] {
+			result = append(result, v)
+		}
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinSubsetp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return vbool(false), nil
+	}
+	list1 := seqToList(args[0])
+	list2 := seqToList(args[1])
+	set2 := make(map[string]bool)
+	for _, v := range list2 {
+		set2[toString(v)] = true
+	}
+	for _, v := range list1 {
+		if !set2[toString(v)] {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinCopyList(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	elems := seqToList(args[0])
+	result := make([]*Value, len(elems))
+	copy(result, elems)
+	return listFromSlice(result), nil
+}
+
+func copyTreeHelper(v *Value) *Value {
+	return copyTreeCycle(v, make(map[*Value]bool))
+}
+
+func copyTreeCycle(v *Value, seen map[*Value]bool) *Value {
+	if v == nil || v.typ != VPair {
+		return v
+	}
+	if seen[v] {
+		// Cycle detected — create a self-referencing pair by returning nil
+		return vnil()
+	}
+	seen[v] = true
+	return cons(copyTreeCycle(v.car, seen), copyTreeCycle(v.cdr, seen))
+}
+
+func builtinCopyTree(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	return copyTreeHelper(args[0]), nil
+}
+
+func builtinListLength(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnum(0), nil
+	}
+	count := 0
+	v := args[0]
+	seen := make(map[*Value]bool)
+	for v != nil && v.typ == VPair {
+		if seen[v] {
+			return nil, fmt.Errorf("list-length: circular list")
+		}
+		seen[v] = true
+		count++
+		v = v.cdr
+	}
+	return vnum(float64(count)), nil
+}
+
+func builtinLast(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	n := 1
+	if len(args) > 1 {
+		n = int(toNum(args[1]))
+	}
+	v := args[0]
+	var elems []*Value
+	seen := make(map[*Value]bool)
+	for v != nil && v.typ == VPair {
+		if seen[v] {
+			return nil, fmt.Errorf("last: circular list")
+		}
+		seen[v] = true
+		elems = append(elems, v)
+		v = v.cdr
+	}
+	if n <= 0 || len(elems) == 0 {
+		return vnil(), nil
+	}
+	if n >= len(elems) {
+		return args[0], nil
+	}
+	return elems[len(elems)-n], nil
+}
+
+func builtinLastPair(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	v := args[0]
+	if v.typ != VPair {
+		return vnil(), nil
+	}
+	seen := make(map[*Value]bool)
+	for v.typ == VPair && !isNil(v.cdr) && v.cdr.typ == VPair {
+		if seen[v] {
+			return nil, fmt.Errorf("last-pair: circular list")
+		}
+		seen[v] = true
+		v = v.cdr
+	}
+	return v, nil
+}
+
+func builtinButlast(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	n := 1
+	if len(args) > 1 {
+		n = int(toNum(args[1]))
+	}
+	elems := seqToList(args[0])
+	if n >= len(elems) {
+		return vnil(), nil
+	}
+	return listFromSlice(elems[:len(elems)-n]), nil
+}
+
+func builtinNbutlast(args []*Value) (*Value, error) {
+	return builtinButlast(args)
+}
+
+func builtinPairlis(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("pairlis: need two lists")
+	}
+	keys := seqToList(args[0])
+	vals := seqToList(args[1])
+	var result []*Value
+	for i := 0; i < len(keys) && i < len(vals); i++ {
+		result = append(result, cons(keys[i], vals[i]))
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinAssocIf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("assoc-if: need predicate and alist")
+	}
+	fn := args[0]
+	alist := args[1]
+	seen := make(map[*Value]bool)
+	for !isNil(alist) && alist.typ == VPair {
+		if seen[alist] {
+			break
+		}
+		seen[alist] = true
+		pair := alist.car
+		if pair.typ == VPair {
+			result, err := callFnOnSeq(fn, []*Value{pair.car}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(result) {
+				return pair, nil
+			}
+		}
+		alist = alist.cdr
+	}
+	return vnil(), nil
+}
+
+func builtinMemberIf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("member-if: need predicate and list")
+	}
+	fn := args[0]
+	lst := args[1]
+	seen := make(map[*Value]bool)
+	for !isNil(lst) && lst.typ == VPair {
+		if seen[lst] {
+			break
+		}
+		seen[lst] = true
+		result, err := callFnOnSeq(fn, []*Value{lst.car}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(result) {
+			return lst, nil
+		}
+		lst = lst.cdr
+	}
+	return vnil(), nil
+}
+
+func builtinMemberIfNot(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("member-if-not: need predicate and list")
+	}
+	fn := args[0]
+	lst := args[1]
+	seen := make(map[*Value]bool)
+	for !isNil(lst) && lst.typ == VPair {
+		if seen[lst] {
+			break
+		}
+		seen[lst] = true
+		result, err := callFnOnSeq(fn, []*Value{lst.car}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		if !isTruthy(result) {
+			return lst, nil
+		}
+		lst = lst.cdr
+	}
+	return vnil(), nil
+}
+
+func builtinAssocIfNot(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("assoc-if-not: need predicate and alist")
+	}
+	fn := args[0]
+	alist := args[1]
+	seen := make(map[*Value]bool)
+	for !isNil(alist) && alist.typ == VPair {
+		if seen[alist] {
+			break
+		}
+		seen[alist] = true
+		pair := alist.car
+		if pair.typ == VPair {
+			result, err := callFnOnSeq(fn, []*Value{pair.car}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if !isTruthy(result) {
+				return pair, nil
+			}
+		}
+		alist = alist.cdr
+	}
+	return vnil(), nil
+}
+
+func builtinRassocIfNot(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("rassoc-if-not: need predicate and alist")
+	}
+	fn := args[0]
+	alist := args[1]
+	cur := alist
+	for cur != nil && cur.typ == VPair {
+		entry := cur.car
+		if entry.typ == VPair {
+			result, err := callFnOnSeq(fn, []*Value{entry.cdr}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if !isTruthy(result) {
+				return entry, nil
+			}
+		}
+		cur = cur.cdr
+	}
+	return vnil(), nil
+}
+
+func builtinMember(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("member: need item and list")
+	}
+	item := args[0]
+	lst := args[1]
+	if lst.typ != VPair && lst.typ != VNil {
+		return nil, fmt.Errorf("member: expected a proper list")
+	}
+	keyFn, testFn, _, _, _, _, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[*Value]bool)
+	for !isNil(lst) && lst.typ == VPair {
+		if seen[lst] {
+			break
+		}
+		seen[lst] = true
+		el := lst.car
+		compareVal := el
+		if !isNil(keyFn) {
+			var err error
+			compareVal, err = callFnOnSeq(keyFn, []*Value{el}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		match := false
+		if !isNil(testFn) {
+			cmp, err := callFnOnSeq(testFn, []*Value{compareVal, item}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			match = isTruthy(cmp)
+		} else {
+			match = eqVal(compareVal, item)
+		}
+		if match {
+			return lst, nil
+		}
+		lst = lst.cdr
+	}
+	return vnil(), nil
+}
+
+func builtinPosition(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("position: need item and sequence")
+	}
+	item := args[0]
+	seq := args[1]
+	if seq.typ != VStr {
+		if err := checkSequenceArg(seq, "position"); err != nil {
+			return nil, err
+		}
+	}
+	start, end := 0, -1
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":start":
+				if i+1 < len(args) {
+					i++
+					n, e := safeToNum(args[i], "position")
+					if e != nil {
+						return nil, e
+					}
+					start = int(n)
+				}
+			case ":end":
+				if i+1 < len(args) {
+					i++
+					n, e := safeToNum(args[i], "position")
+					if e != nil {
+						return nil, e
+					}
+					end = int(n)
+				}
+			}
+		}
+	}
+	if seq.typ == VStr {
+		s := seq.str
+		runes := []rune(s)
+		var targetCh rune
+		if item.typ == VChar {
+			targetCh = item.ch
+		} else {
+			return vnil(), nil
+		}
+		if end < 0 || end > len(runes) {
+			end = len(runes)
+		}
+		for i := start; i < end; i++ {
+			if runes[i] == targetCh {
+				return vnum(float64(i)), nil
+			}
+		}
+		return vnil(), nil
+	}
+	elems := seqToList(seq)
+	if end < 0 || end > len(elems) {
+		end = len(elems)
+	}
+	for i := start; i < end; i++ {
+		if eqVal(elems[i], item) {
+			return vnum(float64(i)), nil
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinPositionIf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("position-if: need predicate and sequence")
+	}
+	fn := args[0]
+	seq := args[1]
+	elems := seqToList(seq)
+	for i, el := range elems {
+		result, err := callFnOnSeq(fn, []*Value{el}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(result) {
+			return vnum(float64(i)), nil
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinSeqCount(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-count: need item and sequence")
+	}
+	item := args[0]
+	seq := args[1]
+	keyFn, testFn, _, _, start, end, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	cnt := 0
+	for i := start; i < end; i++ {
+		if testItemMatch(item, elements[i], testFn, keyFn) {
+			cnt++
+		}
+	}
+	return vnum(float64(cnt)), nil
+}
+
+func builtinSeqCountIf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-count-if: need predicate and sequence")
+	}
+	pred := args[0]
+	seq := args[1]
+	keyFn, _, _, _, start, end, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	cnt := 0
+	for i := start; i < end; i++ {
+		v := elements[i]
+		if !isNil(keyFn) {
+			var err error
+			v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		cmp, err := callFnOnSeq(pred, []*Value{v}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(cmp) {
+			cnt++
+		}
+	}
+	return vnum(float64(cnt)), nil
+}
+
+func builtinSeqRemove(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-remove: need item and sequence")
+	}
+	item := args[0]
+	seq := args[1]
+	keyFn, testFn, fromEnd, count, start, end, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	var result []*Value
+	removed := 0
+	if fromEnd {
+		// Build from end: collect indices to remove
+		removeSet := map[int]bool{}
+		for i := end - 1; i >= start; i-- {
+			if count >= 0 && removed >= count {
+				break
+			}
+			if testItemMatch(item, elements[i], testFn, keyFn) {
+				removeSet[i] = true
+				removed++
+			}
+		}
+		for i, el := range elements {
+			if !removeSet[i] {
+				result = append(result, el)
+			}
+		}
+	} else {
+		for i, el := range elements {
+			if i >= start && i < end && (count < 0 || removed < count) {
+				if testItemMatch(item, el, testFn, keyFn) {
+					removed++
+					continue
+				}
+			}
+			result = append(result, el)
+		}
+	}
+	return listFromSlice(result), nil
+}
+
+// builtinDelete is the destructive version of remove - it modifies the list in-place
+func builtinDelete(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("delete: need item and sequence")
+	}
+	item := args[0]
+	seq := args[1]
+	if seq.typ == VNil {
+		return seq, nil
+	}
+	if seq.typ != VPair {
+		return nil, fmt.Errorf("delete: expected a list, got %s", typeStr(seq))
+	}
+	keyFn, testFn, fromEnd, count, start, end, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+
+	// Normalize start/end
+	if end < 0 {
+		// Compute length to get real end
+		seen := make(map[*Value]bool)
+		length := 0
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			if seen[cur] {
+				break
+			}
+			seen[cur] = true
+			length++
+			cur = cur.cdr
+		}
+		end = length
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > start {
+		end = start + (end - start)
+	}
+
+	// Destructive in-place deletion by rewiring .cdr pointers
+	var head *Value = seq
+	if fromEnd {
+		// First pass: find indices to remove (count from end)
+			// First pass: find indices to remove (count from end)
+		elements := seqToList(seq)
+		removeSet := map[int]bool{}
+		removed := 0
+		for i := len(elements) - 1; i >= 0; i-- {
+			if count >= 0 && removed >= count {
+				break
+			}
+			if testItemMatch(item, elements[i], testFn, keyFn) {
+				removeSet[i] = true
+				removed++
+			}
+		}
+		// Second pass: rewiring (skip matching elements)
+		// head stays as is; we rewire the tail
+		prev := (*Value)(nil)
+		cur := head
+		i := 0
+		for !isNil(cur) && cur.typ == VPair {
+			if !removeSet[i] {
+				prev = cur
+			} else {
+				if prev == nil {
+					head = cur.cdr
+				} else {
+					prev.cdr = cur.cdr
+				}
+			}
+			cur = cur.cdr
+			i++
+		}
+	} else {
+		// Forward pass: build result list by rewiring .cdr
+		// head may change if first element is removed
+		prev := (*Value)(nil)
+		cur := head
+		i := 0
+		removed := 0
+		for !isNil(cur) && cur.typ == VPair {
+			withinRange := i >= start && (count < 0 || removed < count)
+			if withinRange && testItemMatch(item, cur.car, testFn, keyFn) {
+				// Remove this cell by rewiring prev.cdr
+				if prev == nil {
+					head = cur.cdr
+				} else {
+					prev.cdr = cur.cdr
+				}
+				cur = cur.cdr
+				removed++
+			} else {
+				prev = cur
+				cur = cur.cdr
+			}
+			i++
+		}
+	}
+	return head, nil
+}
+
+// builtinDeleteIf - destructive version of remove-if
+func builtinDeleteIf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("delete-if: need predicate and sequence")
+	}
+	pred := args[0]
+	seq := args[1]
+	if seq.typ == VNil {
+		return seq, nil
+	}
+	if seq.typ != VPair {
+		return nil, fmt.Errorf("delete-if: expected a list, got %s", typeStr(seq))
+	}
+	_, _, _, count, start, end, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	if end < 0 {
+		seen := make(map[*Value]bool)
+		length := 0
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			if seen[cur] { break }
+			seen[cur] = true
+			length++
+			cur = cur.cdr
+		}
+		end = length
+	}
+	if start < 0 { start = 0 }
+	head := seq
+	prev := (*Value)(nil)
+	cur := seq
+	i := 0
+	removed := 0
+	for !isNil(cur) && cur.typ == VPair {
+		match := false
+		if i >= start && i < end && (count < 0 || removed < count) {
+			res, err := eval(list(pred, cur.car), globalEnv)
+			if err == nil && isTruthy(res) {
+				match = true
+				removed++
+			}
+		}
+		if match {
+			if prev == nil {
+				head = cur.cdr
+			} else {
+				prev.cdr = cur.cdr
+			}
+			cur = cur.cdr
+		} else {
+			prev = cur
+			cur = cur.cdr
+		}
+		i++
+	}
+	return head, nil
+}
+
+// builtinDeleteIfNot - destructive version of remove-if-not
+func builtinDeleteIfNot(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("delete-if-not: need predicate and sequence")
+	}
+	pred := args[0]
+	seq := args[1]
+	if seq.typ == VNil {
+		return seq, nil
+	}
+	if seq.typ != VPair {
+		return nil, fmt.Errorf("delete-if-not: expected a list, got %s", typeStr(seq))
+	}
+	negPred := &Value{typ: VFunc, params: []string{"x"}, body: list(list(vsym("not"), list(pred, vsym("x")))), env: globalEnv}
+	newArgs := []*Value{negPred, seq}
+	newArgs = append(newArgs, args[2:]...)
+	return builtinDeleteIf(newArgs)
+}
+
+// builtinDeleteDuplicates - destructive version of remove-duplicates
+func builtinDeleteDuplicates(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("delete-duplicates: need sequence")
+	}
+	seq := args[0]
+	if seq.typ == VNil {
+		return seq, nil
+	}
+	if seq.typ != VPair {
+		return nil, fmt.Errorf("delete-duplicates: expected a list, got %s", typeStr(seq))
+	}
+	keyFn, _, _, _, start, end, _, err := seqParseKeys(args, 1)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[*Value]bool)
+	head := seq
+	prev := (*Value)(nil)
+	cur := seq
+	i := 0
+	for !isNil(cur) && cur.typ == VPair {
+		withinRange := i >= start && (end < 0 || i < end)
+		if withinRange {
+			key := cur.car
+			if !isNil(keyFn) {
+				key, _ = eval(list(keyFn, key), globalEnv)
+			}
+			if seen[key] {
+				// duplicate: remove by rewiring
+				if prev == nil {
+					head = cur.cdr
+				} else {
+					prev.cdr = cur.cdr
+				}
+				cur = cur.cdr
+			} else {
+				seen[key] = true
+				prev = cur
+				cur = cur.cdr
+			}
+		} else {
+			prev = cur
+			cur = cur.cdr
+		}
+		i++
+	}
+	return head, nil
+}
+
+// builtinNsubstituteIf - destructive version of substitute-if
+func builtinNsubstituteIf(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("nsubstitute-if: need new, predicate, and sequence")
+	}
+	newVal := args[0]
+	pred := args[1]
+	seq := args[2]
+		_, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+	if err != nil {
+		return nil, err
+	}
+	if end < 0 {
+		seen := make(map[*Value]bool)
+		length := 0
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			if seen[cur] { break }
+			seen[cur] = true
+			length++
+			cur = cur.cdr
+		}
+		end = length
+	}
+	if start < 0 { start = 0 }
+	replaced := 0
+	if fromEnd {
+		var elements []*Value
+		var cellPtrs []*Value
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			elements = append(elements, cur.car)
+			cellPtrs = append(cellPtrs, cur)
+			cur = cur.cdr
+		}
+		for i := len(elements) - 1; i >= start && i < end; i-- {
+			if count >= 0 && replaced >= count { break }
+			predVal, perr := eval(list(pred, elements[i]), globalEnv)
+			if perr == nil && isTruthy(predVal) {
+				cellPtrs[i].car = newVal
+				replaced++
+			}
+		}
+	} else {
+		i := 0
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			if i >= start && i < end && (count < 0 || replaced < count) {
+				predVal, perr := eval(list(pred, cur.car), globalEnv)
+				if perr == nil && isTruthy(predVal) {
+					cur.car = newVal
+					replaced++
+				}
+			}
+			i++
+			cur = cur.cdr
+		}
+	}
+	return seq, nil
+}
+
+func builtinSeqRemoveDuplicates(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("seq-remove-duplicates: need sequence")
+	}
+	seq := args[0]
+	keyFn, testFn, fromEnd, _, start, end, _, err := seqParseKeys(args, 1)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	// Track seen indices
+	seen := map[int]bool{}
+	dupSet := map[int]bool{}
+	if fromEnd {
+		for i := end - 1; i >= start; i-- {
+			if seen[i] {
+				continue
+			}
+			for j := i - 1; j >= start; j-- {
+				if dupSet[j] {
+					continue
+				}
+				if testItemMatch(elements[i], elements[j], testFn, keyFn) {
+					dupSet[j] = true
+				}
+			}
+			seen[i] = true
+		}
+	} else {
+		for i := start; i < end; i++ {
+			if seen[i] {
+				continue
+			}
+			for j := i + 1; j < end; j++ {
+				if dupSet[j] {
+					continue
+				}
+				if testItemMatch(elements[i], elements[j], testFn, keyFn) {
+					dupSet[j] = true
+				}
+			}
+			seen[i] = true
+		}
+	}
+	var result []*Value
+	for i, el := range elements {
+		if !dupSet[i] {
+			result = append(result, el)
+		}
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinSeqFindIf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-find-if: need predicate and sequence")
+	}
+	pred := args[0]
+	seq := args[1]
+	keyFn, _, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	if fromEnd {
+		for i := end - 1; i >= start; i-- {
+			v := elements[i]
+			if !isNil(keyFn) {
+				var err error
+				v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			cmp, err := callFnOnSeq(pred, []*Value{v}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(cmp) {
+				return elements[i], nil
+			}
+		}
+	} else {
+		for i := start; i < end; i++ {
+			v := elements[i]
+			if !isNil(keyFn) {
+				var err error
+				v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			cmp, err := callFnOnSeq(pred, []*Value{v}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(cmp) {
+				return elements[i], nil
+			}
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinSeqPositionIf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-position-if: need predicate and sequence")
+	}
+	pred := args[0]
+	seq := args[1]
+	keyFn, _, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	if fromEnd {
+		for i := end - 1; i >= start; i-- {
+			v := elements[i]
+			if !isNil(keyFn) {
+				var err error
+				v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			cmp, err := callFnOnSeq(pred, []*Value{v}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(cmp) {
+				return vnum(float64(i)), nil
+			}
+		}
+	} else {
+		for i := start; i < end; i++ {
+			v := elements[i]
+			if !isNil(keyFn) {
+				var err error
+				v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			cmp, err := callFnOnSeq(pred, []*Value{v}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(cmp) {
+				return vnum(float64(i)), nil
+			}
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinSeqRemoveIfNot(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-remove-if-not: need predicate and sequence")
+	}
+	negPred := &Value{typ: VFunc, params: []string{"x"}, body: list(list(vsym("not"), list(args[0], vsym("x")))), env: globalEnv}
+	newArgs := append([]*Value{negPred}, args[1:]...)
+	return builtinSeqRemoveIf(newArgs)
+}
+
+func builtinSeqCountIfNot(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-count-if-not: need predicate and sequence")
+	}
+	negPred := &Value{typ: VFunc, params: []string{"x"}, body: list(list(vsym("not"), list(args[0], vsym("x")))), env: globalEnv}
+	newArgs := append([]*Value{negPred}, args[1:]...)
+	return builtinSeqCountIf(newArgs)
+}
+
+func builtinSeqFindIfNot(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-find-if-not: need predicate and sequence")
+	}
+	negPred := &Value{typ: VFunc, params: []string{"x"}, body: list(list(vsym("not"), list(args[0], vsym("x")))), env: globalEnv}
+	newArgs := append([]*Value{negPred}, args[1:]...)
+	return builtinSeqFindIf(newArgs)
+}
+
+func builtinSeqPositionIfNot(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("seq-position-if-not: need predicate and sequence")
+	}
+	negPred := &Value{typ: VFunc, params: []string{"x"}, body: list(list(vsym("not"), list(args[0], vsym("x")))), env: globalEnv}
+	newArgs := append([]*Value{negPred}, args[1:]...)
+	return builtinSeqPositionIf(newArgs)
+}
+
+func builtinSeqSubstituteIf(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("seq-substitute-if: need new, predicate, and sequence")
+	}
+	newVal := args[0]
+	pred := args[1]
+	seq := args[2]
+	keyFn, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	result := make([]*Value, len(elements))
+	copy(result, elements)
+	replaced := 0
+	if fromEnd {
+		for i := end - 1; i >= start; i-- {
+			if count >= 0 && replaced >= count {
+				break
+			}
+			v := elements[i]
+			if !isNil(keyFn) {
+				var err error
+				v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			cmp, err := callFnOnSeq(pred, []*Value{v}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(cmp) {
+				result[i] = newVal
+				replaced++
+			}
+		}
+	} else {
+		for i := start; i < end; i++ {
+			if count >= 0 && replaced >= count {
+				break
+			}
+			v := elements[i]
+			if !isNil(keyFn) {
+				var err error
+				v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			cmp, err := callFnOnSeq(pred, []*Value{v}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(cmp) {
+				result[i] = newVal
+				replaced++
+			}
+		}
+	}
+	return listFromSlice(result), nil
+}
+
+// builtinNsubstitute is the destructive version - modifies the list in-place
+func builtinNsubstitute(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("nsubstitute: need new, old, and sequence")
+	}
+	newVal := args[0]
+	oldVal := args[1]
+	seq := args[2]
+	keyFn, testFn, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+	if err != nil {
+		return nil, err
+	}
+
+	// Normalize end
+	if end < 0 {
+		seen := make(map[*Value]bool)
+		length := 0
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			if seen[cur] { break }
+			seen[cur] = true
+			length++
+			cur = cur.cdr
+		}
+		end = length
+	}
+	if start < 0 { start = 0 }
+
+	// Destructive: modify .car of matching cells in-place
+	replaced := 0
+	if fromEnd {
+		// First, build index of elements
+		seen := make(map[*Value]bool)
+		var elements []*Value
+		var cellPtrs []*Value
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			if seen[cur] { break }
+			seen[cur] = true
+			elements = append(elements, cur.car)
+			cellPtrs = append(cellPtrs, cur)
+			cur = cur.cdr
+		}
+		for i := len(elements) - 1; i >= start && i < end; i-- {
+			if count >= 0 && replaced >= count { break }
+			if testItemMatch(oldVal, elements[i], testFn, keyFn) {
+				cellPtrs[i].car = newVal
+				replaced++
+			}
+		}
+	} else {
+		i := 0
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			if i >= start && i < end && (count < 0 || replaced < count) {
+				if testItemMatch(oldVal, cur.car, testFn, keyFn) {
+					cur.car = newVal
+					replaced++
+				}
+			}
+			i++
+			cur = cur.cdr
+		}
+	}
+	return seq, nil
+}
+
+func builtinSeqSubstituteIfNot(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("seq-substitute-if-not: need new, predicate, and sequence")
+	}
+	negPred := &Value{typ: VFunc, params: []string{"x"}, body: list(list(vsym("not"), list(args[1], vsym("x")))), env: globalEnv}
+	newArgs := []*Value{args[0], negPred, args[2]}
+	newArgs = append(newArgs, args[3:]...)
+	return builtinSeqSubstituteIf(newArgs)
+}
+
+func builtinSeqMerge(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("seq-merge: need two sequences and a predicate")
+	}
+	seq1 := args[0]
+	seq2 := args[1]
+	pred := args[2]
+	a := seqToList(seq1)
+	b := seqToList(seq2)
+	var result []*Value
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		cmp, err := callFnOnSeq(pred, []*Value{a[i], b[j]}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(cmp) {
+			result = append(result, a[i])
+			i++
+		} else {
+			result = append(result, b[j])
+			j++
+		}
+	}
+	for ; i < len(a); i++ {
+		result = append(result, a[i])
+	}
+	for ; j < len(b); j++ {
+		result = append(result, b[j])
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinSeqFill(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("fill: need sequence and item")
+	}
+	seq := args[0]
+	item := args[1]
+	start := 0
+	end := -1
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":start":
+				if i+1 < len(args) {
+					i++
+					start = int(toNum(args[i]))
+				}
+			case ":end":
+				if i+1 < len(args) {
+					i++
+					end = int(toNum(args[i]))
+				}
+			}
+		}
+	}
+	if seq.typ == VStr {
+		s := seq.str
+		if end < 0 || end > len(s) {
+			end = len(s)
+		}
+		if start < 0 {
+			start = 0
+		}
+		c := " "
+		if item.typ == VStr && len(item.str) > 0 {
+			c = item.str[:1]
+		} else if item.typ == VChar {
+			c = string(item.ch)
+		}
+		result := s[:start] + strings.Repeat(c, end-start) + s[end:]
+		return vstr(result), nil
+	}
+	elements := seqToList(seq)
+	if end < 0 || end > len(elements) {
+		end = len(elements)
+	}
+	if start < 0 {
+		start = 0
+	}
+	result := make([]*Value, len(elements))
+	copy(result, elements)
+	for i := start; i < end; i++ {
+		result[i] = item
+	}
+	return listFromSlice(result), nil
+}
+
+func builtinSeqReplace(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("replace: need destination and source sequences")
+	}
+	dest := seqToList(args[0])
+	src := seqToList(args[1])
+	start1 := 0
+	end1 := len(dest)
+	start2 := 0
+	end2 := len(src)
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":start1":
+				if i+1 < len(args) {
+					i++
+					start1 = int(toNum(args[i]))
+				}
+			case ":end1":
+				if i+1 < len(args) {
+					i++
+					end1 = int(toNum(args[i]))
+				}
+			case ":start2":
+				if i+1 < len(args) {
+					i++
+					start2 = int(toNum(args[i]))
+				}
+			case ":end2":
+				if i+1 < len(args) {
+					i++
+					end2 = int(toNum(args[i]))
+				}
+			}
+		}
+	}
+	result := make([]*Value, len(dest))
+	copy(result, dest)
+	j := start2
+	for i := start1; i < end1 && j < end2; i++ {
+		result[i] = src[j]
+		j++
+	}
+	return listFromSlice(result), nil
+}
+
+// -------- Additional CL sequence/string functions --------
+func builtinSeqSearch(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("search: need two sequences")
+	}
+	seq1 := args[0]
+	seq2 := args[1]
+	pred := vnil()
+	start1, end1, start2, end2 := 0, -1, 0, -1
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":test":
+				if i+1 < len(args) {
+					i++
+					pred = args[i]
+				}
+			case ":start1":
+				if i+1 < len(args) {
+					i++
+					start1 = int(toNum(args[i]))
+				}
+			case ":end1":
+				if i+1 < len(args) {
+					i++
+					end1 = int(toNum(args[i]))
+				}
+			case ":start2":
+				if i+1 < len(args) {
+					i++
+					start2 = int(toNum(args[i]))
+				}
+			case ":end2":
+				if i+1 < len(args) {
+					i++
+					end2 = int(toNum(args[i]))
+				}
+			}
+		}
+	}
+	s1 := seqToList(seq1)
+	s2 := seqToList(seq2)
+	if end1 < 0 || end1 > len(s1) {
+		end1 = len(s1)
+	}
+	if end2 < 0 || end2 > len(s2) {
+		end2 = len(s2)
+	}
+	slen := end1 - start1
+	if slen <= 0 {
+		return vnil(), nil
+	}
+	for i := start2; i <= end2-slen; i++ {
+		match := true
+		for j := 0; j < slen; j++ {
+			if pred.typ != VNil {
+				cmp, err := callFnOnSeq(pred, []*Value{s1[start1+j], s2[i+j]}, globalEnv)
+				if err != nil || !isTruthy(cmp) {
+					match = false
+					break
+				}
+			} else {
+				if !eqVal(s1[start1+j], s2[i+j]) {
+					match = false
+					break
+				}
+			}
+		}
+		if match {
+			return vnum(float64(i)), nil
+		}
+	}
+	return vnil(), nil
+}
+
+func builtinSeqCopySeq(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("copy-seq: need sequence")
+	}
+	seq := args[0]
+	if seq.typ == VStr {
+		return vstr(seq.str), nil
+	}
+	elems := seqToList(seq)
+	result := make([]*Value, len(elems))
+	copy(result, elems)
+	return listFromSlice(result), nil
+}
+
+func builtinSeqNReverse(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("nreverse: need sequence")
+	}
+	seq := args[0]
+	if seq.typ == VStr {
+		runes := []rune(seq.str)
+		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+			runes[i], runes[j] = runes[j], runes[i]
+		}
+		return vstr(string(runes)), nil
+	}
+	elems := seqToList(seq)
+	for i, j := 0, len(elems)-1; i < j; i, j = i+1, j-1 {
+		elems[i], elems[j] = elems[j], elems[i]
+	}
+	return listFromSlice(elems), nil
+}
+
+func builtinStringTrim(args []*Value) (*Value, error) {
+	// CL: (string-trim char-bag string)
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-trim: need char-bag and string")
+	}
+	if args[1].typ != VStr {
+		return nil, fmt.Errorf("string-trim: second argument must be a string")
+	}
+	s := args[1].str
+	cSeq := seqToList(args[0])
+	var cb strings.Builder
+	for _, v := range cSeq {
+		if v.typ == VStr {
+			cb.WriteString(v.str)
+		} else if v.typ == VChar {
+			cb.WriteRune(v.ch)
+		}
+	}
+	chars := cb.String()
+	if len(chars) == 0 {
+		chars = " \t\n\r"
+	}
+	charSet := make(map[rune]bool)
+	for _, r := range chars {
+		charSet[r] = true
+	}
+	runes := []rune(s)
+	start := 0
+	for _, r := range runes {
+		if charSet[r] {
+			start++
+		} else {
+			break
+		}
+	}
+	end := len(runes)
+	for i := len(runes) - 1; i >= 0; i-- {
+		if charSet[runes[i]] {
+			end = i
+		} else {
+			break
+		}
+	}
+	if start >= end {
+		return vstr(""), nil
+	}
+	return vstr(string(runes[start:end])), nil
+}
+
+func builtinStringLeftTrim(args []*Value) (*Value, error) {
+	// CL: (string-left-trim char-bag string)
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-left-trim: need char-bag and string")
+	}
+	if args[1].typ != VStr {
+		return nil, fmt.Errorf("string-left-trim: second argument must be a string")
+	}
+	s := args[1].str
+	cSeq := seqToList(args[0])
+	var cb strings.Builder
+	for _, v := range cSeq {
+		if v.typ == VStr {
+			cb.WriteString(v.str)
+		} else if v.typ == VChar {
+			cb.WriteRune(v.ch)
+		}
+	}
+	chars := cb.String()
+	if len(chars) == 0 {
+		chars = " \t\n\r"
+	}
+	charSet := make(map[rune]bool)
+	for _, r := range chars {
+		charSet[r] = true
+	}
+	runes := []rune(s)
+	start := 0
+	for _, r := range runes {
+		if charSet[r] {
+			start++
+		} else {
+			break
+		}
+	}
+	return vstr(string(runes[start:])), nil
+}
+
+func builtinStringRightTrim(args []*Value) (*Value, error) {
+	// CL: (string-right-trim char-bag string)
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-right-trim: need char-bag and string")
+	}
+	if args[1].typ != VStr {
+		return nil, fmt.Errorf("string-right-trim: second argument must be a string")
+	}
+	s := args[1].str
+	cSeq := seqToList(args[0])
+	var cb strings.Builder
+	for _, v := range cSeq {
+		if v.typ == VStr {
+			cb.WriteString(v.str)
+		} else if v.typ == VChar {
+			cb.WriteRune(v.ch)
+		}
+	}
+	chars := cb.String()
+	if len(chars) == 0 {
+		chars = " \t\n\r"
+	}
+	charSet := make(map[rune]bool)
+	for _, r := range chars {
+		charSet[r] = true
+	}
+	runes := []rune(s)
+	end := len(runes)
+	for i := len(runes) - 1; i >= 0; i-- {
+		if charSet[runes[i]] {
+			end = i
+		} else {
+			break
+		}
+	}
+	return vstr(string(runes[:end])), nil
+}
+
+func builtinStrCapitalize(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VStr {
+		return nil, fmt.Errorf("string-capitalize: expected string")
+	}
+	s := args[0].str
+	var result strings.Builder
+	prevAlpha := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			if !prevAlpha {
+				result.WriteRune(unicode.ToUpper(r))
+			} else {
+				result.WriteRune(unicode.ToLower(r))
+			}
+			prevAlpha = true
+		} else {
+			result.WriteRune(r)
+			prevAlpha = false
+		}
+	}
+	return vstr(result.String()), nil
+}
+
+// checkStringArg returns the string value or an error for string comparison builtins.
+func checkStringArg(v *Value, funcName string) (string, error) {
+	v = primaryValue(v)
+	if v.typ != VStr {
+		return "", fmt.Errorf("%s: expected a string", funcName)
+	}
+	return v.str, nil
+}
+
+func builtinStrEqual(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string=: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string=")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string=")
+	if err != nil {
+		return nil, err
+	}
+	return vbool(s1 == s2), nil
+}
+
+func builtinStrLess(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string<: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string<")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string<")
+	if err != nil {
+		return nil, err
+	}
+	runes1 := []rune(s1)
+	runes2 := []rune(s2)
+	for i := 0; i < len(runes1) && i < len(runes2); i++ {
+		if runes1[i] < runes2[i] {
+			return vnum(float64(i)), nil
+		}
+		if runes1[i] > runes2[i] {
+			return vnil(), nil
+		}
+	}
+	if len(runes1) < len(runes2) {
+		return vnum(float64(len(runes1))), nil
+	}
+	return vnil(), nil
+}
+
+func builtinIdentity(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("identity: need argument")
+	}
+	return args[0], nil
+}
+
+func builtinComplement(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("complement: need function")
+	}
+	fn := args[0]
+	if fn.typ != VPrim && fn.typ != VFunc {
+		return nil, fmt.Errorf("complement: first argument must be a function")
+	}
+	// Return a VPrim that calls the original function and returns its logical NOT
+	return &Value{typ: VPrim, fn: func(innerArgs []*Value) (*Value, error) {
+		var result *Value
+		var err error
+		switch fn.typ {
+		case VPrim:
+			result, err = fn.fn(innerArgs)
+		case VFunc:
+			newEnv := NewEnv(fn.env)
+			for i, p := range fn.params {
+				if i < len(innerArgs) {
+					newEnv.Set(p, innerArgs[i])
+				} else {
+					newEnv.Set(p, vnil())
+				}
+			}
+			if fn.rest != "" {
+				newEnv.Set(fn.rest, listFromSlice(innerArgs[len(fn.params):]))
+			}
+			body := fn.body
+			if isNil(body) {
+				return vbool(true), nil // not(nil) = true
+			}
+			for body.typ == VPair && !isNil(body.cdr) {
+				_, e := eval(body.car, newEnv)
+				if e != nil {
+					return nil, e
+				}
+				body = body.cdr
+			}
+			result, err = eval(body.car, newEnv)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return vbool(!isTruthy(result)), nil
+	}}, nil
+}
+
+func builtinConstantly(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("constantly: need at least one argument")
+	}
+	constVal := args[0]
+	// Return a function that ignores its args and returns constVal
+	return &Value{typ: VFunc, params: []string{},
+		body: list(list(vsym("quote"), constVal)), env: globalEnv}, nil
+}
+
+// -------- parse-integer --------
+
+// -------- getf --------
+func builtinGetf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("getf: need plist and indicator")
+	}
+	plist := args[0]
+	indicator := args[1]
+	defaultVal := vnil()
+	if len(args) >= 3 {
+		defaultVal = args[2]
+	}
+	cur := plist
+	for cur != nil && cur.typ == VPair {
+		key := cur.car
+		if cur.cdr != nil && cur.cdr.typ == VPair {
+			val := cur.cdr.car
+			if eqVal(key, indicator) {
+				return val, nil
+			}
+			cur = cur.cdr.cdr
+		} else {
+			break
+		}
+	}
+	return defaultVal, nil
+}
+
+// -------- get-properties --------
+func builtinGetProperties(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("get-properties: need plist and indicator-list")
+	}
+	plist := args[0]
+	indicators := seqToList(args[1])
+	cur := plist
+	for cur != nil && cur.typ == VPair {
+		key := cur.car
+		if cur.cdr != nil && cur.cdr.typ == VPair {
+			val := cur.cdr.car
+			for _, ind := range indicators {
+				if eqVal(key, ind) {
+					return list(val, key, cur), nil
+				}
+			}
+			cur = cur.cdr.cdr
+		} else {
+			break
+		}
+	}
+	return list(vnil(), vnil(), vnil()), nil
+}
+
+// -------- remf --------
+func builtinRemf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("remf: need plist and indicator")
+	}
+	plist := args[0]
+	indicator := args[1]
+	// Find and remove the indicator/value pair
+	elems := seqToList(plist)
+	result := make([]*Value, 0)
+	i := 0
+	for i < len(elems)-1 {
+		if eqVal(elems[i], indicator) {
+			i += 2 // skip key and value
+			continue
+		}
+		result = append(result, elems[i], elems[i+1])
+		i += 2
+	}
+	return listFromSlice(result), nil
+}
+
+// -------- make-string --------
+func builtinMakeString(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("make-string: need size")
+	}
+	size := int(toNum(args[0]))
+	initChar := ' '
+	for i := 1; i < len(args); i++ {
+		if args[i].typ == VSym && args[i].str == ":initial-element" {
+			if i+1 < len(args) {
+				i++
+				c := args[i]
+				if c.typ == VChar {
+					initChar = c.ch
+				} else if c.typ == VStr && len(c.str) > 0 {
+					initChar = []rune(c.str)[0]
+				}
+			}
+		}
+	}
+	if size <= 0 {
+		return vstr(""), nil
+	}
+	runes := make([]rune, size)
+	for i := range runes {
+		runes[i] = initChar
+	}
+	return vstr(string(runes)), nil
+}
+
+// -------- make-list --------
+func builtinMakeList(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("make-list: need size")
+	}
+	size := int(toNum(args[0]))
+	initVal := vnil()
+	for i := 1; i < len(args); i++ {
+		if args[i].typ == VSym && args[i].str == ":initial-element" {
+			if i+1 < len(args) {
+				i++
+				initVal = args[i]
+			}
+		}
+	}
+	result := make([]*Value, size)
+	for i := range result {
+		result[i] = initVal
+	}
+	return listFromSlice(result), nil
+}
+
+// -------- random --------
+func builtinRandom(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("random: need limit")
+	}
+	v := primaryValue(args[0])
+	if v.typ != VNum && v.typ != VBigInt && v.typ != VRat {
+		return nil, fmt.Errorf("random: argument must be a positive integer")
+	}
+	limit := toNum(v)
+	if limit < 1 {
+		return nil, fmt.Errorf("random: limit must be >= 1")
+	}
+	rng := rand.Intn
+	// Check for :random-state keyword arg
+	for i := 1; i+1 < len(args); i++ {
+		if args[i].typ == VSym && args[i].str == ":random-state" && args[i+1].typ == VRandomState {
+			if args[i+1].randState != nil {
+				rng = args[i+1].randState.Intn
+			}
+			break
+		}
+	}
+	return vnum(float64(rng(int(limit)))), nil
+}
+
+func builtinNStringUpcase(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VStr {
+		return nil, fmt.Errorf("nstring-upcase: need a string")
+	}
+	return vstr(strings.ToUpper(args[0].str)), nil
+}
+
+func builtinNStringDowncase(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VStr {
+		return nil, fmt.Errorf("nstring-downcase: need a string")
+	}
+	return vstr(strings.ToLower(args[0].str)), nil
+}
+
+func builtinNStringCapitalize(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VStr {
+		return nil, fmt.Errorf("nstring-capitalize: need a string")
+	}
+	return vstr(strings.Title(args[0].str)), nil
+}
+
+// -------- string-equal (case-insensitive) --------
+func builtinStrEqualCI(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-equal: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string-equal")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string-equal")
+	if err != nil {
+		return nil, err
+	}
+	return vbool(strings.EqualFold(s1, s2)), nil
+}
+
+// -------- string-not-equal, string-greaterp, string-lessp, etc. --------
+func builtinStringNotEqual(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-not-equal: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string-not-equal")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string-not-equal")
+	if err != nil {
+		return nil, err
+	}
+	if strings.EqualFold(s1, s2) {
+		return vnil(), nil
+	}
+	runes1 := []rune(s1)
+	runes2 := []rune(s2)
+	minLen := len(runes1)
+	if len(runes2) < minLen {
+		minLen = len(runes2)
+	}
+	for i := 0; i < minLen; i++ {
+		if unicode.ToLower(runes1[i]) != unicode.ToLower(runes2[i]) {
+			return vnum(float64(i)), nil
+		}
+	}
+	if len(runes1) != len(runes2) {
+		return vnum(float64(minLen)), nil
+	}
+	return vnil(), nil
+}
+
+func builtinStringGreaterp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-greaterp: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string-greaterp")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string-greaterp")
+	if err != nil {
+		return nil, err
+	}
+	runes1 := []rune(s1)
+	runes2 := []rune(s2)
+	for i := 0; i < len(runes1) && i < len(runes2); i++ {
+		c1 := unicode.ToLower(runes1[i])
+		c2 := unicode.ToLower(runes2[i])
+		if c1 > c2 {
+			return vnum(float64(i)), nil
+		}
+		if c1 < c2 {
+			return vnil(), nil
+		}
+	}
+	if len(runes1) > len(runes2) {
+		return vnum(float64(len(runes2))), nil
+	}
+	return vnil(), nil
+}
+
+func builtinStringLessp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-lessp: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string-lessp")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string-lessp")
+	if err != nil {
+		return nil, err
+	}
+	runes1 := []rune(s1)
+	runes2 := []rune(s2)
+	for i := 0; i < len(runes1) && i < len(runes2); i++ {
+		c1 := unicode.ToLower(runes1[i])
+		c2 := unicode.ToLower(runes2[i])
+		if c1 < c2 {
+			return vnum(float64(i)), nil
+		}
+		if c1 > c2 {
+			return vnil(), nil
+		}
+	}
+	if len(runes1) < len(runes2) {
+		return vnum(float64(len(runes1))), nil
+	}
+	return vnil(), nil
+}
+
+func builtinStringNotGreaterp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-not-greaterp: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string-not-greaterp")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string-not-greaterp")
+	if err != nil {
+		return nil, err
+	}
+	runes1 := []rune(s1)
+	runes2 := []rune(s2)
+	for i := 0; i < len(runes1) && i < len(runes2); i++ {
+		c1 := unicode.ToLower(runes1[i])
+		c2 := unicode.ToLower(runes2[i])
+		if c1 > c2 {
+			return vnil(), nil
+		}
+		if c1 < c2 {
+			return vnum(float64(i)), nil
+		}
+	}
+	if len(runes1) <= len(runes2) {
+		return vnum(float64(len(runes1))), nil
+	}
+	return vnil(), nil
+}
+
+func builtinStringNotLessp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-not-lessp: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string-not-lessp")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string-not-lessp")
+	if err != nil {
+		return nil, err
+	}
+	runes1 := []rune(s1)
+	runes2 := []rune(s2)
+	for i := 0; i < len(runes1) && i < len(runes2); i++ {
+		c1 := unicode.ToLower(runes1[i])
+		c2 := unicode.ToLower(runes2[i])
+		if c1 < c2 {
+			return vnil(), nil
+		}
+		if c1 > c2 {
+			return vnum(float64(i)), nil
+		}
+	}
+	if len(runes1) >= len(runes2) {
+		return vnum(float64(len(runes2))), nil
+	}
+	return vnil(), nil
+}
+
+// -------- write-to-string (already defined above, skip duplicate) --------
+
+// -------- prin1-to-string --------
+func builtinPrin1ToString(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("prin1-to-string: need an object")
+	}
+	return vstr(toString(primaryValue(args[0]))), nil
+}
+
+// -------- princ-to-string --------
+func builtinPrincToString(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("princ-to-string: need an object")
+	}
+	return vstr(princToString(primaryValue(args[0]))), nil
+}
+
+// -------- string-elt --------
+func builtinStringElt(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string-elt: need string and index")
+	}
+	s, err := checkStringArg(args[0], "string-elt")
+	if err != nil {
+		return nil, err
+	}
+	idx := int(toNum(args[1]))
+	runes := []rune(s)
+	if idx < 0 || idx >= len(runes) {
+		return nil, fmt.Errorf("string-elt: index %d out of bounds", idx)
+	}
+	return vchar(runes[idx]), nil
+}
+
+// -------- nreverse (already exists as builtinSeqNReverse, add alias) --------
+
+// -------- reverse --------
+func builtinReverse(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("reverse: need sequence")
+	}
+	seq := args[0]
+	if err := checkSequenceArg(seq, "reverse"); err != nil {
+		return nil, err
+	}
+	if seq.typ == VStr {
+		runes := []rune(seq.str)
+		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+			runes[i], runes[j] = runes[j], runes[i]
+		}
+		return vstr(string(runes)), nil
+	}
+	elems := seqToList(seq)
+	for i, j := 0, len(elems)-1; i < j; i, j = i+1, j-1 {
+		elems[i], elems[j] = elems[j], elems[i]
+	}
+	return listFromSlice(elems), nil
+}
+
+// -------- acons --------
+func builtinAcons(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("acons: need key, value, and alist")
+	}
+	key := args[0]
+	val := args[1]
+	alist := vnil()
+	if len(args) >= 3 {
+		alist = args[2]
+	}
+	return cons(cons(key, val), alist), nil
+}
+
+// -------- pairlis (already exists) --------
+
+// -------- rassoc --------
+func builtinRassoc(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("rassoc: need item and alist")
+	}
+	item := args[0]
+	alist := args[1]
+	pred := vnil()
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym && args[i].str == ":test" && i+1 < len(args) {
+			i++
+			pred = args[i]
+		}
+	}
+	cur := alist
+	for cur != nil && cur.typ == VPair {
+		entry := cur.car
+		if entry.typ == VPair {
+			if pred.typ != VNil {
+				cmp, err := callFnOnSeq(pred, []*Value{entry.cdr, item}, globalEnv)
+				if err == nil && isTruthy(cmp) {
+					return entry, nil
+				}
+			} else {
+				if eqVal(entry.cdr, item) {
+					return entry, nil
+				}
+			}
+		}
+		cur = cur.cdr
+	}
+	return vnil(), nil
+}
+
+// -------- rassoc-if --------
+func builtinRassocIf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("rassoc-if: need predicate and alist")
+	}
+	fn := args[0]
+	alist := args[1]
+	cur := alist
+	for cur != nil && cur.typ == VPair {
+		entry := cur.car
+		if entry.typ == VPair {
+			result, err := callFnOnSeq(fn, []*Value{entry.cdr}, globalEnv)
+			if err == nil && isTruthy(result) {
+				return entry, nil
+			}
+		}
+		cur = cur.cdr
+	}
+	return vnil(), nil
+}
+
+// -------- nth --------
+func builtinNth(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("nth: need index and list")
+	}
+	n, err := safeToNum(args[0], "nth")
+	if err != nil {
+		return nil, err
+	}
+	lst := args[1]
+	cur := lst
+	for i := 0; i < int(n); i++ {
+		if cur == nil || cur.typ != VPair {
+			return vnil(), nil
+		}
+		cur = cur.cdr
+	}
+	if cur == nil || cur.typ != VPair {
+		return vnil(), nil
+	}
+	return cur.car, nil
+}
+
+// -------- nthcdr --------
+func builtinNthCdr(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("nthcdr: need index and list")
+	}
+	n, err := safeToNum(args[0], "nthcdr")
+	if err != nil {
+		return nil, err
+	}
+	lst := args[1]
+	cur := lst
+	for i := 0; i < int(n); i++ {
+		if cur == nil || cur.typ != VPair {
+			return vnil(), nil
+		}
+		cur = cur.cdr
+	}
+	return cur, nil
+}
+
+// -------- set-difference (already exists) --------
+
+// -------- string= (already exists as builtinStrEqual) --------
+
+// -------- string/= --------
+func builtinStringNotEq(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string/=: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string/=")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string/=")
+	if err != nil {
+		return nil, err
+	}
+	if s1 == s2 {
+		return vnil(), nil
+	}
+	runes1 := []rune(s1)
+	runes2 := []rune(s2)
+	minLen := len(runes1)
+	if len(runes2) < minLen {
+		minLen = len(runes2)
+	}
+	for i := 0; i < minLen; i++ {
+		if runes1[i] != runes2[i] {
+			return vnum(float64(i)), nil
+		}
+	}
+	return vnum(float64(minLen)), nil
+}
+
+func builtinStringGreater(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string>: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string>")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string>")
+	if err != nil {
+		return nil, err
+	}
+	runes1 := []rune(s1)
+	runes2 := []rune(s2)
+	for i := 0; i < len(runes1) && i < len(runes2); i++ {
+		if runes1[i] > runes2[i] {
+			return vnum(float64(i)), nil
+		}
+		if runes1[i] < runes2[i] {
+			return vnil(), nil
+		}
+	}
+	if len(runes1) > len(runes2) {
+		return vnum(float64(len(runes2))), nil
+	}
+	return vnil(), nil
+}
+
+func builtinStringLe(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string<=: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string<=")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string<=")
+	if err != nil {
+		return nil, err
+	}
+	runes1 := []rune(s1)
+	runes2 := []rune(s2)
+	for i := 0; i < len(runes1) && i < len(runes2); i++ {
+		if runes1[i] < runes2[i] {
+			return vnum(float64(i)), nil
+		}
+		if runes1[i] > runes2[i] {
+			return vnil(), nil
+		}
+	}
+	if len(runes1) <= len(runes2) {
+		return vnum(float64(len(runes1))), nil
+	}
+	return vnil(), nil
+}
+
+func builtinStringGe(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("string>=: need two strings")
+	}
+	s1, err := checkStringArg(args[0], "string>=")
+	if err != nil {
+		return nil, err
+	}
+	s2, err := checkStringArg(args[1], "string>=")
+	if err != nil {
+		return nil, err
+	}
+	runes1 := []rune(s1)
+	runes2 := []rune(s2)
+	for i := 0; i < len(runes1) && i < len(runes2); i++ {
+		if runes1[i] > runes2[i] {
+			return vnum(float64(i)), nil
+		}
+		if runes1[i] < runes2[i] {
+			return vnil(), nil
+		}
+	}
+	if len(runes1) >= len(runes2) {
+		return vnum(float64(len(runes2))), nil
+	}
+	return vnil(), nil
+}
+
+// -------- abs --------
+func builtinAbs(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("abs: need a number")
+	}
+	v := args[0]
+	switch v.typ {
+	case VNum:
+		return vnum(math.Abs(v.num)), nil
+	case VRat:
+		n, d := v.irat, v.iden
+		if n < 0 {
+			n = -n
+		}
+		return vrat(n, d), nil
+	case VBigInt:
+		result := new(big.Int).Abs(v.bigInt)
+		return vbigint(result), nil
+	case VComplex:
+		return vnum(math.Hypot(v.num, v.imag)), nil
+	}
+	return nil, fmt.Errorf("abs: not a number")
+}
+
+// -------- max / min --------
+func builtinMax(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("max: need at least one number")
+	}
+	result := args[0]
+	for i := 1; i < len(args); i++ {
+		if compareNumeric(result, args[i]) < 0 {
+			result = args[i]
+		}
+	}
+	// If result is VRat, return as-is; if VBigInt or VNum, return as-is
+	return result, nil
+}
+
+func builtinMin(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("min: need at least one number")
+	}
+	result := args[0]
+	for i := 1; i < len(args); i++ {
+		if compareNumeric(result, args[i]) > 0 {
+			result = args[i]
+		}
+	}
+	return result, nil
+}
+
+// -------- mod / rem --------
+func builtinMod(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("mod: need two numbers")
+	}
+	if isBigIntInt(args) {
+		n := toBigInt(args[0])
+		d := toBigInt(args[1])
+		if n == nil || d == nil {
+			// Fall back to float
+			nf := toNum(args[0])
+			df := toNum(args[1])
+			if df == 0 {
+				return nil, fmt.Errorf("mod: division by zero")
+			}
+			r := math.Mod(nf, df)
+			if r != 0 && (r > 0) != (df > 0) {
+				r += df
+			}
+			return vnum(r), nil
+		}
+		if d.Sign() == 0 {
+			return nil, fmt.Errorf("mod: division by zero")
+		}
+		r := new(big.Int).Mod(n, d)
+		return vbigint(r), nil
+	}
+	n := toNum(args[0])
+	d := toNum(args[1])
+	if d == 0 {
+		return nil, fmt.Errorf("mod: division by zero")
+	}
+	r := math.Mod(n, d)
+	// CL mod: result has same sign as divisor
+	if r != 0 && (r > 0) != (d > 0) {
+		r += d
+	}
+	return vnum(r), nil
+}
+
+func builtinRem(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("rem: need two numbers")
+	}
+	if isBigIntInt(args) {
+		n := toBigInt(args[0])
+		d := toBigInt(args[1])
+		if n == nil || d == nil {
+			nf := toNum(args[0])
+			df := toNum(args[1])
+			if df == 0 {
+				return nil, fmt.Errorf("rem: division by zero")
+			}
+			return vnum(math.Mod(nf, df)), nil
+		}
+		if d.Sign() == 0 {
+			return nil, fmt.Errorf("rem: division by zero")
+		}
+		r := new(big.Int).Rem(n, d)
+		return vbigint(r), nil
+	}
+	n := toNum(args[0])
+	d := toNum(args[1])
+	if d == 0 {
+		return nil, fmt.Errorf("rem: division by zero")
+	}
+	return vnum(math.Mod(n, d)), nil
+}
+
+// -------- floor / ceiling / truncate / round --------
+func builtinFloor(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("floor: need a number")
+	}
+	n := toNum(args[0])
+	f := math.Floor(n)
+	if len(args) >= 2 {
+		div := toNum(args[1])
+		if div == 0 {
+			return nil, fmt.Errorf("floor: division by zero")
+		}
+		q := math.Floor(n / div)
+		r := n - q*div
+		if r != 0 && (r > 0) != (div > 0) {
+			r += div
+		}
+		return list(vnum(q), vnum(r)), nil
+	}
+	return list(vnum(f), vnum(n-f)), nil
+}
+
+func builtinCeiling(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("ceiling: need a number")
+	}
+	n := toNum(args[0])
+	c := math.Ceil(n)
+	if len(args) >= 2 {
+		div := toNum(args[1])
+		if div == 0 {
+			return nil, fmt.Errorf("ceiling: division by zero")
+		}
+		q := math.Ceil(n / div)
+		r := n - q*div
+		return list(vnum(q), vnum(r)), nil
+	}
+	return list(vnum(c), vnum(n-c)), nil
+}
+
+func builtinTruncate(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("truncate: need a number")
+	}
+	n := toNum(args[0])
+	t := math.Trunc(n)
+	if len(args) >= 2 {
+		div := toNum(args[1])
+		if div == 0 {
+			return nil, fmt.Errorf("truncate: division by zero")
+		}
+		q := math.Trunc(n / div)
+		r := n - q*div
+		return list(vnum(q), vnum(r)), nil
+	}
+	return list(vnum(t), vnum(n-t)), nil
+}
+
+func builtinRound(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("round: need a number")
+	}
+	n := toNum(args[0])
+	r := math.Round(n)
+	// Round half to even
+	if diff := math.Abs(n - r); diff == 0.5 {
+		if math.Mod(r, 2) != 0 {
+			if n > 0 {
+				r--
+			} else {
+				r++
+			}
+		}
+	}
+	if len(args) >= 2 {
+		div := toNum(args[1])
+		if div == 0 {
+			return nil, fmt.Errorf("round: division by zero")
+		}
+		q := math.Round(n / div)
+		rem := n - q*div
+		return list(vnum(q), vnum(rem)), nil
+	}
+	return list(vnum(r), vnum(n-r)), nil
+}
+
+// -------- signum --------
+func builtinSignum(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("signum: need a number")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		sign := v.bigInt.Sign()
+		if sign > 0 {
+			return vnum(1), nil
+		}
+		if sign < 0 {
+			return vnum(-1), nil
+		}
+		return vnum(0), nil
+	}
+	n := toNum(args[0])
+	if n > 0 {
+		return vnum(1), nil
+	}
+	if n < 0 {
+		return vnum(-1), nil
+	}
+	return vnum(0), nil
+}
+
+// -------- gcd --------
+func builtinGCD(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return vnum(0), nil
+	}
+	if isBigIntInt(args) {
+		result := new(big.Int)
+		bi := toBigInt(args[0])
+		if bi != nil {
+			result.Abs(bi)
+		} else {
+			result.SetInt64(int64(math.Abs(toNum(args[0]))))
+		}
+		for i := 1; i < len(args); i++ {
+			bi := toBigInt(args[i])
+			n := new(big.Int)
+			if bi != nil {
+				n.Abs(bi)
+			} else {
+				n.SetInt64(int64(math.Abs(toNum(args[i]))))
+			}
+			result.GCD(nil, nil, result, n)
+		}
+		return vbigint(result), nil
+	}
+	result := int64(math.Abs(toNum(args[0])))
+	for i := 1; i < len(args); i++ {
+		n := int64(math.Abs(toNum(args[i])))
+		for n != 0 {
+			result, n = n, result%n
+		}
+	}
+	return vnum(float64(result)), nil
+}
+
+// -------- lcm --------
+func builtinLCM(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return vnum(1), nil
+	}
+	if isBigIntInt(args) {
+		result := new(big.Int)
+		bi := toBigInt(args[0])
+		if bi != nil {
+			result.Abs(bi)
+		} else {
+			result.SetInt64(int64(math.Abs(toNum(args[0]))))
+		}
+		if result.Sign() == 0 {
+			return vnum(0), nil
+		}
+		for i := 1; i < len(args); i++ {
+			bi := toBigInt(args[i])
+			n := new(big.Int)
+			if bi != nil {
+				n.Abs(bi)
+			} else {
+				n.SetInt64(int64(math.Abs(toNum(args[i]))))
+			}
+			if n.Sign() == 0 {
+				return vnum(0), nil
+			}
+			g := new(big.Int).GCD(nil, nil, result, n)
+			result.Mul(result, n)
+			result.Quo(result, g)
+			result.Abs(result)
+		}
+		return vbigint(result), nil
+	}
+	gcd := func(a, b int64) int64 {
+		for b != 0 {
+			a, b = b, a%b
+		}
+		return a
+	}
+	result := int64(math.Abs(toNum(args[0])))
+	if result == 0 {
+		return vnum(0), nil
+	}
+	for i := 1; i < len(args); i++ {
+		n := int64(math.Abs(toNum(args[i])))
+		if n == 0 {
+			return vnum(0), nil
+		}
+		result = result / gcd(result, n) * n
+	}
+	return vnum(float64(result)), nil
+}
+
+// -------- log --------
+func builtinLog(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("log: need a number")
+	}
+	n := toNum(args[0])
+	if n <= 0 {
+		return nil, fmt.Errorf("log: argument must be positive")
+	}
+	if len(args) >= 2 {
+		base := toNum(args[1])
+		if base <= 0 || base == 1 {
+			return nil, fmt.Errorf("log: invalid base")
+		}
+		return vnum(math.Log(n) / math.Log(base)), nil
+	}
+	return vnum(math.Log(n)), nil
+}
+
+// -------- sqrt --------
+func builtinSqrt(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("sqrt: need a number")
+	}
+	n := toNum(args[0])
+	if n < 0 {
+		// Return complex
+		return vcomplex(0, math.Sqrt(-n)), nil
+	}
+	return vnum(math.Sqrt(n)), nil
+}
+
+func toRational(f float64) *Value {
+	const maxDen = 1000000
+	num := int64(math.Round(f * float64(maxDen)))
+	den := int64(maxDen)
+	g := gcd(num, den)
+	num /= g
+	den /= g
+	if den == 1 {
+		return vnum(float64(num))
+	}
+	return vrat(num, den)
+}
+
+func builtinExpt(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("expt: need base and exponent")
+	}
+	base, exp := args[0], args[1]
+	// Check if exponent is an integer
+	expIsInt := (exp.typ == VNum && exp.num == math.Trunc(exp.num)) || exp.typ == VBigInt
+	if !expIsInt {
+		return vnum(math.Pow(toNum(base), toNum(exp))), nil
+	}
+	// Get exponent as int64
+	var e int64
+	if exp.typ == VBigInt {
+		if !exp.bigInt.IsInt64() {
+			return nil, fmt.Errorf("expt: exponent too large")
+		}
+		e = exp.bigInt.Int64()
+	} else {
+		e = int64(exp.num)
+	}
+	if e < 0 {
+		// 1 / base^|e| — return float
+		absE := new(big.Int).Abs(big.NewInt(e))
+		var result *big.Int
+		bi := toBigInt(base)
+		if bi != nil {
+			result = new(big.Int).Exp(bi, absE, nil)
+		} else {
+			result = big.NewInt(int64(toNum(base)))
+			result.Exp(result, absE, nil)
+		}
+		f, _ := new(big.Float).SetInt(result).Float64()
+		return vnum(1.0 / f), nil
+	}
+	if e == 0 {
+		return vnum(1), nil
+	}
+	// Try big.Int exponentiation for integer bases
+	bi := toBigInt(base)
+	if bi != nil {
+		result := new(big.Int).Exp(bi, big.NewInt(e), nil)
+		return vbigint(result), nil
+	}
+	// Non-integer base, integer exponent — use float
+	baseF := toNum(base)
+	if baseF == 0 {
+		return vnum(0), nil
+	}
+	if e == 1 {
+		return vnum(baseF), nil
+	}
+	if e == -1 {
+		return vnum(1 / baseF), nil
+	}
+	return vnum(math.Pow(baseF, float64(e))), nil
+}
+
+// -------- Trig functions --------
+func builtinSin(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("sin: need a number")
+	}
+	n := toNum(args[0])
+	return vnum(float64(math.Sin(n))), nil
+}
+func builtinCos(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("cos: need a number")
+	}
+	n := toNum(args[0])
+	return vnum(float64(math.Cos(n))), nil
+}
+func builtinTan(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("tan: need a number")
+	}
+	n := toNum(args[0])
+	return vnum(float64(math.Tan(n))), nil
+}
+func builtinAtan(args []*Value) (*Value, error) {
+	if len(args) == 1 {
+		n := toNum(args[0])
+		return vnum(float64(math.Atan(n))), nil
+	}
+	// atan2: (atan y x)
+	y := toNum(args[0])
+	x := toNum(args[1])
+	return vnum(float64(math.Atan2(y, x))), nil
+}
+func builtinAtan2(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("atan2: need y and x")
+	}
+	y := toNum(args[0])
+	x := toNum(args[1])
+	return vnum(float64(math.Atan2(y, x))), nil
+}
+func builtinExp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("exp: need a number")
+	}
+	n := toNum(args[0])
+	return vnum(float64(math.Exp(n))), nil
+}
+func builtinSinh(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("sinh: need a number")
+	}
+	n := toNum(args[0])
+	return vnum(float64(math.Sinh(n))), nil
+}
+func builtinCosh(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("cosh: need a number")
+	}
+	n := toNum(args[0])
+	return vnum(float64(math.Cosh(n))), nil
+}
+func builtinTanh(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("tanh: need a number")
+	}
+	n := toNum(args[0])
+	return vnum(float64(math.Tanh(n))), nil
+}
+
+// -------- evenp / oddp --------
+func builtinEvenp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("evenp: need a number")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		return vbool(new(big.Int).Mod(v.bigInt, big.NewInt(2)).Sign() == 0), nil
+	}
+	return vbool(int64(toNum(args[0]))%2 == 0), nil
+}
+
+func builtinOddp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("oddp: need a number")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		return vbool(new(big.Int).Mod(v.bigInt, big.NewInt(2)).Sign() != 0), nil
+	}
+	return vbool(int64(toNum(args[0]))%2 != 0), nil
+}
+
+// -------- plusp / minusp / zerop --------
+func builtinPlusp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("plusp: need a number")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		return vbool(v.bigInt.Sign() > 0), nil
+	}
+	return vbool(toNum(args[0]) > 0), nil
+}
+
+func builtinMinusp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("minusp: need a number")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		return vbool(v.bigInt.Sign() < 0), nil
+	}
+	return vbool(toNum(args[0]) < 0), nil
+}
+
+func builtinZerop(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("zerop: need a number")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		return vbool(v.bigInt.Sign() == 0), nil
+	}
+	return vbool(toNum(args[0]) == 0), nil
+}
+
+// -------- 1+ / 1- --------
+func builtinOnePlus(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("1+: need a number")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		return vbigint(new(big.Int).Add(v.bigInt, big.NewInt(1))), nil
+	}
+	return vnum(toNum(args[0]) + 1), nil
+}
+
+func builtinOneMinus(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("1-: need a number")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		return vbigint(new(big.Int).Sub(v.bigInt, big.NewInt(1))), nil
+	}
+	return vnum(toNum(args[0]) - 1), nil
+}
+
+// -------- incf / decf (implemented as special forms in eval) --------
+
+// -------- digit-char --------
+func builtinDigitChar(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("digit-char: need weight")
+	}
+	weight := int(toNum(args[0]))
+	radix := 10
+	if len(args) >= 2 {
+		radix = int(toNum(args[1]))
+	}
+	if weight < 0 || weight >= radix {
+		return vnil(), nil
+	}
+	if weight < 10 {
+		return vchar(rune('0' + weight)), nil
+	}
+	return vchar(rune('A' + weight - 10)), nil
+}
+
+// -------- digit-char-p --------
+
+// -------- alphanumericp --------
+func builtinAlphanumericp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("alphanumericp: need a character")
+	}
+	var ch rune
+	if args[0].typ == VChar {
+		ch = args[0].ch
+	} else if args[0].typ == VStr && len(args[0].str) > 0 {
+		ch = []rune(args[0].str)[0]
+	} else {
+		return vbool(false), nil
+	}
+	return vbool(unicode.IsLetter(ch) || unicode.IsDigit(ch)), nil
+}
+
+// -------- alpha-char-p --------
+func builtinAlphaCharP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("alpha-char-p: need a character")
+	}
+	var ch rune
+	if args[0].typ == VChar {
+		ch = args[0].ch
+	} else if args[0].typ == VStr && len(args[0].str) > 0 {
+		ch = []rune(args[0].str)[0]
+	} else {
+		return vbool(false), nil
+	}
+	return vbool(unicode.IsLetter(ch)), nil
+}
+
+// -------- graphic-char-p --------
+func builtinGraphicCharP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("graphic-char-p: need a character")
+	}
+	var ch rune
+	if args[0].typ == VChar {
+		ch = args[0].ch
+	} else if args[0].typ == VStr && len(args[0].str) > 0 {
+		ch = []rune(args[0].str)[0]
+	} else {
+		return vbool(false), nil
+	}
+	// Graphic chars are printable characters excluding Space and Newline
+	return vbool(unicode.IsPrint(ch) && !unicode.IsSpace(ch)), nil
+}
+
+// -------- upper-case-p / lower-case-p / both-case-p --------
+func builtinUpperCaseP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("upper-case-p: need a character")
+	}
+	var ch rune
+	if args[0].typ == VChar {
+		ch = args[0].ch
+	} else if args[0].typ == VStr && len(args[0].str) > 0 {
+		ch = []rune(args[0].str)[0]
+	} else {
+		return vbool(false), nil
+	}
+	return vbool(unicode.IsUpper(ch) && unicode.IsLetter(ch)), nil
+}
+
+func builtinLowerCaseP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("lower-case-p: need a character")
+	}
+	var ch rune
+	if args[0].typ == VChar {
+		ch = args[0].ch
+	} else if args[0].typ == VStr && len(args[0].str) > 0 {
+		ch = []rune(args[0].str)[0]
+	} else {
+		return vbool(false), nil
+	}
+	return vbool(unicode.IsLower(ch) && unicode.IsLetter(ch)), nil
+}
+
+func builtinBothCaseP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("both-case-p: need a character")
+	}
+	var ch rune
+	if args[0].typ == VChar {
+		ch = args[0].ch
+	} else if args[0].typ == VStr && len(args[0].str) > 0 {
+		ch = []rune(args[0].str)[0]
+	} else {
+		return vbool(false), nil
+	}
+	return vbool(unicode.IsLetter(ch)), nil
+}
+
+// -------- char-upcase / char-downcase --------
+
+// -------- char-equal (case-insensitive) / char-not-equal --------
+func builtinCharEqual(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("char-equal: need two characters")
+	}
+	c1 := charVal(args[0])
+	c2 := charVal(args[1])
+	return vbool(unicode.ToLower(c1) == unicode.ToLower(c2)), nil
+}
+
+func builtinCharNotEqual(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("char-not-equal: need two characters")
+	}
+	c1 := charVal(args[0])
+	c2 := charVal(args[1])
+	return vbool(unicode.ToLower(c1) != unicode.ToLower(c2)), nil
+}
+
+func charVal(v *Value) rune {
+	if v.typ == VChar {
+		return v.ch
+	}
+	if v.typ == VStr && len(v.str) > 0 {
+		return []rune(v.str)[0]
+	}
+	return 0
+}
+
+// -------- char-lessp / char-greaterp (case-insensitive) --------
+func builtinCharLessp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("char-lessp: need two characters")
+	}
+	return vbool(unicode.ToLower(charVal(args[0])) < unicode.ToLower(charVal(args[1]))), nil
+}
+
+func builtinCharGreaterp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("char-greaterp: need two characters")
+	}
+	return vbool(unicode.ToLower(charVal(args[0])) > unicode.ToLower(charVal(args[1]))), nil
+}
+
+// -------- char-not-lessp / char-not-greaterp --------
+func builtinCharNotLessp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("char-not-lessp: need two characters")
+	}
+	return vbool(unicode.ToLower(charVal(args[0])) >= unicode.ToLower(charVal(args[1]))), nil
+}
+
+func builtinCharNotGreaterp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("char-not-greaterp: need two characters")
+	}
+	return vbool(unicode.ToLower(charVal(args[0])) <= unicode.ToLower(charVal(args[1]))), nil
+}
+
+// -------- char/= (char<= and char>= already defined above) --------
+func builtinCharNotEq(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("char/=: need two characters")
+	}
+	return vbool(charVal(args[0]) != charVal(args[1])), nil
+}
+
+// -------- revappend (already exists) --------
+
+// -------- nreconc --------
+func builtinNreconc(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("nreconc: need two lists")
+	}
+	list1 := seqToList(args[0])
+	list2 := seqToList(args[1])
+	// Reverse list1 and prepend to list2
+	for i, j := 0, len(list1)-1; i < j; i, j = i+1, j-1 {
+		list1[i], list1[j] = list1[j], list1[i]
+	}
+	result := make([]*Value, len(list1)+len(list2))
+	copy(result, list1)
+	copy(result[len(list1):], list2)
+	return listFromSlice(result), nil
+}
+
+// -------- concatenate (already exists) --------
+
+// -------- map --------
+func builtinSeqMapResult(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("map: need result-type, function, and sequence")
+	}
+	resultType := args[0]
+	fn := args[1]
+	seqs := args[2:]
+	// Get element lists
+	allElems := make([][]*Value, len(seqs))
+	minLen := -1
+	for i, seq := range seqs {
+		elems := seqToList(seq)
+		allElems[i] = elems
+		if minLen < 0 || len(elems) < minLen {
+			minLen = len(elems)
+		}
+	}
+	if minLen <= 0 {
+		if resultType.typ == VSym && resultType.str == "string" {
+			return vstr(""), nil
+		}
+		return vnil(), nil
+	}
+	var result []*Value
+	for i := 0; i < minLen; i++ {
+		callArgs := make([]*Value, len(seqs))
+		for j, elems := range allElems {
+			callArgs[j] = elems[i]
+		}
+		r, err := callFnOnSeq(fn, callArgs, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	if resultType.typ == VSym && resultType.str == "string" {
+		var sb strings.Builder
+		for _, v := range result {
+			if v.typ == VChar {
+				sb.WriteRune(v.ch)
+			} else {
+				sb.WriteString(toString(v))
+			}
+		}
+		return vstr(sb.String()), nil
+	}
+	return listFromSlice(result), nil
+}
+
+// -------- mapl / maplist / mapc / mapcon --------
+func builtinMaplist(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("maplist: need function and list")
+	}
+	fn := args[0]
+	lst := args[1]
+	var results []*Value
+	seen := make(map[*Value]bool)
+	cur := lst
+	for cur != nil && cur.typ == VPair {
+		if seen[cur] {
+			break
+		}
+		seen[cur] = true
+		r, err := callFnOnSeq(fn, []*Value{cur}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+		cur = cur.cdr
+	}
+	return listFromSlice(results), nil
+}
+
+func builtinMapc(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("mapc: need function and list")
+	}
+	fn := args[0]
+	lst := args[1]
+	seen := make(map[*Value]bool)
+	cur := lst
+	for cur != nil && cur.typ == VPair {
+		if seen[cur] {
+			break
+		}
+		seen[cur] = true
+		_, err := callFnOnSeq(fn, []*Value{cur.car}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		cur = cur.cdr
+	}
+	return lst, nil
+}
+
+func builtinMapl(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("mapl: need function and list")
+	}
+	fn := args[0]
+	lst := args[1]
+	seen := make(map[*Value]bool)
+	cur := lst
+	for cur != nil && cur.typ == VPair {
+		if seen[cur] {
+			break
+		}
+		seen[cur] = true
+		_, err := callFnOnSeq(fn, []*Value{cur}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		cur = cur.cdr
+	}
+	return lst, nil
+}
+
+func builtinMapcon(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("mapcon: need function and list")
+	}
+	fn := args[0]
+	lst := args[1]
+	var results []*Value
+	seen := make(map[*Value]bool)
+	cur := lst
+	for cur != nil && cur.typ == VPair {
+		if seen[cur] {
+			break
+		}
+		seen[cur] = true
+		r, err := callFnOnSeq(fn, []*Value{cur}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+		elems := seqToList(r)
+		results = append(results, elems...)
+		cur = cur.cdr
+	}
+	return listFromSlice(results), nil
+}
+
+// -------- list* --------
+func builtinListStar(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("list*: need at least one argument")
+	}
+	if len(args) == 1 {
+		return args[0], nil
+	}
+	result := make([]*Value, len(args)-1)
+	for i := 0; i < len(args)-1; i++ {
+		result[i] = args[i]
+	}
+	return appendList(listFromSlice(result), args[len(args)-1]), nil
+}
+
+// appendList appends a tail to a proper list
+func appendList(lst, tail *Value) *Value {
+	if isNil(lst) {
+		return tail
+	}
+	seen := make(map[*Value]bool)
+	return appendListRec(lst, tail, seen)
+}
+func appendListRec(lst, tail *Value, seen map[*Value]bool) *Value {
+	if isNil(lst) {
+		return tail
+	}
+	if seen[lst] {
+		return tail // break cycle
+	}
+	seen[lst] = true
+	if lst.typ == VPair {
+		return cons(lst.car, appendListRec(lst.cdr, tail, seen))
+	}
+	return tail
+}
+
+// -------- realpart / imagpart --------
+func builtinRealpart(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("realpart: need a number")
+	}
+	v := args[0]
+	if v.typ == VComplex {
+		return vnum(v.num), nil
+	}
+	return v, nil
+}
+
+func builtinImagpart(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("imagpart: need a number")
+	}
+	v := args[0]
+	if v.typ == VComplex {
+		return vnum(v.imag), nil
+	}
+	return vnum(0), nil
+}
+
+// -------- conjugate --------
+func builtinConjugate(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("conjugate: need a number")
+	}
+	v := args[0]
+	if v.typ == VComplex {
+		return vcomplex(v.num, -v.imag), nil
+	}
+	return v, nil
+}
+
+// -------- phase --------
+func builtinPhase(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("phase: need a number")
+	}
+	v := args[0]
+	if v.typ == VComplex {
+		return vnum(math.Atan2(v.imag, v.num)), nil
+	}
+	n := toNum(v)
+	if n >= 0 {
+		return vnum(0), nil
+	}
+	return vnum(math.Pi), nil
+}
+
+// -------- cis --------
+func builtinCis(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("cis: need a number")
+	}
+	radians := toNum(args[0])
+	return vcomplex(math.Cos(radians), math.Sin(radians)), nil
+}
+
+// -------- complex --------
+func builtinComplex(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("complex: need real and imaginary parts")
+	}
+	realPart := toNum(args[0])
+	imagPart := toNum(args[1])
+	if imagPart == 0 {
+		return vnum(realPart), nil
+	}
+	return vcomplex(realPart, imagPart), nil
+}
+
+// -------- type predicates --------
+func builtinIntegerp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	v := args[0]
+	if v.typ == VNum {
+		return vbool(v.num == math.Trunc(v.num)), nil
+	}
+	if v.typ == VRat {
+		return vbool(v.iden == 1), nil
+	}
+	if v.typ == VBigInt {
+		return vbool(true), nil
+	}
+	return vbool(false), nil
+}
+
+func builtinFloatp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	v := args[0]
+	if v.typ == VNum {
+		// floatp only true for non-integer floats
+		return vbool(v.num != math.Trunc(v.num)), nil
+	}
+	return vbool(false), nil
+}
+
+func builtinRationalp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	v := args[0]
+	return vbool(v.typ == VRat || v.typ == VNum || v.typ == VBigInt), nil
+}
+
+func builtinRealp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	v := args[0]
+	return vbool(v.typ == VNum || v.typ == VRat || v.typ == VBigInt), nil
+}
+
+func builtinComplexp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(args[0].typ == VComplex), nil
+}
+
+// -------- float / rational --------
+func builtinFloat(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("float: need a number")
+	}
+	return vnum(toNum(args[0])), nil
+}
+
+func builtinRational(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("rational: need a number")
+	}
+	v := args[0]
+	if v.typ == VRat {
+		return v, nil
+	}
+	if v.typ == VNum {
+		// Convert float to rational approximation
+		r := big.NewRat(0, 1)
+		r.SetFloat64(v.num)
+		return vrat(r.Num().Int64(), r.Denom().Int64()), nil
+	}
+	return nil, fmt.Errorf("rational: not a real number")
+}
+
+// -------- numerator / denominator --------
+func builtinNumerator(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("numerator: need a rational")
+	}
+	v := args[0]
+	if v.typ == VRat {
+		return vnum(float64(v.irat)), nil
+	}
+	if v.typ == VNum {
+		return vnum(v.num), nil
+	}
+	return nil, fmt.Errorf("numerator: not a rational")
+}
+
+func builtinDenominator(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("denominator: need a rational")
+	}
+	v := args[0]
+	if v.typ == VRat {
+		return vnum(float64(v.iden)), nil
+	}
+	if v.typ == VNum {
+		return vnum(1), nil
+	}
+	return nil, fmt.Errorf("denominator: not a rational")
+}
+
+// -------- ash (arithmetic shift) --------
+func builtinAsh(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("ash: need integer and count")
+	}
+	n := toBigInt(args[0])
+	if n == nil {
+		// Fallback for non-bignum values
+		n = big.NewInt(int64(toNum(args[0])))
+	}
+	count := int(toNum(args[1]))
+	var result *big.Int
+	if count >= 0 {
+		result = new(big.Int).Lsh(n, uint(count))
+	} else {
+		result = new(big.Int).Rsh(n, uint(-count))
+	}
+	return vbigint(result), nil
+}
+
+// -------- logand / logior / logxor / lognot --------
+func builtinLogand(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return vnum(-1), nil // all ones
+	}
+	if isBigIntInt(args) {
+		result := toBigInt(args[0])
+		if result == nil {
+			result = big.NewInt(int64(toNum(args[0])))
+		}
+		for i := 1; i < len(args); i++ {
+			bi := toBigInt(args[i])
+			if bi == nil {
+				bi = big.NewInt(int64(toNum(args[i])))
+			}
+			result.And(result, bi)
+		}
+		return vbigint(result), nil
+	}
+	result := int64(toNum(args[0]))
+	for i := 1; i < len(args); i++ {
+		result &= int64(toNum(args[i]))
+	}
+	return vnum(float64(result)), nil
+}
+
+func builtinLogior(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return vnum(0), nil
+	}
+	if isBigIntInt(args) {
+		result := toBigInt(args[0])
+		if result == nil {
+			result = big.NewInt(int64(toNum(args[0])))
+		}
+		for i := 1; i < len(args); i++ {
+			bi := toBigInt(args[i])
+			if bi == nil {
+				bi = big.NewInt(int64(toNum(args[i])))
+			}
+			result.Or(result, bi)
+		}
+		return vbigint(result), nil
+	}
+	result := int64(toNum(args[0]))
+	for i := 1; i < len(args); i++ {
+		result |= int64(toNum(args[i]))
+	}
+	return vnum(float64(result)), nil
+}
+
+func builtinLogxor(args []*Value) (*Value, error) {
+	if len(args) == 0 {
+		return vnum(0), nil
+	}
+	if isBigIntInt(args) {
+		result := toBigInt(args[0])
+		if result == nil {
+			result = big.NewInt(int64(toNum(args[0])))
+		}
+		for i := 1; i < len(args); i++ {
+			bi := toBigInt(args[i])
+			if bi == nil {
+				bi = big.NewInt(int64(toNum(args[i])))
+			}
+			result.Xor(result, bi)
+		}
+		return vbigint(result), nil
+	}
+	result := int64(toNum(args[0]))
+	for i := 1; i < len(args); i++ {
+		result ^= int64(toNum(args[i]))
+	}
+	return vnum(float64(result)), nil
+}
+
+func builtinLognot(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("lognot: need an integer")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		result := new(big.Int).Not(v.bigInt)
+		return vbigint(result), nil
+	}
+	return vnum(float64(^int64(toNum(args[0])))), nil
+}
+
+// -------- logcount --------
+func builtinLogcount(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("logcount: need an integer")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		n := new(big.Int)
+		if v.bigInt.Sign() < 0 {
+			n.Not(v.bigInt)
+		} else {
+			n.Set(v.bigInt)
+		}
+		count := 0
+		for n.Sign() > 0 {
+			count++
+			n.And(n, new(big.Int).Sub(n, big.NewInt(1)))
+		}
+		return vnum(float64(count)), nil
+	}
+	n := int64(toNum(args[0]))
+	if n < 0 {
+		n = ^n
+	}
+	count := 0
+	for n != 0 {
+		count++
+		n &= n - 1
+	}
+	return vnum(float64(count)), nil
+}
+
+// -------- integer-length --------
+func builtinIntegerLength(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("integer-length: need an integer")
+	}
+	v := args[0]
+	if v.typ == VBigInt {
+		n := new(big.Int)
+		if v.bigInt.Sign() < 0 {
+			n.Not(v.bigInt)
+		} else {
+			n.Set(v.bigInt)
+		}
+		bits := 0
+		for n.Sign() > 0 {
+			bits++
+			n.Rsh(n, 1)
+		}
+		return vnum(float64(bits)), nil
+	}
+	n := int64(toNum(args[0]))
+	if n < 0 {
+		n = ^n
+	}
+	bits := 0
+	for n != 0 {
+		bits++
+		n >>= 1
+	}
+	return vnum(float64(bits)), nil
+}
+
+// -------- logbitp --------
+func builtinLogbitp(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("logbitp: need bit index and integer")
+	}
+	bit := int(toNum(args[0]))
+	v := args[1]
+	if v.typ == VBigInt {
+		bitmask := new(big.Int).Rsh(v.bigInt, uint(bit))
+		return vbool(bitmask.Bit(0) == 1), nil
+	}
+	n := int64(toNum(args[1]))
+	return vbool((n>>uint(bit))&1 == 1), nil
+}
+
+// -------- logtest --------
+func builtinLogtest(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("logtest: need two integers")
+	}
+	a := int64(toNum(args[0]))
+	b := int64(toNum(args[1]))
+	return vbool(a&b != 0), nil
+}
+
+// -------- copy-alist --------
+func builtinCopyAlist(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("copy-alist: need an alist")
+	}
+	alist := args[0]
+	if isNil(alist) {
+		return vnil(), nil
+	}
+	var result *Value = vnil()
+	elems := seqToList(alist)
+	for i := len(elems) - 1; i >= 0; i-- {
+		entry := elems[i]
+		if entry.typ == VPair {
+			result = cons(cons(entry.car, entry.cdr), result)
+		} else {
+			result = cons(entry, result)
+		}
+	}
+	return result, nil
+}
+
+// -------- mismatch --------
+func builtinMismatch(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("mismatch: need two sequences")
+	}
+	s1 := seqToList(args[0])
+	s2 := seqToList(args[1])
+	start1, end1, start2, end2 := 0, -1, 0, -1
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":start1":
+				if i+1 < len(args) {
+					i++
+					start1 = int(toNum(args[i]))
+				}
+			case ":end1":
+				if i+1 < len(args) {
+					i++
+					end1 = int(toNum(args[i]))
+				}
+			case ":start2":
+				if i+1 < len(args) {
+					i++
+					start2 = int(toNum(args[i]))
+				}
+			case ":end2":
+				if i+1 < len(args) {
+					i++
+					end2 = int(toNum(args[i]))
+				}
+			}
+		}
+	}
+	if end1 < 0 || end1 > len(s1) {
+		end1 = len(s1)
+	}
+	if end2 < 0 || end2 > len(s2) {
+		end2 = len(s2)
+	}
+	len1 := end1 - start1
+	len2 := end2 - start2
+	minLen := len1
+	if len2 < minLen {
+		minLen = len2
+	}
+	for i := 0; i < minLen; i++ {
+		if !eqVal(s1[start1+i], s2[start2+i]) {
+			return vnum(float64(i)), nil
+		}
+	}
+	if len1 != len2 {
+		return vnum(float64(minLen)), nil
+	}
+	return vnil(), nil
+}
+func builtinByte(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("byte: need size and position")
+	}
+	size := int(toNum(args[0]))
+	position := int(toNum(args[1]))
+	return list(vnum(float64(size)), vnum(float64(position))), nil
+}
+
+func builtinByteSize(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("byte-size: need a byte specifier")
+	}
+	bs := seqToList(args[0])
+	if len(bs) >= 1 {
+		return bs[0], nil
+	}
+	return vnum(0), nil
+}
+
+func builtinBytePosition(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("byte-position: need a byte specifier")
+	}
+	bs := seqToList(args[0])
+	if len(bs) >= 2 {
+		return bs[1], nil
+	}
+	return vnum(0), nil
+}
+
+func builtinLdb(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("ldb: need byte specifier and integer")
+	}
+	bs := seqToList(args[0])
+	if len(bs) < 2 {
+		return nil, fmt.Errorf("ldb: invalid byte specifier")
+	}
+	size := int(toNum(bs[0]))
+	pos := int(toNum(bs[1]))
+	n := int64(toNum(args[1]))
+	if size <= 0 {
+		return vnum(0), nil
+	}
+	if size > 63 {
+		size = 63
+	}
+	mask := int64((1<<uint(size)) - 1)
+	return vnum(float64((n >> uint(pos)) & mask)), nil
+}
+
+func builtinDpb(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("dpb: need newbyte, byte specifier, and integer")
+	}
+	newByte := int64(toNum(args[0]))
+	bs := seqToList(args[1])
+	if len(bs) < 2 {
+		return nil, fmt.Errorf("dpb: invalid byte specifier")
+	}
+	size := int(toNum(bs[0]))
+	pos := int(toNum(bs[1]))
+	n := int64(toNum(args[2]))
+	if size <= 0 {
+		return args[2], nil // zero-width field: no change
+	}
+	if size > 63 {
+		size = 63
+	}
+	mask := int64((1 << uint(size)) - 1)
+	return vnum(float64((n & ^(mask << uint(pos))) | ((newByte & mask) << uint(pos)))), nil
+}
+
+// -------- boole --------
+func builtinBoole(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("boole: need opcode, integer1, and integer2")
+	}
+	op := int(toNum(args[0]))
+	a := int64(toNum(args[1]))
+	b := int64(toNum(args[2]))
+	var result int64
+	switch op {
+	case 0:
+		result = 0 // boole-clr
+	case 1:
+		result = a & b // boole-and
+	case 2:
+		result = a & ^b // boole-andc1
+	case 3:
+		result = a // boole-1
+	case 4:
+		result = ^a & b // boole-andc2
+	case 5:
+		result = b // boole-2
+	case 6:
+		result = a ^ b // boole-xor
+	case 7:
+		result = a | b // boole-ior
+	case 8:
+		result = ^(a | b) // boole-nor
+	case 9:
+		result = ^(a ^ b) // boole-eqv
+	case 10:
+		result = ^b // boole-c2
+	case 11:
+		result = a | ^b // boole-orc2
+	case 12:
+		result = ^a // boole-c1
+	case 13:
+		result = ^a | b // boole-orc1
+	case 14:
+		result = ^(a & b) // boole-nand
+	case 15:
+		result = -1 // boole-set
+	default:
+		return nil, fmt.Errorf("boole: invalid opcode %d", op)
+	}
+	return vnum(float64(result)), nil
+}
+
+// -------- with-output-to-string (special form) --------
+// Implemented as special form in eval
+
+// -------- coerce improvements --------
+func builtinCoerce(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("coerce: need object and result-type")
+	}
+	obj := args[0]
+	resultType := args[1]
+	typeStr := ""
+	if resultType.typ == VSym {
+		typeStr = resultType.str
+	} else if isPair(resultType) && resultType.car != nil && resultType.car.typ == VSym {
+		// Compound type specifier like (complex float)
+		typeStr = resultType.car.str
+	}
+
+	switch typeStr {
+	case "string":
+		if obj.typ == VStr {
+			return obj, nil
+		}
+		if obj.typ == VChar {
+			return vstr(string(obj.ch)), nil
+		}
+		if obj.typ == VSym {
+			return vstr(obj.str), nil
+		}
+		if obj.typ == VPair || isNil(obj) {
+			// list of characters/numbers -> string
+			var sb strings.Builder
+			cur := obj
+			for !isNil(cur) {
+				if cur.typ == VPair {
+					elt := cur.car
+					if elt.typ == VChar {
+						sb.WriteRune(elt.ch)
+					} else if elt.typ == VNum {
+						sb.WriteRune(rune(toNum(elt)))
+					}
+					cur = cur.cdr
+				} else {
+					break
+				}
+			}
+			return vstr(sb.String()), nil
+		}
+		elems := seqToList(obj)
+		var sb2 strings.Builder
+		for _, v := range elems {
+			if v.typ == VChar {
+				sb2.WriteRune(v.ch)
+			} else {
+				sb2.WriteString(toString(v))
+			}
+		}
+		return vstr(sb2.String()), nil
+	case "list", ":list":
+		if obj.typ == VPair || isNil(obj) {
+			return obj, nil
+		}
+		if obj.typ == VStr {
+			return listFromSlice(stringToCharList(obj.str)), nil
+		}
+		return listFromSlice(seqToList(obj)), nil
+	case "float", ":float", "single-float", "double-float":
+		return vnum(toNum(obj)), nil
+	case "rational", "ratio", ":rational", ":ratio":
+		if obj.typ == VRat {
+			return obj, nil
+		}
+		if obj.typ == VNum {
+			n := toNum(obj)
+			if n == float64(int(n)) {
+				return vrat(int64(n), 1), nil
+			}
+			return toRational(n), nil
+		}
+		return nil, fmt.Errorf("coerce: cannot coerce to rational")
+	case "complex", ":complex":
+		if obj.typ == VComplex {
+			return obj, nil
+		}
+		return vcomplex(toNum(obj), 0), nil
+	case "character", ":character":
+		if obj.typ == VChar {
+			return obj, nil
+		}
+		if obj.typ == VStr && len(obj.str) > 0 {
+			return vchar([]rune(obj.str)[0]), nil
+		}
+		if obj.typ == VNum {
+			return vchar(rune(int(toNum(obj)))), nil
+		}
+		return nil, fmt.Errorf("coerce: cannot coerce to character")
+	case "function", ":function":
+		if obj.typ == VFunc || obj.typ == VPrim {
+			return obj, nil
+		}
+		// (coerce 'name 'function) - look up function by name
+		if obj.typ == VSym {
+			fn, err := globalEnv.Get(obj.str)
+			if err == nil && (fn.typ == VFunc || fn.typ == VPrim) {
+				return fn, nil
+			}
+		}
+		return nil, fmt.Errorf("coerce: cannot coerce to function")
+	case "integer", ":integer":
+		n := toNum(obj)
+		return vnum(math.Floor(n)), nil
+	case "sequence", ":sequence":
+		return obj, nil
+	default:
+		return nil, fmt.Errorf("coerce: unsupported result-type %s", typeStr)
+	}
+}
+
+func stringToCharList(s string) []*Value {
+	runes := []rune(s)
+	result := make([]*Value, len(runes))
+	for i, r := range runes {
+		result[i] = vchar(r)
+	}
+	return result
+}
+
+func builtinIsqrt(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("isqrt: need a number")
+	}
+	n := toNum(args[0])
+	if n < 0 {
+		return nil, fmt.Errorf("isqrt: negative argument")
+	}
+	r := int(math.Sqrt(n))
+	return vnum(float64(r)), nil
+}
+
+// -------- Advanced format --------
+
+type fmtState struct {
+	ctrl      string
+	pos       int
+	args      []*Value
+	argIdx    int
+	buf       strings.Builder
+	escaped   bool
+	remaining int // items remaining in current ~{ iteration (-1 = not in iteration)
+}
+
+func (fs *fmtState) done() bool { return fs.pos >= len(fs.ctrl) }
+func (fs *fmtState) peek() byte {
+	if fs.done() {
+		return 0
+	}
+	return fs.ctrl[fs.pos]
+}
+func (fs *fmtState) next() byte {
+	c := fs.ctrl[fs.pos]
+	fs.pos++
+	return c
+}
+
+func (fs *fmtState) popArg() *Value {
+	if fs.argIdx < len(fs.args) {
+		v := fs.args[fs.argIdx]
+		fs.argIdx++
+		return v
+	}
+	return vnil()
+}
+
+// formatBigIntBase formats a big.Int in the given base (2, 8, 16).
+func formatBigIntBase(n *big.Int, base int) string {
+	if base == 16 {
+		return new(big.Int).Set(n).Text(16)
+	}
+	if base == 8 {
+		return new(big.Int).Set(n).Text(8)
+	}
+	return new(big.Int).Set(n).Text(2)
+}
+
+func formatRoman(n int) string {
+	if n <= 0 || n >= 4000 {
+		return ""
+	}
+	vals := []int{1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1}
+	romans := []string{"m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i"}
+	var b strings.Builder
+	for i, v := range vals {
+		for n >= v {
+			b.WriteString(romans[i])
+			n -= v
+		}
+	}
+	return b.String()
+}
+
+func formatRomanUpper(n int) string {
+	return strings.ToUpper(formatRoman(n))
+}
+
+func formatOldRoman(n int) string {
+	// Old-style Roman: like regular Roman but uses simpler additive notation
+	if n <= 0 || n >= 4000 {
+		return ""
+	}
+	vals := []int{1000, 500, 100, 50, 10, 5, 1}
+	romans := []string{"M", "D", "C", "L", "X", "V", "I"}
+	var b strings.Builder
+	for i, v := range vals {
+		for n >= v {
+			b.WriteString(romans[i])
+			n -= v
+		}
+	}
+	return b.String()
+}
+
+// formatCardinal converts a number to English cardinal word form.
+// 0 -> "zero", 1 -> "one", 21 -> "twenty-one", 123 -> "one hundred twenty-three"
+func formatCardinal(n int) string {
+	if n == 0 {
+		return "zero"
+	}
+	if n < 0 {
+		return "minus " + formatCardinalPositive(-n)
+	}
+	return formatCardinalPositive(n)
+}
+
+func formatCardinalPositive(n int) string {
+	if n == 0 {
+		return ""
+	}
+	if n >= 1000000000 {
+		return formatCardinalHelper(n/1000000000, "billion", formatCardinalPositive(n%1000000000))
+	}
+	if n >= 1000000 {
+		return formatCardinalHelper(n/1000000, "million", formatCardinalPositive(n%1000000))
+	}
+	if n >= 1000 {
+		return formatCardinalHelper(n/1000, "thousand", formatCardinalPositive(n%1000))
+	}
+	if n >= 100 {
+		return formatCardinalHelper(n/100, "hundred", formatCardinalPositive(n%100))
+	}
+	tens := []string{"", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"}
+	teens := []string{"ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"}
+	units := []string{"", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
+	switch {
+	case n >= 20:
+		s := tens[n/10]
+		if n%10 != 0 {
+			s += "-" + units[n%10]
+		}
+		return s
+	case n >= 10:
+		return teens[n-10]
+	default:
+		return units[n]
+	}
+}
+
+func formatCardinalHelper(val int, name, rest string) string {
+	s := formatCardinalPositive(val) + " " + name
+	if rest != "" {
+		s += " " + rest
+	}
+	return s
+}
+
+// formatOrdinal converts a number to English ordinal word form.
+// 0 -> "zeroth", 1 -> "first", 21 -> "twenty-first", 123 -> "one hundred twenty-third"
+func formatOrdinal(n int) string {
+	if n == 0 {
+		return "zeroth"
+	}
+	if n < 0 {
+		return "minus " + formatOrdinalPositive(-n)
+	}
+	return formatOrdinalPositive(n)
+}
+
+func formatOrdinalPositive(n int) string {
+	ordinals := []string{
+		"zeroth", "first", "second", "third", "fourth", "fifth",
+		"sixth", "seventh", "eighth", "ninth", "tenth",
+		"eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth",
+		"sixteenth", "seventeenth", "eighteenth", "nineteenth",
+		"twentieth", "twenty-first", "twenty-second", "twenty-third",
+		"twenty-fourth", "twenty-fifth", "twenty-sixth", "twenty-seventh",
+		"twenty-eighth", "twenty-ninth", "thirtieth", "thirty-first",
+	}
+	if n < len(ordinals) {
+		return ordinals[n]
+	}
+	// For larger numbers, use cardinal form with ordinal ending on last word
+	cardinal := formatCardinalPositive(n)
+	words := strings.Split(cardinal, " ")
+	last := words[len(words)-1]
+	ordLast := lastOrdinal(last)
+	if ordLast == last {
+		// Fallback: just append "th"
+		ordLast = last + "th"
+	}
+	words[len(words)-1] = ordLast
+	return strings.Join(words, " ")
+}
+
+func lastOrdinal(cardinal string) string {
+	ordinals := map[string]string{
+		"zero": "zeroth", "one": "first", "two": "second", "three": "third",
+		"four": "fourth", "five": "fifth", "six": "sixth", "seven": "seventh",
+		"eight": "eighth", "nine": "ninth", "ten": "tenth",
+		"eleven": "eleventh", "twelve": "twelfth", "thirteen": "thirteenth",
+		"fourteen": "fourteenth", "fifteen": "fifteenth", "sixteen": "sixteenth",
+		"seventeen": "seventeenth", "eighteen": "eighteenth", "nineteen": "nineteenth",
+		"twenty": "twentieth", "thirty": "thirtieth", "forty": "fortieth",
+		"fifty": "fiftieth", "sixty": "sixtieth", "seventy": "seventieth",
+		"eighty": "eightieth", "ninety": "ninetieth",
+	}
+	// Check if cardinal ends with hyphenated word like "twenty-one"
+	if idx := strings.LastIndex(cardinal, "-"); idx != -1 {
+		lastWord := cardinal[idx+1:]
+		if ord, ok := ordinals[lastWord]; ok {
+			return cardinal[:idx+1] + ord
+		}
+	}
+	if ord, ok := ordinals[cardinal]; ok {
+		return ord
+	}
+	return cardinal
+}
+
+func (fs *fmtState) parseFmtDirective() (params []interface{}, colon, at bool, cmd byte) {
+	colon = false
+	at = false
+	params = nil
+	gotValue := false
+	for !fs.done() {
+		c := fs.peek()
+		if c == ':' {
+			colon = true
+			fs.next()
+		} else if c == '@' {
+			at = true
+			fs.next()
+		} else if c == '\'' {
+			fs.next()
+			if !fs.done() {
+				params = append(params, fs.next())
+			}
+			gotValue = true
+		} else if c == 'V' || c == 'v' {
+			fs.next()
+			params = append(params, 'V')
+			gotValue = true
+		} else if c == '#' {
+			fs.next()
+			params = append(params, '#')
+			gotValue = true
+		} else if c >= '0' && c <= '9' {
+			n := 0
+			for !fs.done() && fs.peek() >= '0' && fs.peek() <= '9' {
+				n = n*10 + int(fs.next()-'0')
+			}
+			params = append(params, n)
+			gotValue = true
+		} else if c == ',' {
+			fs.next()
+			if !gotValue {
+				params = append(params, -1)
+			}
+			gotValue = false
+		} else {
+			break
+		}
+	}
+	if !fs.done() {
+		cmd = fs.next()
+	}
+	return
+}
+
+func (fs *fmtState) getParam(params []interface{}, idx, defaultVal int) int {
+	if idx < len(params) {
+		if v, ok := params[idx].(int); ok {
+			return v
+		}
+	}
+	// Check for V param
+	if idx < len(params) {
+		if _, ok := params[idx].(byte); ok {
+			arg := fs.popArg()
+			if arg.typ == VNum {
+				return int(toNum(arg))
+			}
+			return defaultVal
+		}
+	}
+	return defaultVal
+}
+
+func (fs *fmtState) getCharParam(params []interface{}, idx int, defaultVal byte) byte {
+	if idx < len(params) {
+		switch v := params[idx].(type) {
+		case byte:
+			return v
+		case int:
+			return byte(v)
+		}
+	}
+	return defaultVal
+}
+
+func builtinFormat(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("format: need stream and control-string")
+	}
+	stream := args[0]
+	ctrl := args[1]
+	if ctrl.typ != VStr {
+		return nil, fmt.Errorf("format: control-string must be a string")
+	}
+	fs := &fmtState{
+		ctrl: ctrl.str,
+		args: args[2:],
+	}
+	formatRun(fs)
+	result := fs.buf.String()
+	if stream == globalEnv.bindings["#t"] {
+		fmt.Print(result)
+		return vnil(), nil
+	}
+	return vstr(result), nil
+}
+
+func newFmtState(ctrl string, args []*Value, argIdx int) *fmtState {
+	return &fmtState{ctrl: ctrl, args: args, argIdx: argIdx, remaining: -1}
+}
+
+func formatRun(fs *fmtState) {
+	for !fs.done() && !fs.escaped {
+		c := fs.peek()
+		if c == '~' {
+			fs.next()
+			if fs.done() {
+				fs.buf.WriteByte('~')
+				return
+			}
+			formatDispatch(fs)
+		} else {
+			fs.buf.WriteByte(fs.next())
+		}
+	}
+}
+
+func formatDispatch(fs *fmtState) {
+	params, colon, at, cmd := fs.parseFmtDirective()
+	// Format directives are case-insensitive
+	if cmd >= 'a' && cmd <= 'z' {
+		cmd = cmd - 'a' + 'A'
+	}
+	switch cmd {
+	case 'A':
+		arg := fs.popArg()
+		mincol := fs.getParam(params, 0, 0)
+		colinc := fs.getParam(params, 1, 1)
+		minpad := fs.getParam(params, 2, 0)
+		padchar := fs.getCharParam(params, 3, ' ')
+		s := princToString(arg)
+		if isNil(arg) && colon {
+			s = "()"
+		}
+		padlen := 0
+		if int(mincol) > len(s) {
+			padlen = int(mincol) - len(s)
+			if int(minpad) > padlen {
+				padlen = int(minpad)
+			}
+			if int(colinc) > 1 {
+				for padlen < int(mincol)-len(s) || (padlen-int(minpad))%int(colinc) != 0 {
+					padlen++
+				}
+			}
+		}
+		if at {
+			for i := 0; i < padlen; i++ {
+				fs.buf.WriteByte(byte(padchar))
+			}
+			fs.buf.WriteString(s)
+		} else {
+			fs.buf.WriteString(s)
+			for i := 0; i < padlen; i++ {
+				fs.buf.WriteByte(byte(padchar))
+			}
+		}
+	case 'S':
+		arg := fs.popArg()
+		mincol := fs.getParam(params, 0, 0)
+		padchar := fs.getCharParam(params, 3, ' ')
+		s := writeToString(arg)
+		padlen := 0
+		if int(mincol) > len(s) {
+			padlen = int(mincol) - len(s)
+		}
+		if at {
+			for i := 0; i < padlen; i++ {
+				fs.buf.WriteByte(byte(padchar))
+			}
+			fs.buf.WriteString(s)
+		} else {
+			fs.buf.WriteString(s)
+			for i := 0; i < padlen; i++ {
+				fs.buf.WriteByte(byte(padchar))
+			}
+		}
+	case 'D':
+		width := fs.getParam(params, 0, 0)
+		padchar := fs.getCharParam(params, 1, ' ')
+		arg := fs.popArg()
+		var s string
+		if arg.typ == VBigInt {
+			s = arg.bigInt.String()
+		} else {
+			s = strconv.FormatInt(int64(toNum(arg)), 10)
+		}
+		n := 0
+		if arg.typ == VBigInt {
+			n = arg.bigInt.Sign()
+		} else {
+			n = int(toNum(arg))
+		}
+		if n >= 0 && at {
+			s = "+" + s
+		}
+		for len(s) < width {
+			s = string(padchar) + s
+		}
+		if colon && !at {
+			var b strings.Builder
+			for i, c := range s {
+				if i > 0 && (len(s)-i)%3 == 0 && c != '-' {
+					b.WriteByte(',')
+				}
+				b.WriteRune(c)
+			}
+			s = b.String()
+		}
+		fs.buf.WriteString(s)
+	case 'B':
+		arg := fs.popArg()
+		var s string
+		if arg.typ == VBigInt {
+			s = formatBigIntBase(arg.bigInt, 2)
+		} else {
+			s = strconv.FormatInt(int64(toNum(arg)), 2)
+		}
+		if at {
+			fs.buf.WriteString("#b" + s)
+		} else {
+			fs.buf.WriteString(s)
+		}
+	case 'O':
+		arg := fs.popArg()
+		var s string
+		if arg.typ == VBigInt {
+			s = formatBigIntBase(arg.bigInt, 8)
+		} else {
+			s = strconv.FormatInt(int64(toNum(arg)), 8)
+		}
+		if at {
+			fs.buf.WriteString("#o" + s)
+		} else {
+			fs.buf.WriteString(s)
+		}
+	case 'X':
+		arg := fs.popArg()
+		var s string
+		if arg.typ == VBigInt {
+			s = formatBigIntBase(arg.bigInt, 16)
+		} else {
+			s = strconv.FormatInt(int64(toNum(arg)), 16)
+		}
+		if at {
+			fs.buf.WriteString("#x" + s)
+		} else {
+			fs.buf.WriteString(s)
+		}
+	case 'F':
+		decimals := fs.getParam(params, 1, -1)
+		arg := fs.popArg()
+		f := toNum(arg)
+		var s string
+		if decimals >= 0 {
+			s = strconv.FormatFloat(f, 'f', decimals, 64)
+		} else {
+			s = strconv.FormatFloat(f, 'f', -1, 64)
+		}
+		fs.buf.WriteString(s)
+	case '$':
+		// ~$, ~:$, ~@$ - dollar float formatting
+		digits := fs.getParam(params, 0, 2)
+		decimals := fs.getParam(params, 1, 2)
+		width := fs.getParam(params, 2, 0)
+		padchar := fs.getCharParam(params, 3, ' ')
+		arg := fs.popArg()
+		f := toNum(arg)
+		s := strconv.FormatFloat(f, 'f', int(decimals), 64)
+		padlen := width - len(s) - int(digits)
+		if padlen < 0 {
+			padlen = 0
+		}
+		// Insert commas/digits before number
+		if colon {
+			// CL: ~:$ inserts thousand separator
+			// For simplicity, just output the number with prefix
+		}
+		for i := 0; i < padlen; i++ {
+			fs.buf.WriteRune(rune(padchar))
+		}
+		fs.buf.WriteString(s)
+	case 'E':
+		decimals := fs.getParam(params, 1, -1)
+		arg := fs.popArg()
+		f := toNum(arg)
+		var s string
+		if decimals >= 0 {
+			s = strconv.FormatFloat(f, 'E', decimals, 64)
+		} else {
+			s = strconv.FormatFloat(f, 'E', -1, 64)
+		}
+		if idx := strings.Index(s, "E"); idx >= 0 {
+			exp := s[idx:]
+			base := s[:idx]
+			if len(exp) == 3 {
+				exp = string(exp[:2]) + "0" + string(exp[2:])
+			} else if len(exp) == 2 {
+				exp = string(exp) + "+00"
+			}
+			s = base + exp
+		}
+		fs.buf.WriteString(s)
+	case 'R':
+		arg := fs.popArg()
+		n := int(toNum(arg))
+		switch {
+		case at && colon:
+			// ~:@R: old-style Roman numerals
+			fs.buf.WriteString(formatOldRoman(n))
+		case at:
+			// ~@R: Roman numerals (uppercase)
+			fs.buf.WriteString(formatRomanUpper(n))
+		case colon:
+			// ~:R: ordinal
+			fs.buf.WriteString(formatOrdinal(n))
+		default:
+			// ~R: cardinal
+			fs.buf.WriteString(formatCardinal(n))
+		}
+	case 'C':
+		fs.buf.WriteString(princToString(fs.popArg()))
+	case '%':
+		fs.buf.WriteString("\n")
+	case '&':
+		// fresh-line: output newline unless already at start of line
+		if fs.buf.Len() > 0 {
+			fs.buf.WriteString("\n")
+		}
+	case '|':
+		fs.buf.WriteString("\f")
+	case '~':
+		fs.buf.WriteString("~")
+	case 'T':
+		colnum := fs.getParam(params, 0, 1)
+		current := fs.buf.Len()
+		if colnum <= current {
+			colnum = current + 1
+		}
+		for i := current; i < colnum; i++ {
+			fs.buf.WriteByte(' ')
+		}
+	case '*':
+		n := fs.getParam(params, 0, 1)
+		if at {
+			// ~@* with no param: go to arg 0 (first argument)
+			if len(params) == 0 {
+				n = 0
+			}
+			fs.argIdx = n
+		} else {
+			fs.argIdx += n
+		}
+	case '?':
+		newCtrl := fs.popArg()
+		newArgs := fs.popArg()
+		if newCtrl.typ == VStr {
+			subFs := &fmtState{ctrl: newCtrl.str, args: seqToList(newArgs)}
+			formatRun(subFs)
+			fs.buf.WriteString(subFs.buf.String())
+		}
+	case '(':
+		// ~( ... ~) - case conversion
+		depth := 1
+		bodyStart := fs.pos
+		for !fs.done() && depth > 0 {
+			c := fs.next()
+			if c == '~' && !fs.done() {
+				nc := fs.next()
+				if nc == '(' {
+					depth++
+				} else if nc == ')' {
+					depth--
+				}
+			}
+		}
+		bodyEnd := fs.pos - 2
+		if bodyEnd < bodyStart {
+			bodyEnd = bodyStart
+		}
+		body := fs.ctrl[bodyStart:bodyEnd]
+		subFs := newFmtState(body, fs.args, fs.argIdx)
+		formatRun(subFs)
+		fs.argIdx = subFs.argIdx
+		s := subFs.buf.String()
+		if colon && at {
+			s = strings.Title(strings.ToLower(s))
+		} else if colon {
+			s = strings.ToUpper(s)
+		} else if at {
+			if len(s) > 0 {
+				s = strings.ToUpper(s[:1]) + strings.ToLower(s[1:])
+			}
+		} else {
+			s = strings.ToLower(s)
+		}
+		fs.buf.WriteString(s)
+	case ')':
+	case '[':
+		sections := formatCollectSections(fs, ']')
+		selector := fs.popArg()
+		sel := int(toNum(selector))
+		if sel < 0 {
+			sel = 0
+		}
+		if sel >= len(sections) {
+			sel = len(sections) - 1
+		}
+		if sel >= 0 && sel < len(sections) {
+			subFs := &fmtState{ctrl: sections[sel], args: fs.args, argIdx: fs.argIdx}
+			formatRun(subFs)
+			fs.buf.WriteString(subFs.buf.String())
+			fs.argIdx = subFs.argIdx
+		}
+	case ';', ']':
+	case '{':
+		body := formatCollectBody(fs, '}')
+		limit := fs.getParam(params, 0, -1) // -1 means no limit
+		if colon {
+			listArg := fs.popArg()
+			elements := seqToList(listArg)
+			for i, el := range elements {
+				if limit >= 0 && i >= limit {
+					break
+				}
+				rem := len(elements) - i - 1
+				subFs := &fmtState{ctrl: body, args: seqToList(el), remaining: rem}
+				formatRun(subFs)
+				fs.buf.WriteString(subFs.buf.String())
+			}
+		} else if at {
+			count := 0
+			prevArgIdx := fs.argIdx
+			iterCount := 0
+			for fs.argIdx < len(fs.args) {
+				if limit >= 0 && count >= limit {
+					break
+				}
+				if iterCount > len(fs.args)+10 {
+					break
+				}
+				rem := len(fs.args) - fs.argIdx - 1
+				subFs := &fmtState{ctrl: body, args: fs.args, argIdx: fs.argIdx, remaining: rem}
+				formatRun(subFs)
+				fs.buf.WriteString(subFs.buf.String())
+				if subFs.argIdx <= fs.argIdx {
+					break
+				}
+				fs.argIdx = subFs.argIdx
+				if fs.argIdx == prevArgIdx {
+					break
+				}
+				count++
+				iterCount++
+			}
+		} else {
+			listArg := fs.popArg()
+			elements := seqToList(listArg)
+			for i, el := range elements {
+				if limit >= 0 && i >= limit {
+					break
+				}
+				rem := len(elements) - i - 1
+				subFs := &fmtState{ctrl: body, args: []*Value{el}, remaining: rem}
+				formatRun(subFs)
+				fs.buf.WriteString(subFs.buf.String())
+			}
+		}
+	case '}':
+	case '^':
+		if fs.remaining >= 0 {
+			// Inside ~{ iteration: check if more items remain
+			if fs.remaining == 0 {
+				fs.escaped = true
+			}
+		} else if fs.argIdx >= len(fs.args) {
+			fs.escaped = true
+		}
+	case '<':
+		// ~mincol,colinc,minpad,padchar<text~> — Justification
+		// ~<seg1~;seg2~;seg3~> — segmented: distribute segments across width
+		// Extract body between ~< and ~>
+		depth := 1
+		bodyStart := fs.pos
+		for !fs.done() && depth > 0 {
+			c := fs.next()
+			if c == '~' && !fs.done() {
+				nc := fs.next()
+				if nc == '<' {
+					depth++
+				} else if nc == '>' {
+					depth--
+				}
+			}
+		}
+		bodyEnd := fs.pos - 2
+		if bodyEnd < bodyStart {
+			bodyEnd = bodyStart
+		}
+		body := fs.ctrl[bodyStart:bodyEnd]
+
+		// Check for segments separated by ~; and detect fill separator (~:;)
+		segments, fillSegIdx := formatCollectJustifySegments(body)
+
+		if !colon && !at && len(segments) <= 1 {
+			// ~<~> without modifiers, no segments: process body and output
+			subFs := newFmtState(body, fs.args, fs.argIdx)
+			formatRun(subFs)
+			fs.argIdx = subFs.argIdx
+			fs.buf.WriteString(subFs.buf.String())
+		} else if len(segments) > 1 {
+			// Segmented justification: process each segment and distribute
+			// padding between them to fill mincol
+			mincol := fs.getParam(params, 0, 0)
+			colinc := fs.getParam(params, 1, 1)
+			padchar := fs.getCharParam(params, 3, ' ')
+
+			// Process each segment
+			processedSegs := make([]string, 0, len(segments))
+			for _, seg := range segments {
+				subFs := newFmtState(seg, fs.args, fs.argIdx)
+				formatRun(subFs)
+				fs.argIdx = subFs.argIdx
+				processedSegs = append(processedSegs, subFs.buf.String())
+			}
+
+			totalContentLen := 0
+			for _, s := range processedSegs {
+				totalContentLen += len(s)
+			}
+
+			// Calculate total padding needed
+			numGaps := len(processedSegs) - 1
+			if numGaps <= 0 {
+				numGaps = 1
+			}
+			totalPadLen := 0
+			if int(mincol) > totalContentLen {
+				totalPadLen = int(mincol) - totalContentLen
+				if int(colinc) > 1 && numGaps > 0 {
+					// Round up totalPadLen to a multiple of colinc
+					for totalPadLen%int(colinc) != 0 && totalPadLen+totalContentLen < int(mincol)+int(colinc) {
+						totalPadLen++
+					}
+				}
+			}
+
+			// Distribute padding between gaps
+			gapPad := make([]int, numGaps)
+			remaining := totalPadLen
+			if fillSegIdx >= 0 && fillSegIdx < numGaps {
+				// Fill section: all extra padding goes to the gap after fill separator
+				for i := 0; i < numGaps; i++ {
+					if i == fillSegIdx {
+						gapPad[i] = remaining
+					} else {
+						gapPad[i] = 0
+					}
+				}
+			} else {
+				// Distribute evenly
+				base := 0
+				if numGaps > 0 {
+					base = remaining / numGaps
+				}
+				extra := remaining - base*numGaps
+				for i := 0; i < numGaps; i++ {
+					gapPad[i] = base
+					if i < extra {
+						gapPad[i]++
+					}
+				}
+			}
+
+			// Output segments with padding
+			for i, s := range processedSegs {
+				fs.buf.WriteString(s)
+				if i < numGaps {
+					for j := 0; j < gapPad[i]; j++ {
+						fs.buf.WriteByte(byte(padchar))
+					}
+				}
+			}
+		} else {
+			// ~:@<~> or ~@<~> or ~:<~>: single-segment justification
+			mincol := fs.getParam(params, 0, 0)
+			colinc := fs.getParam(params, 1, 1)
+			minpad := fs.getParam(params, 2, 0)
+			padchar := fs.getCharParam(params, 3, ' ')
+
+			subFs := newFmtState(body, fs.args, fs.argIdx)
+			formatRun(subFs)
+			fs.argIdx = subFs.argIdx
+			s := subFs.buf.String()
+
+			// Calculate padding to reach mincol
+			padlen := 0
+			if int(mincol) > len(s) {
+				padlen = int(mincol) - len(s)
+				if int(minpad) > padlen {
+					padlen = int(minpad)
+				}
+				if int(colinc) > 1 {
+					for padlen < int(mincol)-len(s) || (padlen-int(minpad))%int(colinc) != 0 {
+						padlen++
+					}
+				}
+			}
+
+			if colon && at {
+				// ~:@< : center (pad on both sides equally)
+				leftPad := padlen / 2
+				rightPad := padlen - leftPad
+				for i := 0; i < leftPad; i++ {
+					fs.buf.WriteByte(byte(padchar))
+				}
+				fs.buf.WriteString(s)
+				for i := 0; i < rightPad; i++ {
+					fs.buf.WriteByte(byte(padchar))
+				}
+			} else if at {
+				// ~@< : right-justify (pad on left)
+				for i := 0; i < padlen; i++ {
+					fs.buf.WriteByte(byte(padchar))
+				}
+				fs.buf.WriteString(s)
+			} else {
+				// ~:< : left-justify (pad on right)
+				fs.buf.WriteString(s)
+				for i := 0; i < padlen; i++ {
+					fs.buf.WriteByte(byte(padchar))
+				}
+			}
+		}
+	case '>':
+	case 'P':
+		n := int(toNum(fs.popArg()))
+		if at {
+			if n != 1 {
+				fs.buf.WriteString("ies")
+			} else {
+				fs.buf.WriteString("y")
+			}
+		} else if colon {
+			if n != 1 {
+				fs.buf.WriteString("es")
+			}
+		} else {
+			if n != 1 {
+				fs.buf.WriteString("s")
+			}
+		}
+	case 'G':
+		// General format: scientific for very large/small, fixed otherwise
+		digits := fs.getParam(params, 0, 6)
+		arg := fs.popArg()
+		f := toNum(arg)
+		if f == 0 {
+			fs.buf.WriteString("0.0")
+		} else {
+			absF := math.Abs(f)
+			if absF >= 1e16 || (absF < 1e-3 && absF > 0) {
+				fs.buf.WriteString(strconv.FormatFloat(f, 'g', digits, 64))
+			} else {
+				fs.buf.WriteString(strconv.FormatFloat(f, 'f', digits, 64))
+			}
+		}
+	case 'W':
+		// Write format: use toString for canonical output
+		fs.buf.WriteString(toString(fs.popArg()))
+	case '_':
+		// Conditional newline: output a newline (simplified)
+		fs.buf.WriteByte('\n')
+	case 'I':
+		// Indent: output spaces for pretty-printing
+		n := fs.getParam(params, 0, 0)
+		for i := 0; i < n; i++ {
+			fs.buf.WriteByte(' ')
+		}
+	}
+}
+
+// formatCollectJustifySegments splits a ~<...~> body by ~; separators,
+// respecting nested directives. Returns segments and the index of the
+// gap that follows the ~:; fill separator (-1 if none).
+func formatCollectJustifySegments(body string) ([]string, int) {
+	var segments []string
+	fillGapIdx := -1
+	depth := 0
+	start := 0
+	pos := 0
+	for pos < len(body) {
+		if body[pos] == '~' && pos+1 < len(body) {
+			nc := body[pos+1]
+			if nc == '<' {
+				depth++
+				pos += 2
+			} else if nc == '>' {
+				depth--
+				pos += 2
+			} else if nc == ':' && pos+2 < len(body) && body[pos+2] == ';' && depth == 0 {
+				// ~:; fill separator
+				segments = append(segments, body[start:pos])
+				fillGapIdx = len(segments) // gap after this segment gets fill padding
+				pos += 3
+				start = pos
+			} else if nc == ';' && depth == 0 {
+				// ~; regular separator
+				segments = append(segments, body[start:pos])
+				pos += 2
+				start = pos
+			} else {
+				pos += 2
+			}
+		} else {
+			pos++
+		}
+	}
+	if start < len(body) {
+		segments = append(segments, body[start:])
+	}
+	return segments, fillGapIdx
+}
+
+func formatCollectSections(fs *fmtState, endChar byte) []string {
+	var sections []string
+	depth := 0
+	start := fs.pos
+	for !fs.done() {
+		if fs.peek() == '~' {
+			fs.next()
+			if fs.done() {
+				break
+			}
+			nc := fs.peek()
+			if nc == '[' {
+				depth++
+				fs.next()
+			} else if nc == ']' {
+				if depth == 0 {
+					sections = append(sections, fs.ctrl[start:fs.pos-1])
+					fs.next()
+					return sections
+				}
+				depth--
+				fs.next()
+			} else if nc == ':' {
+				// Check for ~:; (default clause marker)
+				pos := fs.pos
+				if pos+1 < len(fs.ctrl) && fs.ctrl[pos+1] == ';' && depth == 0 {
+					// ~:; — mark everything before this as section,
+					// everything after as default, skip the next ~;
+					sections = append(sections, fs.ctrl[start:fs.pos-1])
+					fs.next() // consume ':'
+					fs.next() // consume ';'
+					start = fs.pos
+					// Now continue collecting, but when we see the next ~; at depth 0,
+					// skip it (it's the paired ~; with ~:)
+					for !fs.done() {
+						if fs.peek() == '~' {
+							fs.next()
+							if fs.done() {
+								break
+							}
+							nc2 := fs.peek()
+							if nc2 == '[' {
+								depth++
+								fs.next()
+							} else if nc2 == ']' {
+								if depth == 0 {
+									sections = append(sections, fs.ctrl[start:fs.pos-1])
+									fs.next()
+									return sections
+								}
+								depth--
+								fs.next()
+							} else if nc2 == '{' {
+								depth++
+								fs.next()
+							} else if nc2 == '}' {
+								depth--
+								fs.next()
+							} else if nc2 == ';' && depth == 0 {
+								// Skip the paired ~; — this is the second half of ~:;
+								fs.next()
+								start = fs.pos
+							} else {
+								fs.next()
+							}
+						} else {
+							fs.next()
+						}
+					}
+					sections = append(sections, fs.ctrl[start:fs.pos])
+					return sections
+				}
+				// Not ~:; just consume
+				fs.next()
+			} else if nc == ';' && depth == 0 {
+				sections = append(sections, fs.ctrl[start:fs.pos-1])
+				fs.next()
+				start = fs.pos
+			} else if nc == '{' {
+				depth++
+				fs.next()
+			} else if nc == '}' {
+				depth--
+				fs.next()
+			} else {
+				fs.next()
+			}
+		} else {
+			fs.next()
+		}
+	}
+	sections = append(sections, fs.ctrl[start:fs.pos])
+	return sections
+}
+
+func formatCollectBody(fs *fmtState, endChar byte) string {
+	depth := 0
+	start := fs.pos
+	for !fs.done() {
+		if fs.peek() == '~' {
+			fs.next()
+			if fs.done() {
+				break
+			}
+			nc := fs.next()
+			if nc == '{' {
+				depth++
+			} else if nc == '}' {
+				if depth == 0 {
+					return fs.ctrl[start : fs.pos-2]
+				}
+				depth--
+			} else if nc == '[' {
+				depth++
+			} else if nc == ']' {
+				depth--
+			}
+		} else {
+			fs.next()
+		}
+	}
+	return fs.ctrl[start:fs.pos]
+}
+
+func princToString(v *Value) string {
+	switch v.typ {
+	case VBigInt:
+		return v.bigInt.String()
+	case VStr:
+		return v.str
+	case VNil:
+		return "nil"
+	case VBool:
+		if v == globalEnv.bindings["#t"] {
+			return "#t"
+		}
+		return "#f"
+	case VPair, VArray, VInstance:
+		// Use writeToString for circular reference detection
+		return writeToString(v)
+	default:
+		return toString(v)
+	}
+}
+
+// -------- CLOS --------
+
+// c3Linearize computes the C3 class precedence list
+// parents is a list of VClass values in declaration order
+func c3Linearize(c *Value, parents []*Value) []*Value {
+	if len(parents) == 0 {
+		return []*Value{c}
+	}
+	// Build the merge lists: each parent's CPL + the direct parents list
+	lists := make([][]*Value, 0, len(parents)+1)
+	for _, p := range parents {
+		if p.typ == VClass {
+			lists = append(lists, p.cpl)
+		}
+	}
+	// Add direct parents as a list
+	direct := make([]*Value, len(parents))
+	copy(direct, parents)
+	lists = append(lists, direct)
+
+	result := []*Value{c}
+	// C3 merge
+	for {
+		// Find a candidate: first element of any list that's not in the tail of any list
+		candidate := -1
+		for i, lst := range lists {
+			if len(lst) == 0 {
+				continue
+			}
+			cand := lst[0]
+			inTail := false
+			for j, lst2 := range lists {
+				if j == i || len(lst2) <= 1 {
+					continue
+				}
+				for k := 1; k < len(lst2); k++ {
+					if lst2[k] == cand {
+						inTail = true
+						break
+					}
+				}
+				if inTail {
+					break
+				}
+			}
+			if !inTail {
+				candidate = i
+				break
+			}
+		}
+		if candidate < 0 {
+			// All lists consumed or inconsistency
+			break
+		}
+		cand := lists[candidate][0]
+		result = append(result, cand)
+		// Remove cand from all lists
+		for i := range lists {
+			if len(lists[i]) > 0 && lists[i][0] == cand {
+				lists[i] = lists[i][1:]
+			}
+		}
+	}
+	return result
+}
+
+// findMethodClass finds the class in the CPL matching a given class name
+func findInCPL(cpl []*Value, name string) int {
+	for i, c := range cpl {
+		if c.str == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func lispToReflect(v *Value, t reflect.Type) reflect.Value {
+	switch v.typ {
+	case VNum:
+		switch t.Kind() {
+		case reflect.Float64:
+			return reflect.ValueOf(v.num)
+		case reflect.Float32:
+			return reflect.ValueOf(float32(v.num))
+		case reflect.Int:
+			return reflect.ValueOf(int(v.num))
+		case reflect.Int64:
+			return reflect.ValueOf(int64(v.num))
+		case reflect.Uint:
+			return reflect.ValueOf(uint(v.num))
+		default:
+			return reflect.ValueOf(v.num)
+		}
+	case VStr:
+		return reflect.ValueOf(v.str)
+	case VBool:
+		return reflect.ValueOf(v == globalEnv.bindings["#t"])
+	default:
+		return reflect.ValueOf(v.str)
+	}
+}
+
+func reflectToLisp(v reflect.Value) *Value {
+	switch v.Kind() {
+	case reflect.Float64, reflect.Float32:
+		return vnum(v.Float())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return vnum(float64(v.Int()))
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return vnum(float64(v.Uint()))
+	case reflect.String:
+		return vstr(v.String())
+	case reflect.Bool:
+		return vbool(v.Bool())
+	case reflect.Slice:
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			return vstr(string(v.Bytes()))
+		}
+		return vnil()
+	default:
+		return vstr(fmt.Sprint(v.Interface()))
+	}
+}
+
+// -------- Printer --------
+func toString(v *Value) string {
+	if v == nil {
+		return "()"
+	}
+	switch v.typ {
+	case VNil:
+		return "()"
+	case VNum:
+		f := v.num
+		if f == math.Trunc(f) && !math.IsInf(f, 0) && math.Abs(f) < 1e15 {
+			return strconv.FormatInt(int64(f), 10)
+		}
+		return strconv.FormatFloat(f, 'g', -1, 64)
+	case VStr:
+		return `"` + strings.ReplaceAll(v.str, `"`, `\"`) + `"`
+	case VSym:
+		return v.str
+	case VBool:
+		if v == globalEnv.bindings["#t"] {
+			return "#t"
+		}
+		return "#f"
+	case VPair:
+		return listToString(v)
+	case VPrim:
+		return "#<primitive>"
+	case VFunc:
+		return "#<procedure>"
+	case VMacro:
+		return "#<macro>"
+	case VRat:
+		return strconv.FormatInt(v.irat, 10) + "/" + strconv.FormatInt(v.iden, 10)
+	case VComplex:
+		r := strconv.FormatFloat(v.num, 'g', -1, 64)
+		i := strconv.FormatFloat(v.imag, 'g', -1, 64)
+		return "#c(" + r + " " + i + ")"
+	case VBigInt:
+		return v.bigInt.String()
+	case VPathname:
+		return "#P\"" + pathnameToString(v.pathname) + "\""
+	case VPackage:
+		if v.pkg != nil {
+			return "#<PACKAGE " + v.pkg.name + ">"
+		}
+		return "#<PACKAGE>"
+	case VReadtable:
+		return "#<READTABLE>"
+	case VClass:
+		return "#<class " + v.str + ">"
+	case VGeneric:
+		return "#<generic " + v.str + ">"
+	case VInstance:
+		if v.instClass != nil {
+			return "#<instance " + v.instClass.str + ">"
+		}
+		return "#<instance>"
+	case VVHash:
+		return "#<hash-table " + strconv.Itoa(v.hashTab.count) + ">"
+	case VThread:
+		return "#<thread " + strconv.FormatInt(int64(v.num), 10) + ">"
+	case VLock:
+		return "#<lock " + strconv.FormatInt(int64(v.num), 10) + ">"
+	case VChar:
+		switch v.ch {
+		case ' ':
+			return "#\\space"
+		case '\n':
+			return "#\\newline"
+		case '\t':
+			return "#\\tab"
+		case '\r':
+			return "#\\return"
+		case '\x08':
+			return "#\\backspace"
+		case '\x7f':
+			return "#\\rubout"
+		case '\f':
+			return "#\\page"
+		default:
+			return "#\\" + string(v.ch)
+		}
+	case VStream:
+		return "#<stream>"
+	case VArray:
+		return arrayToString(v)
+	case VMultiVal:
+		return listToString(cons(v.car, v.cdr))
+	default:
+		return "#<unknown>"
+	}
+}
+
+// -------- Circular structure printing (*print-circle*) --------
+
+// circleState tracks visited values for circular reference detection
+type circleState struct {
+	seen    map[*Value]int // value -> label number
+	counter int
+}
+
+// writeToString returns a string representation respecting *print-circle*
+func writeToString(v *Value) string {
+	pc, _ := globalEnv.Get("*print-circle*")
+	useCircle := pc != nil && !isNil(pc)
+	// Always detect circular structures to prevent infinite loops
+	cs := &circleState{seen: make(map[*Value]int), counter: 1}
+	findShared(v, cs, make(map[*Value]bool))
+	if useCircle && len(cs.seen) > 0 {
+		// Print with #n= and #n# labels
+		return toStringCircle(v, cs)
+	}
+	if len(cs.seen) > 0 {
+		// Circular but *print-circle* is nil — truncate with ...
+		return toStringSafe(v, cs)
+	}
+	return toString(v)
+}
+
+// toStringSafe prints with ... for circular references (when *print-circle* is nil)
+func toStringSafe(v *Value, cs *circleState) string {
+	if v == nil {
+		return "()"
+	}
+	switch v.typ {
+	case VNil:
+		return "()"
+	case VPair:
+		if _, ok := cs.seen[v]; ok {
+			return "..."
+		}
+		return listToStringSafe(v, cs)
+	case VArray:
+		if _, ok := cs.seen[v]; ok {
+			return "..."
+		}
+		return arrayToStringSafe(v, cs)
+	default:
+		return toString(v)
+	}
+}
+
+func listToStringSafe(v *Value, cs *circleState) string {
+	var b strings.Builder
+	b.WriteString("(")
+	first := true
+	localSeen := make(map[*Value]bool)
+	for !isNil(v) {
+		if v.typ != VPair {
+			b.WriteString(" . ")
+			b.WriteString(toStringSafe(v, cs))
+			break
+		}
+		if _, ok := cs.seen[v]; ok && !first {
+			b.WriteString("...")
+			break
+		}
+		if localSeen[v] {
+			b.WriteString("...")
+			break
+		}
+		localSeen[v] = true
+		if !first {
+			b.WriteString(" ")
+		}
+		first = false
+		b.WriteString(toStringSafe(v.car, cs))
+		v = v.cdr
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+func arrayToStringSafe(v *Value, cs *circleState) string {
+	if v.array == nil {
+		return "#()"
+	}
+	var b strings.Builder
+	b.WriteString("#(")
+	for i, elem := range v.array.elements {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(toStringSafe(elem, cs))
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+// findShared walks the structure and marks values referenced more than once (or circularly)
+func findShared(v *Value, cs *circleState, visited map[*Value]bool) {
+	if v == nil || v.typ == VNil {
+		return
+	}
+	if v.typ == VPair {
+		if visited[v] {
+			// Already visited — mark as shared/circular
+			if _, exists := cs.seen[v]; !exists {
+				cs.seen[v] = cs.counter
+				cs.counter++
+			}
+			return // Don't recurse into already-visited
+		}
+		visited[v] = true
+		findShared(v.car, cs, visited)
+		findShared(v.cdr, cs, visited)
+	} else if v.typ == VArray && v.array != nil {
+		if visited[v] {
+			if _, exists := cs.seen[v]; !exists {
+				cs.seen[v] = cs.counter
+				cs.counter++
+			}
+			return
+		}
+		visited[v] = true
+		for _, elem := range v.array.elements {
+			findShared(elem, cs, visited)
+		}
+	} else if v.typ == VInstance {
+		if visited[v] {
+			if _, exists := cs.seen[v]; !exists {
+				cs.seen[v] = cs.counter
+				cs.counter++
+			}
+			return
+		}
+		visited[v] = true
+		for _, slot := range v.instSlots {
+			findShared(slot, cs, visited)
+		}
+	}
+}
+
+// toStringCircle prints with #n= and #n# syntax for circular/shared references
+func toStringCircle(v *Value, cs *circleState) string {
+	if v == nil {
+		return "()"
+	}
+	switch v.typ {
+	case VNil:
+		return "()"
+	case VPair:
+		if label, ok := cs.seen[v]; ok {
+			// Check if already printed (replace the entry with negative to mark)
+			if label < 0 {
+				return "#" + strconv.Itoa(-label) + "#"
+			}
+			cs.seen[v] = -label // mark as printed
+			prefix := "#" + strconv.Itoa(label) + "="
+			return prefix + listToStringCircle(v, cs)
+		}
+		return listToStringCircle(v, cs)
+	case VArray:
+		if label, ok := cs.seen[v]; ok {
+			if label < 0 {
+				return "#" + strconv.Itoa(-label) + "#"
+			}
+			cs.seen[v] = -label
+			prefix := "#" + strconv.Itoa(label) + "="
+			return prefix + arrayToStringCircle(v, cs)
+		}
+		return arrayToStringCircle(v, cs)
+	case VInstance:
+		if label, ok := cs.seen[v]; ok {
+			if label < 0 {
+				return "#" + strconv.Itoa(-label) + "#"
+			}
+			cs.seen[v] = -label
+			prefix := "#" + strconv.Itoa(label) + "="
+			return prefix + toString(v)
+		}
+		return toString(v)
+	default:
+		return toString(v)
+	}
+}
+
+func listToStringCircle(v *Value, cs *circleState) string {
+	var b strings.Builder
+	b.WriteString("(")
+	for !isNil(v) {
+		if v.typ != VPair {
+			b.WriteString(" . ")
+			b.WriteString(toStringCircle(v, cs))
+			break
+		}
+		// Check cdr for circular reference before recursing
+		if !isNil(v.cdr) {
+			if label, ok := cs.seen[v.cdr]; ok {
+				// cdr is shared — print (a b . #n#) style
+				b.WriteString(toStringCircle(v.car, cs))
+				b.WriteString(" . ")
+				cs.seen[v.cdr] = -absInt(label) // ensure negative for #n#
+				b.WriteString(toStringCircle(v.cdr, cs))
+				b.WriteString(")")
+				return b.String()
+			}
+		}
+		b.WriteString(toStringCircle(v.car, cs))
+		v = v.cdr
+		if !isNil(v) {
+			b.WriteString(" ")
+		}
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+func arrayToStringCircle(v *Value, cs *circleState) string {
+	if v.array == nil {
+		return "#()"
+	}
+	var b strings.Builder
+	b.WriteString("#(")
+	for i, elem := range v.array.elements {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(toStringCircle(elem, cs))
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func listToString(v *Value) string {
+	if v == nil || v.typ != VPair {
+		return "()"
+	}
+	var b strings.Builder
+	b.WriteString("(")
+	seen := make(map[*Value]bool)
+	for !isNil(v) {
+		if seen[v] {
+			b.WriteString("...")
+			break
+		}
+		seen[v] = true
+		if v.typ != VPair {
+			b.WriteString(" . ")
+			b.WriteString(toStringWithSeen(v, seen))
+			break
+		}
+		b.WriteString(toStringWithSeen(v.car, seen))
+		v = v.cdr
+		if !isNil(v) {
+			b.WriteString(" ")
+		}
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+// toStringWithSeen is like toString but shares a seen map for cycle detection
+func toStringWithSeen(v *Value, seen map[*Value]bool) string {
+	if v == nil {
+		return "()"
+	}
+	switch v.typ {
+	case VNil:
+		return "()"
+	case VPair:
+		if seen[v] {
+			return "..."
+		}
+		// Don't add v to seen here; listToString will do it
+		return listToStringShared(v, seen)
+	default:
+		return toString(v)
+	}
+}
+
+func listToStringShared(v *Value, seen map[*Value]bool) string {
+	if v == nil || v.typ != VPair {
+		return "()"
+	}
+	var b strings.Builder
+	b.WriteString("(")
+	for !isNil(v) {
+		if seen[v] {
+			b.WriteString("...")
+			break
+		}
+		seen[v] = true
+		if v.typ != VPair {
+			b.WriteString(" . ")
+			b.WriteString(toStringWithSeen(v, seen))
+			break
+		}
+		b.WriteString(toStringWithSeen(v.car, seen))
+		v = v.cdr
+		if !isNil(v) {
+			b.WriteString(" ")
+		}
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+// -------- File loading --------
+func loadFile(fname string, env *Env) (*Value, error) {
+	data, err := os.ReadFile(fname)
+	if err != nil {
+		return nil, fmt.Errorf("load: %v", err)
+	}
+	return evalString(string(data), env)
+}
+
+func builtinMakeThread(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("make-thread: need a function")
+	}
+	fn := args[0]
+	fnArgs := args[1:]
+
+	tid := atomic.AddInt64(&nextThreadID, 1)
+	resultCh := make(chan threadResult, 1)
+
+	threadChannelsMu.Lock()
+	threadChannels[tid] = resultCh
+	threadChannelsMu.Unlock()
+
+	go func() {
+		threadEnv := copyGlobalEnv()
+		argList := listFromSlice(fnArgs)
+		result, err := apply(fn, argList, threadEnv)
+		resultCh <- threadResult{value: result, err: err}
+	}()
+
+	return &Value{typ: VThread, num: float64(tid)}, nil
+}
+
+func copyGlobalEnv() *Env {
+	env := NewEnv(nil)
+	for k, v := range globalEnv.bindings {
+		env.bindings[k] = v
+	}
+	return env
+}
+
+func builtinJoinThread(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VThread {
+		return nil, fmt.Errorf("join-thread: need a thread")
+	}
+	tid := int64(args[0].num)
+	threadChannelsMu.Lock()
+	ch, ok := threadChannels[tid]
+	threadChannelsMu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("join-thread: no such thread %d", tid)
+	}
+	tr := <-ch
+	if tr.err != nil {
+		return nil, tr.err
+	}
+	threadChannelsMu.Lock()
+	delete(threadChannels, tid)
+	threadChannelsMu.Unlock()
+	return tr.value, nil
+}
+
+var nextLockID int64
+var atomicCounter int64
+var lockMutexMap = make(map[int64]*sync.Mutex)
+var lockMapMu sync.Mutex
+var condMu sync.Mutex
+var condVars = make(map[int64]*sync.Cond)
+var nextCondID int64
+
+func builtinMakeLock(args []*Value) (*Value, error) {
+	lid := atomic.AddInt64(&nextLockID, 1)
+	lockMapMu.Lock()
+	lockMutexMap[lid] = &sync.Mutex{}
+	lockMapMu.Unlock()
+	return &Value{typ: VLock, num: float64(lid)}, nil
+}
+
+func builtinLock(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VLock {
+		return nil, fmt.Errorf("lock: need a lock object")
+	}
+	lid := int64(args[0].num)
+	lockMapMu.Lock()
+	mu, ok := lockMutexMap[lid]
+	lockMapMu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("lock: invalid lock")
+	}
+	mu.Lock()
+	return vnil(), nil
+}
+
+func builtinUnlock(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VLock {
+		return nil, fmt.Errorf("unlock: need a lock object")
+	}
+	lid := int64(args[0].num)
+	lockMapMu.Lock()
+	mu, ok := lockMutexMap[lid]
+	lockMapMu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("unlock: invalid lock")
+	}
+	mu.Unlock()
+	return vnil(), nil
+}
+
+func builtinSleep(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VNum {
+		return nil, fmt.Errorf("sleep: need a number of seconds")
+	}
+	secs := args[0].num
+	duration := time.Duration(secs * float64(time.Second))
+	time.Sleep(duration)
+	return vnil(), nil
+}
+
+func builtinValues(args []*Value) (*Value, error) {
+	// values returns a VMultiVal wrapping all arguments.
+	// Primary value (car) is the first argument, or nil if none.
+	v := gcv()
+	v.typ = VMultiVal
+	v.cdr = vnil()
+	if len(args) > 0 {
+		v.car = args[0]
+		v.cdr = list(args[1:]...)
+	}
+	return v, nil
+}
+
+func builtinValuesList(args []*Value) (*Value, error) {
+	// values-list: converts a list to multiple values.
+	// (values-list '(a b c)) => values a b c
+	if len(args) != 1 {
+		return nil, fmt.Errorf("values-list: need exactly 1 argument")
+	}
+	lst := args[0]
+	if isNil(lst) {
+		v := gcv()
+		v.typ = VMultiVal
+		v.car = vnil()
+		v.cdr = vnil()
+		return v, nil
+	}
+	v := gcv()
+	v.typ = VMultiVal
+	v.car = lst.car
+	v.cdr = lst.cdr
+	return v, nil
+}
+
+// -------- Standard Library (embedded) --------
+var initLib = `
+(define (not x) (if x #f #t))
+(define (caar x) (car (car x)))
+(define (cadr x) (car (cdr x)))
+(define (cdar x) (cdr (car x)))
+(define (cddr x) (cdr (cdr x)))
+(define (caaar x) (car (car (car x))))
+(define (caadr x) (car (car (cdr x))))
+(define (cadar x) (car (cdr (car x))))
+(define (caddr x) (car (cdr (cdr x))))
+(define (cdaar x) (cdr (car (car x))))
+(define (cdadr x) (cdr (car (cdr x))))
+(define (cddar x) (cdr (cdr (car x))))
+(define (cdddr x) (cdr (cdr (cdr x))))
+
+(define (list . x) x)
+(define (filter f lst)
+  (if (null? lst) '()
+    (if (f (car lst))
+      (cons (car lst) (filter f (cdr lst)))
+      (filter f (cdr lst)))))
+(define (fold f init lst)
+  (if (null? lst) init
+    (fold f (f (car lst) init) (cdr lst))))
+(define (fold-right f init lst)
+  (if (null? lst) init
+    (f (car lst) (fold-right f init (cdr lst)))))
+(define (append . lists)
+  (cond
+    ((null? lists) '())
+    ((null? (cdr lists)) (car lists))
+    ((null? (car lists)) (apply append (cdr lists)))
+    (else (cons (car (car lists)) (apply append (cons (cdr (car lists)) (cdr lists)))))))
+(define (range n)
+  (if (<= n 0) '() (append (range (- n 1)) (list (- n 1)))))
+(define (list-ref lst n)
+  (cond
+    ((null? lst) '())
+    ((= n 0) (car lst))
+    (#t (list-ref (cdr lst) (- n 1)))))
+;; member is now a Go builtin with :key/:test support
+(define (member? x lst)
+  (if (null? lst) #f
+    (if (equal? x (car lst)) #t (member? x (cdr lst)))))
+(define (assoc x alist)
+  (if (null? alist) #f
+    (if (equal? x (caar alist)) (car alist) (assoc x (cdr alist)))))
+(define (any pred lst)
+  (cond
+    ((null? lst) #f)
+    ((pred (car lst)) #t)
+    (else (any pred (cdr lst)))))
+(define (all pred lst)
+  (cond
+    ((null? lst) #t)
+    ((not (pred (car lst))) #f)
+    (else (all pred (cdr lst)))))
+(define (take n lst)
+  (if (or (<= n 0) (null? lst)) '()
+    (cons (car lst) (take (- n 1) (cdr lst)))))
+(define (drop n lst)
+  (if (or (<= n 0) (null? lst)) lst
+    (drop (- n 1) (cdr lst))))
+(define (zip a b)
+  (if (or (null? a) (null? b)) '()
+    (cons (list (car a) (car b)) (zip (cdr a) (cdr b)))))
+(define (flatten lst)
+  (cond
+    ((null? lst) '())
+    ((pair? (car lst)) (append (flatten (car lst)) (flatten (cdr lst))))
+    (else (cons (car lst) (flatten (cdr lst))))))
+(define (square x) (* x x))
+(define (modulo n d) (- n (* d (ffi "math/floor" (/ n d)))))
+(define (atom x) (not (pair? x)))
+(define (list? x) (or (null? x) (pair? x)))
+(define (butlast lst . n)
+  (let ((n (if (null? n) 1 (car n))))
+    (if (<= n 0) lst
+      (let ((len (length lst)))
+        (if (>= n len) '()
+          (take (- len n) lst))))))
+(define (last lst . n)
+  (let ((n (if (null? n) 1 (car n))))
+    (drop (max 0 (- (length lst) n)) lst)))
+(define (signum n)
+  (cond ((> n 0) 1) ((< n 0) -1) (#t 0)))
+(define (even? n) (= (modulo n 2) 0))
+(define (odd? n) (not (= (modulo n 2) 0)))
+(define (zero? n) (= n 0))
+(define (positive? n) (> n 0))
+(define (negative? n) (< n 0))
+(define (copy-seq s) (if (string? s) (string-append s) (append s '())))
+(define (nreverse lst) (reverse lst))
+(define (nconc . lsts)
+  (define (nconc-2 a b)
+    (if (null? a) b
+      (let ((last-pair (last a)))
+        (set-cdr! last-pair b)
+        a)))
+  (if (null? lsts) '()
+    (if (null? (cdr lsts)) (car lsts)
+      (nconc-2 (car lsts) (apply nconc (cdr lsts))))))
+(define (rassoc key alist . rest)
+  (if (null? alist) '()
+    (let ((pair (car alist)))
+      (if (and (pair? pair) (equal? key (cdr pair))) pair
+        (apply rassoc key (cdr alist) rest)))))
+(define (union list1 list2 . rest)
+  (let ((test (if (null? rest) equal?
+                (let ((args rest))
+                  (if (and (pair? args) (equal? (car args) :test) (pair? (cdr args)))
+                      (cadr args) equal?)))))
+    (append list1 (filter (lambda (x) (not (member x list1))) list2))))
+(define (intersection list1 list2)
+  (filter (lambda (x) (member x list2)) list1))
+(define (set-difference list1 list2)
+  (filter (lambda (x) (not (member x list2))) list1))
+(define (adjoin item list . rest)
+  (if (member item list) list (cons item list)))
+(define (every pred lst . rest)
+  (apply seq-every (cons pred (cons lst rest))))
+(define (some pred lst . rest)
+  (apply seq-some (cons pred (cons lst rest))))
+(define (notany pred lst . rest)
+  (apply seq-notany (cons pred (cons lst rest))))
+(define (notevery pred lst . rest)
+  (apply seq-notevery (cons pred (cons lst rest))))
+
+;; -------- CL macros: cond, case, typecase, prog1, push, pop, incf, decf --------
+(define-macro (cond . clauses)
+  (if (null? clauses) #f
+    (if (eq? (caar clauses) 'else)
+      (cons 'begin (cdar clauses))
+      (list 'if (caar clauses)
+        (cons 'begin (cdar clauses))
+        (cons 'cond (cdr clauses))))))
+
+(define-macro (prog1 first . rest)
+  (let ((v (gensym)))
+    (list 'let (list (list v first))
+      (cons 'begin (append rest (list v))))))
+
+(define-macro (prog2 first second . rest)
+  (list 'begin first (cons 'prog1 (cons second rest))))
+
+(define-macro (push item place)
+  (list 'setf place (list 'cons item place)))
+
+(define-macro (pop place)
+  (let ((v (gensym)))
+    (list 'let (list (list v place))
+      (list 'setf place (list 'cdr v))
+      (list 'car v))))
+
+(define-macro (pushnew item place)
+  (list 'if (list 'member item place)
+    place
+    (list 'setf place (list 'cons item place))))
+
+(define-macro (incf place . delta)
+  (list 'setf place (list '+ place (if (null? delta) 1 (car delta)))))
+
+(define-macro (decf place . delta)
+  (list 'setf place (list '- place (if (null? delta) 1 (car delta)))))
+
+(define-macro (rotatef . places)
+  (if (null? places) #f
+    (if (null? (cdr places)) (car places)
+      (let ((g (mapcar (lambda (_) (gensym)) places)))
+        (list 'let (mapcar list g places)
+          (cons 'begin
+            (append
+              (mapcar (lambda (p v) (list 'setf p v))
+                   places
+                   (append (cdr g) (list (car g))))
+              (list (car g)))))))))
+
+(define-macro (shiftf . args)
+  (if (< (length args) 2)
+    (error "shiftf: need at least 2 args")
+    (let ((places (butlast args 1))
+          (newval (car (last-pair args)))
+          (g (mapcar (lambda (_) (gensym)) (butlast args 1))))
+      (list 'let (mapcar list g (butlast args 1))
+        (cons 'begin
+          (append
+            (mapcar (lambda (p v) (list 'setf p v))
+                 places
+                 (append (cdr g) (list newval)))
+            (list (car g))))))))
+
+(define-macro (psetq . pairs)
+  (let ((places (quote ()))
+        (values (quote ()))
+        (rest pairs)
+        (temps (quote ())))
+    (while (not (null? rest))
+      (set! places (cons (car rest) places))
+      (set! rest (cdr rest))
+      (set! values (cons (car rest) values))
+      (set! rest (cdr rest)))
+    (set! places (reverse places))
+    (set! values (reverse values))
+    (let ((i 0))
+      (while (< i (length values))
+        (set! temps (cons (gensym) temps))
+        (set! i (+ i 1))))
+    (set! temps (reverse temps))
+    (list (quote let)
+      (zip temps values)
+      (cons (quote begin)
+        (append
+          (map2 (lambda (p t) (list (quote set!) p t)) places temps)
+          (list (car temps)))))))
+
+(define-macro (psetf . pairs)
+  (let ((places (quote ()))
+        (values (quote ()))
+        (rest pairs)
+        (temps (quote ())))
+    (while (not (null? rest))
+      (set! places (cons (car rest) places))
+      (set! rest (cdr rest))
+      (set! values (cons (car rest) values))
+      (set! rest (cdr rest)))
+    (set! places (reverse places))
+    (set! values (reverse values))
+    (let ((i 0))
+      (while (< i (length values))
+        (set! temps (cons (gensym) temps))
+        (set! i (+ i 1))))
+    (set! temps (reverse temps))
+    (list (quote let)
+      (zip temps values)
+      (cons (quote begin)
+        (append
+          (map2 (lambda (p t) (list (quote setf) p t)) places temps)
+          (list (car temps)))))))
+
+(define (map2 f l1 l2)
+  (if (or (null? l1) (null? l2)) '()
+    (cons (f (car l1) (car l2))
+          (map2 f (cdr l1) (cdr l2)))))
+
+(define-macro (do varlist endlist . body)
+  (let ((vars (mapcar car varlist))
+        (inits (mapcar cadr varlist))
+        (steps (mapcar (lambda (v) (if (null? (cddr v)) (car v) (caddr v))) varlist))
+        (end-test (car endlist))
+        (end-result (if (null? (cdr endlist)) #f (cadr endlist)))
+        (lp (gensym)))
+    (let ((step-args (mapcan2 list vars steps)))
+      (list 'let (mapcar2 list vars inits)
+        (list 'letrec
+          (list (list lp (list 'lambda '()
+                (list 'if end-test
+                  end-result
+                  (cons 'begin
+                    (append body
+                            (list (cons 'psetq step-args)
+                                  (list lp))))))))
+          (list lp))))))
+
+(define-macro (do* varlist endlist . body)
+  (let ((vars (mapcar car varlist))
+        (inits (mapcar cadr varlist))
+        (steps (mapcar (lambda (v) (if (null? (cddr v)) (car v) (caddr v))) varlist))
+        (end-test (car endlist))
+        (end-result (if (null? (cdr endlist)) #f (cadr endlist)))
+        (lp (gensym)))
+    (let ((step-forms (mapcar2 (lambda (v s) (list 'set! v s)) vars steps)))
+      (list 'let* (mapcar2 list vars inits)
+        (list 'letrec
+          (list (list lp (list 'lambda '()
+                (list 'if end-test
+                  end-result
+                  (cons 'begin
+                    (append body
+                            (append step-forms
+                                    (list (list lp)))))))))
+          (list lp))))))
+
+(define (mapcar2 f l1 l2)
+  (if (or (null? l1) (null? l2)) '()
+    (cons (f (car l1) (car l2))
+          (mapcar2 f (cdr l1) (cdr l2)))))
+
+(define (mapcan2 f l1 l2)
+  (if (or (null? l1) (null? l2)) '()
+    (append (f (car l1) (car l2))
+            (mapcan2 f (cdr l1) (cdr l2)))))
+
+;; -------- Additional CL list functions --------
+(define (copy-list lst)
+  (if (null? lst) '()
+    (if (pair? lst) (cons (car lst) (copy-list (cdr lst)))
+      lst)))
+
+(define (copy-tree x)
+  (if (null? x) '()
+    (if (pair? x) (cons (copy-tree (car x)) (copy-tree (cdr x)))
+      x)))
+
+(define (tree-equal x y . rest)
+  (if (and (pair? x) (pair? y))
+    (and (tree-equal (car x) (car y)) (tree-equal (cdr x) (cdr y)))
+    (if (null? rest)
+      (equal? x y)
+      ((car rest) x y))))
+
+(define (revappend x y)
+  (if (null? x) y
+    (revappend (cdr x) (cons (car x) y))))
+
+(define (ldiff list sublist)
+  (if (eq? list sublist) '()
+    (if (null? list) '()
+      (cons (car list) (ldiff (cdr list) sublist)))))
+
+(define (tailp sublist list)
+  (cond ((eq? sublist list) #t)
+        ((null? list) #f)
+        (else (tailp sublist (cdr list)))))
+
+;; -------- type-of-matches helper --------
+(define (type-of-matches obj type-spec)
+  (cond
+    ((eq? type-spec 'number) (number? obj))
+    ((eq? type-spec 'string) (string? obj))
+    ((eq? type-spec 'symbol) (symbol? obj))
+    ((eq? type-spec 'list) (pair? obj))
+    ((eq? type-spec 'cons) (pair? obj))
+    ((eq? type-spec 'null) (null? obj))
+    ((eq? type-spec 'boolean) (boolean? obj))
+    ((eq? type-spec 'character) (char? obj))
+    ((eq? type-spec 'function) (procedure? obj))
+    ((eq? type-spec 'hash-table) (hash-table? obj))
+    ((eq? type-spec 'stream) (streamp obj))
+    ((eq? type-spec 'instance) (instance? obj))
+    (else #f)))
+
+;; -------- destructuring-bind --------
+(define-macro (destructuring-bind pattern expr . body)
+  (list 'let (list (list (gensym) expr))
+    (cons 'begin (destructure-pattern pattern (gensym) body))))
+
+(define (destructure-pattern pattern var body)
+  (if (null? pattern) body
+    (if (symbol? pattern)
+      (list 'let (list (list pattern var))
+        (cons 'begin body))
+      (if (pair? pattern)
+        (let ((head (car pattern))
+              (tail (cdr pattern))
+              (next-var (gensym "d-")))
+          (if (null? tail)
+            (list 'let (list (list head (list 'car var)))
+              (cons 'begin body))
+            (list 'let (list (list head (list 'car var))
+                            (list next-var (list 'cdr var)))
+              (cons 'begin (destructure-pattern tail next-var body)))))
+        body))))
+
+(define (for-each f lst)
+  (if (null? lst) #t
+    (begin (f (car lst)) (for-each f (cdr lst)))))
+(define-macro (when test . body)
+  (list 'if test (cons 'begin body)))
+(define-macro (unless test . body)
+  (list 'if (list 'not test) (cons 'begin body)))
+
+;; assert: simple version - (assert condition)
+(define-macro (assert test . opts)
+  (list 'if test
+    (cons 'begin opts)
+    (if (null? opts)
+        (list 'error "assertion failed")
+        (list 'error (car opts)))))
+
+;; builtin describe is used instead
+
+;; -------- dotimes macro (letrec-based) --------
+(define-macro (dotimes . args)
+  (let ((var (caar args))
+        (count (cadar args))
+        (result (cdar args))
+        (body (cdr args))
+        (n (gensym))
+        (lp (gensym)))
+    (list 'let (list (list var 0) (list n count))
+      (list 'letrec
+        (list (list lp (list 'lambda '()
+              (list 'if (list '>= var n)
+                (cons 'begin result)
+                (cons 'begin (append body
+                  (list (list 'set! var (list '+ var 1))
+                        (list lp))))))))
+        (list lp)))))
+(define-macro (defstruct name-and-options . slots)
+  (letrec
+    ((struct-name
+       (if (pair? name-and-options) (car name-and-options) name-and-options))
+     (options
+       (if (pair? name-and-options) (cdr name-and-options) '()))
+     (include-name #f)
+     (constructor-name #f)
+     (predicate-name #f)
+     (copier-name #f)
+     (print-fn #f)
+     (repr-type 'instance)
+     (slot-defs '())
+     (expansions '())
+     (parse-options
+       (lambda (opts)
+         (if (null? opts) 'done
+           (begin
+             (if (and (pair? (car opts)) (eq? (caar opts) :include))
+               (set! include-name (cadar opts)))
+             (if (and (pair? (car opts)) (eq? (caar opts) :constructor))
+               (set! constructor-name (cadar opts)))
+             (if (and (pair? (car opts)) (eq? (caar opts) :predicate))
+               (set! predicate-name (cadar opts)))
+             (if (and (pair? (car opts)) (eq? (caar opts) :copier))
+               (set! copier-name (cadar opts)))
+             (if (and (pair? (car opts)) (eq? (caar opts) :print-object))
+               (set! print-fn (cadar opts)))
+             (if (and (pair? (car opts)) (eq? (caar opts) :type))
+               (set! repr-type (cadar opts)))
+             (parse-options (cdr opts))))))
+     (parse-slots
+       (lambda (sls)
+         (if (null? sls) '()
+           (if (symbol? (car sls))
+             (cons (list (car sls) #f) (parse-slots (cdr sls)))
+             (if (pair? (car sls))
+               (cons (car sls) (parse-slots (cdr sls)))
+               (parse-slots (cdr sls)))))))
+     (slot-name
+       (lambda (slot)
+         (if (symbol? slot) slot
+           (if (null? (cdr slot)) (car slot)
+             (if (null? (cddr slot)) (car slot)
+               (car slot))))))
+     (gen-accessor
+       (lambda (slot)
+         (list 'define (list (accessor-name slot) 'obj)
+               (list 'slot-value 'obj (list 'quote (slot-name slot))))))
+     (gen-setter
+       (lambda (slot read-only-slots)
+         (if (member? (slot-name slot) read-only-slots)
+           '#f
+           (list 'define
+                 (list (string->symbol
+                       (string-append (symbol->string (accessor-name slot)) "-setf"))
+                       'val 'obj)
+                 (list 'slot-set! 'obj (list 'quote (slot-name slot)) 'val)))))
+     (accessor-name
+       (lambda (slot)
+         (string->symbol
+           (string-append (symbol->string struct-name) "-"
+                          (symbol->string (slot-name slot))))))
+     (slot-keyword
+       (lambda (slot)
+         (string->symbol
+           (string-append ":" (symbol->string (slot-name slot))))))
+     (_g (gensym))
+     (kw-args-sym (gensym)))
+    ;; Body
+    (parse-options options)
+    (set! slot-defs (parse-slots slots))
+    (if include-name
+      (let ((parent-class (eval include-name)))
+        (let ((parent-slots (class-slot-defs parent-class)))
+          (let ((all-slots (append parent-slots slot-defs)))
+            (let ((slot-names (mapcar slot-name all-slots))
+                  (slot-defaults
+                    (mapcar (lambda (s) (if (and (pair? s) (not (null? (cdr s)))) (cadr s) #f))
+                         all-slots))
+                  (read-only-slots
+                    (mapcar (lambda (s)
+                           (if (and (pair? s) (pair? (cddr s)) (eq? (caddr s) :read-only))
+                             (car s) #f))
+                         all-slots))
+                  (pred-name
+                    (if predicate-name predicate-name
+                      (string->symbol
+                        (string-append (symbol->string struct-name) "-p"))))
+                  (cons-name
+                    (if constructor-name constructor-name
+                      (string->symbol
+                        (string-append "make-" (symbol->string struct-name)))))
+                  (copy-name
+                    (if copier-name copier-name
+                      (string->symbol
+                        (string-append "copy-" (symbol->string struct-name))))))
+            ;; Build expansion
+            (set! expansions
+              (cons (list 'defclass struct-name (list include-name) slot-names all-slots)
+                    expansions))
+            (let ((constructor-body
+                    (cons 'let
+                      (cons (list (list 'inst (list 'make-instance (list 'quote struct-name))))
+                        (append
+                          (mapcar (lambda (s)
+                                 (list 'slot-set! 'inst (list 'quote (slot-name s))
+                                   (list 'let (list (list _g (list 'member (slot-keyword s) kw-args-sym)))
+                                     (list 'if _g (list 'cadr _g)
+                                       (if (and (pair? s) (not (null? (cdr s)))) (cadr s) #f)))))
+                               all-slots)
+                          (list 'inst))))))
+              (set! expansions
+                (cons (list 'define (cons cons-name kw-args-sym)
+                            constructor-body)
+                      expansions)))
+            (set! expansions (append (mapcar gen-accessor all-slots) expansions))
+            (set! expansions (append (mapcar (lambda (s) (gen-setter s read-only-slots)) all-slots) expansions))
+            (set! expansions
+              (cons
+                (list 'define (list pred-name 'obj)
+                      (list 'is-a? 'obj (list 'quote struct-name)))
+                expansions))
+            (set! expansions
+              (cons
+                (list 'define (list copy-name 'obj)
+                      (cons 'begin
+                        (cons (list 'define 'new (list 'make-instance (list 'quote struct-name)))
+                          (append
+                            (mapcar (lambda (s)
+                                   (list 'slot-set! 'new (list 'quote (slot-name s))
+                                         (list (accessor-name s) 'obj)))
+                                 all-slots)
+                            (list 'new)))))
+                expansions))
+            (if print-fn
+              (set! expansions
+                (cons
+                  (list 'define (string->symbol
+                                 (string-append (symbol->string struct-name) "-print"))
+                        print-fn)
+                  expansions)))
+            (cons 'begin (reverse expansions))))))
+      ;; no :include branch
+      (let ((all-slots slot-defs)
+            (slot-names (mapcar slot-name slot-defs))
+            (slot-defaults
+              (mapcar (lambda (s) (if (and (pair? s) (not (null? (cdr s)))) (cadr s) #f))
+                   slot-defs))
+            (read-only-slots
+              (mapcar (lambda (s)
+                     (if (and (pair? s) (pair? (cddr s)) (eq? (caddr s) :read-only))
+                       (car s) #f))
+                   slot-defs))
+            (pred-name
+              (if predicate-name predicate-name
+                (string->symbol
+                  (string-append (symbol->string struct-name) "-p"))))
+            (cons-name
+              (if constructor-name constructor-name
+                (string->symbol
+                  (string-append "make-" (symbol->string struct-name)))))
+            (copy-name
+              (if copier-name copier-name
+                (string->symbol
+                  (string-append "copy-" (symbol->string struct-name))))))
+        (set! expansions
+          (cons (list 'defclass struct-name '() slot-names all-slots) expansions))
+        (let ((constructor-body
+                (cons 'let
+                  (cons (list (list 'inst (list 'make-instance (list 'quote struct-name))))
+                    (append
+                      (mapcar (lambda (s)
+                             (list 'slot-set! 'inst (list 'quote (slot-name s))
+                               (list 'let (list (list _g (list 'member (slot-keyword s) kw-args-sym)))
+                                 (list 'if _g (list 'cadr _g)
+                                   (if (and (pair? s) (not (null? (cdr s)))) (cadr s) #f)))))
+                           all-slots)
+                      (list 'inst))))))
+          (set! expansions
+            (cons (list 'define (cons cons-name kw-args-sym)
+                        constructor-body)
+                  expansions)))
+        (set! expansions (append (mapcar gen-accessor all-slots) expansions))
+        (set! expansions (append (mapcar (lambda (s) (gen-setter s read-only-slots)) all-slots) expansions))
+        (set! expansions
+          (cons
+            (list 'define (list pred-name 'obj)
+                  (list 'is-a? 'obj (list 'quote struct-name)))
+            expansions))
+        (set! expansions
+          (cons
+            (list 'define (list copy-name 'obj)
+                  (cons 'begin
+                    (cons (list 'define 'new (list 'make-instance (list 'quote struct-name)))
+                      (append
+                        (mapcar (lambda (s)
+                               (list 'slot-set! 'new (list 'quote (slot-name s))
+                                     (list (accessor-name s) 'obj)))
+                             all-slots)
+                        (list 'new)))))
+            expansions))
+        (if print-fn
+          (set! expansions
+            (cons
+              (list 'define (string->symbol
+                             (string-append (symbol->string struct-name) "-print"))
+                    print-fn)
+              expansions)))
+        (cons 'begin (reverse expansions))))))
+
+;; -------- let* macro --------
+(define-macro (let* bindings . body)
+  (if (null? bindings)
+    (cons 'let (cons '() body))
+    (list 'let (list (car bindings))
+          (cons 'let* (cons (cdr bindings) body)))))
+
+;; -------- while macro --------
+(define-macro (while test . body)
+  (let ((lp (gensym)))
+    (list 'letrec
+      (list (list lp (list 'lambda '()
+            (list 'if test
+              (cons 'begin (cons '(%loop-check) (append body (list (list lp)))))))))
+      (list lp))))
+
+;; -------- dolist macro --------
+(define-macro (dolist spec . body)
+  (let ((var (car spec))
+        (list-expr (cadr spec))
+        (result-cdr (cddr spec))
+        (lst (gensym))
+        (result-var (gensym)))
+    (let ((result (if (null? result-cdr) #f (car result-cdr))))
+      (list 'let*
+        (list (list lst list-expr)
+              (list var '())
+              (list result-var (if result result #f)))
+        (list 'while (list 'not (list 'null? lst))
+          (list 'begin
+            (list 'set! var (list 'car lst))
+            (cons 'begin body)
+            (list 'set! lst (list 'cdr lst))))
+        result-var))))
+
+;; -------- loop macro --------
+(define-macro (loop . clauses)
+  (let ((named #f) (initially '()) (finally '()) (with-list '())
+        (for-list '()) (accum-list '()) (term-list '()) (do-list '())
+        (return-val #f) (has-return #f)
+        (finish-mode #f) (finish-val #f)
+        (current-guard #f))
+
+
+    ;; helper: get keyword from a list (first symbol)
+    (define (get-keyword x)
+      (if (and (not (null? x)) (symbol? (car x))) (car x) #f))
+
+    (define (parse-clauses cls)
+      (if (null? cls) 'done
+        (let ((kw (car cls)) (rest (cdr cls)))
+          (cond
+            ((equal? kw 'for)
+             (let ((var (car rest))
+                   (kind (cadr rest))
+                   (tail (cddr rest)))
+               ;; Collect arguments until the next loop keyword
+               (let ((args '()))
+                 (while (and (pair? tail)
+                             (not (member (car tail)
+                                    '(for with while until repeat collect sum count
+                                      maximize minimize append nconc when unless
+                                      if do named initially finally return always never thereis and by))))
+                   (set! args (append args (list (car tail))))
+                   (set! tail (cdr tail)))
+                 (set! for-list
+                   (cons (cons var (cons kind args)) for-list))
+                 (parse-clauses tail))))
+            ((equal? kw 'with)
+             (set! with-list (cons (list (car rest) (cadr rest)) with-list))
+             (parse-clauses (cddr rest)))
+            ((equal? kw 'while)
+             (set! term-list (cons (list 'while (car rest)) term-list))
+             (parse-clauses (cdr rest)))
+            ((equal? kw 'until)
+             (set! term-list (cons (list 'until (car rest)) term-list))
+             (parse-clauses (cdr rest)))
+            ((equal? kw 'repeat)
+             (set! term-list (cons (list 'repeat (car rest)) term-list))
+             (parse-clauses (cdr rest)))
+            ((equal? kw 'and)
+             ;; Parallel for clause: parse the next for clause
+             (parse-clauses rest))
+            ((equal? kw 'named)
+             (set! named (car rest))
+             (parse-clauses (cdr rest)))
+            ((equal? kw 'initially)
+             (let ((body '()))
+               (define (collect-body xs)
+                 (if (or (null? xs)
+                         (member (car xs)
+                           '(for with while until repeat collect sum count
+                             maximize minimize append nconc when unless
+                             if do named initially finally return always never thereis and)))
+                   (begin (set! initially (append initially (reverse body)))
+                          (parse-clauses xs))
+                   (begin (set! body (cons (car xs) body))
+                          (collect-body (cdr xs)))))
+               (collect-body rest)))
+            ((equal? kw 'finally)
+             (let ((body '()))
+               (define (collect-body xs)
+                 (if (or (null? xs)
+                         (member (car xs)
+                           '(for with while until repeat collect sum count
+                             maximize minimize append nconc when unless
+                             if do named initially finally return always never thereis and)))
+                   (begin (set! finally (append finally (reverse body)))
+                          (parse-clauses xs))
+                   (begin (set! body (cons (car xs) body))
+                          (collect-body (cdr xs)))))
+               (collect-body rest)))
+            ((equal? kw 'do)
+             (let ((body '()))
+               (define (collect-body xs)
+                 (if (or (null? xs)
+                         (member (car xs)
+                           '(for with while until repeat collect sum count
+                             maximize minimize append nconc when unless
+                             if do named initially finally return always never thereis and)))
+                   (begin (if current-guard
+                        (let ((bl (reverse body)))
+                          (set! do-list (cons (list 'if current-guard
+                                            (if (null? (cdr bl)) (car bl) (cons 'begin bl)))
+                                          do-list))
+                          (set! current-guard #f))
+                        (set! do-list (append do-list (reverse body))))
+                          (parse-clauses xs))
+                   (begin (set! body (cons (car xs) body))
+                          (collect-body (cdr xs)))))
+               (collect-body rest)))
+            ((equal? kw 'return)
+             (if current-guard
+               (begin
+                 (set! do-list (cons (list 'if current-guard
+                                      (list 'return-from 'nil (car rest)) '())
+                                      do-list))
+                 (set! current-guard #f))
+               (begin
+                 (set! has-return #t)
+                 (set! return-val (car rest))))
+             (parse-clauses (cdr rest)))
+            ((equal? kw 'always)
+             (set! finish-mode 'always)
+             (if current-guard
+               (set! do-list (cons (list 'if current-guard
+                                    (list 'if (car rest) '()
+                                      (list 'progn (list 'set! 'loop-result #f) (list 'loop-finish))))
+                                    do-list))
+               (set! do-list (cons (list 'if (car rest) '()
+                                    (list 'progn (list 'set! 'loop-result #f) (list 'loop-finish)))
+                                    do-list)))
+             (set! current-guard #f)
+             (parse-clauses (cdr rest)))
+            ((equal? kw 'never)
+             (set! finish-mode 'never)
+             (if current-guard
+               (set! do-list (cons (list 'if current-guard
+                                    (list 'if (car rest)
+                                      (list 'progn (list 'set! 'loop-result #f) (list 'loop-finish)) '()))
+                                    do-list))
+               (set! do-list (cons (list 'if (car rest)
+                                    (list 'progn (list 'set! 'loop-result #f) (list 'loop-finish)) '())
+                                    do-list)))
+             (set! current-guard #f)
+             (parse-clauses (cdr rest)))
+            ((equal? kw 'thereis)
+             (set! finish-mode 'thereis)
+             (let ((tvar (gensym "thereis-")))
+               (let ((new-item (list 'let (list (list tvar (car rest)))
+                                      (list 'if tvar
+                                        (list 'progn (list 'set! 'loop-result tvar) (list 'loop-finish)) '()))))
+                 (if current-guard
+                   (set! do-list (cons (list 'if current-guard new-item '()) do-list))
+                   (set! do-list (cons new-item do-list)))))
+             (set! current-guard #f)
+             (parse-clauses (cdr rest)))
+            ((equal? kw 'collect)
+             (let ((expr (car rest))
+                   (into-var (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                               (caddr rest) #f)))
+               (set! accum-list
+                 (cons (list 'collect expr current-guard into-var) accum-list))
+               (set! current-guard #f)
+               (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                 (parse-clauses (cdddr rest))
+                 (parse-clauses (cdr rest)))))
+            ((equal? kw 'sum)
+             (let ((expr (car rest))
+                   (into-var (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                               (caddr rest) #f)))
+               (set! accum-list
+                 (cons (list 'sum expr current-guard into-var) accum-list))
+               (set! current-guard #f)
+               (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                 (parse-clauses (cdddr rest))
+                 (parse-clauses (cdr rest)))))
+            ((equal? kw 'count)
+             (let ((expr (car rest))
+                   (into-var (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                               (caddr rest) #f)))
+               (set! accum-list
+                 (cons (list 'count expr current-guard into-var) accum-list))
+               (set! current-guard #f)
+               (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                 (parse-clauses (cdddr rest))
+                 (parse-clauses (cdr rest)))))
+            ((equal? kw 'maximize)
+             (let ((expr (car rest))
+                   (into-var (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                               (caddr rest) #f)))
+               (set! accum-list
+                 (cons (list 'maximize expr current-guard into-var) accum-list))
+               (set! current-guard #f)
+               (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                 (parse-clauses (cdddr rest))
+                 (parse-clauses (cdr rest)))))
+            ((equal? kw 'minimize)
+             (let ((expr (car rest))
+                   (into-var (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                               (caddr rest) #f)))
+               (set! accum-list
+                 (cons (list 'minimize expr current-guard into-var) accum-list))
+               (set! current-guard #f)
+               (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                 (parse-clauses (cdddr rest))
+                 (parse-clauses (cdr rest)))))
+            ((equal? kw 'append)
+             (let ((expr (car rest))
+                   (into-var (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                               (caddr rest) #f)))
+               (set! accum-list
+                 (cons (list 'append expr current-guard into-var) accum-list))
+               (set! current-guard #f)
+               (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                 (parse-clauses (cdddr rest))
+                 (parse-clauses (cdr rest)))))
+            ((equal? kw 'nconc)
+             (let ((expr (car rest))
+                   (into-var (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                               (caddr rest) #f)))
+               (set! accum-list
+                 (cons (list 'nconc expr current-guard into-var) accum-list))
+               (set! current-guard #f)
+               (if (and (pair? (cdr rest)) (equal? (cadr rest) 'into))
+                 (parse-clauses (cdddr rest))
+                 (parse-clauses (cdr rest)))))
+            ((equal? kw 'by)
+             ;; Set the step for the most recent for clause
+             (if (null? for-list)
+               (error "by: no for clause to modify")
+               (let ((last-for (car for-list)))
+                 (set-cdr! last-for (append (cdr last-for) (list 'by (car rest))))
+                 (parse-clauses (cdr rest)))))
+            ((or (equal? kw 'when) (equal? kw 'if))
+             (let ((test (car rest)))
+               (set! current-guard test)
+               (parse-clauses (cdr rest))))
+            ((equal? kw 'unless)
+             (set! current-guard (list 'not (car rest)))
+             (parse-clauses (cdr rest)))
+            (else
+             (set! do-list (cons kw do-list))
+             (parse-clauses rest))))))
+
+    ;; --- Parse ---
+    (parse-clauses clauses)
+
+    ;; --- Generate expansion ---
+    (let* ((raw-for-vars (reverse for-list))
+           (accums (reverse accum-list))
+           (acc-names '())
+           (collect-acc-names '())
+           (acc-inits '())
+           (acc-updates '())
+           (acc-results '())
+           (idx 0)
+           ;; Expand in-clauses: (x in list) -> (tail-N in list) + (x (car tail-N))
+           (in-lets '())
+           (expanded '()))
+      (for-each
+        (lambda (f)
+          (if (equal? (cadr f) 'in)
+            (let* ((user-var (car f))
+                   (list-expr (car (cddr f)))
+                   (tail (gensym "in-")))
+              (set! in-lets (cons (list user-var tail list-expr) in-lets))
+              (set! expanded (cons (list tail 'in list-expr) expanded)))
+            (set! expanded (cons f expanded))))
+        raw-for-vars)
+      (let* ((for-vars (reverse expanded))
+             (in-lets (reverse in-lets)))
+
+      ;; Build accumulator information
+      (define (setup-accumulators)
+        (for-each
+          (lambda (a)
+            (let* ((kind (car a))
+                   (expr (cadr a))
+                   (guard (or (caddr a) #t))
+                   (into (if (null? (cdddr a)) #f (car (cdddr a))))
+                   (name (if into into (string->symbol
+                           (string-append
+                             (symbol->string kind) "-acc-"
+                             (number->string idx)))))
+                   (_ (set! idx (+ idx 1))))
+              (set! acc-names (cons name acc-names))
+              (cond
+                ((equal? kind 'collect)
+                 (set! collect-acc-names (cons name collect-acc-names))
+                 (set! acc-inits (cons (list name ''()) acc-inits))
+                 (set! acc-updates
+                   (cons (list 'set! name (list 'if guard (list 'cons expr name) name))
+                         acc-updates))
+                 (set! acc-results
+                   (cons (list 'reverse name) acc-results)))
+                ((equal? kind 'append)
+                 (set! acc-inits (cons (list name ''()) acc-inits))
+                 (set! acc-updates
+                   (cons (list 'set! name (list 'if guard (list 'append name expr) name))
+                         acc-updates))
+                 (set! acc-results (cons name acc-results)))
+                ((equal? kind 'nconc)
+                 (set! acc-inits (cons (list name ''()) acc-inits))
+                 (set! acc-updates
+                   (cons (list 'set! name (list 'if guard (list 'append name expr) name))
+                         acc-updates))
+                 (set! acc-results (cons name acc-results)))
+                ((equal? kind 'sum)
+                 (set! acc-inits (cons (list name 0) acc-inits))
+                 (set! acc-updates
+                   (cons (list 'set! name (list 'if guard (list '+ name expr) name))
+                         acc-updates))
+                 (set! acc-results (cons name acc-results)))
+                ((equal? kind 'count)
+                 (set! acc-inits (cons (list name 0) acc-inits))
+                 (set! acc-updates
+                   (cons (list 'set! name
+                           (list '+ name (list 'if (list 'if guard expr #f) 1 0)))
+                         acc-updates))
+                 (set! acc-results (cons name acc-results)))
+                ((equal? kind 'maximize)
+                 (set! acc-inits (cons (list name #f) acc-inits))
+                 (set! acc-updates
+                   (cons (list 'set! name
+                           (list 'if guard
+                             (list 'if (list 'or (list 'not name) (list '> expr name)) expr name)
+                             name))
+                         acc-updates))
+                 (set! acc-results (cons name acc-results)))
+                ((equal? kind 'minimize)
+                 (set! acc-inits (cons (list name #f) acc-inits))
+                 (set! acc-updates
+                   (cons (list 'set! name
+                           (list 'if guard
+                             (list 'if (list 'or (list 'not name) (list '< expr name)) expr name)
+                             name))
+                         acc-updates))
+                 (set! acc-results (cons name acc-results))))))
+          accums))
+
+      (setup-accumulators)
+
+      ;; Build for-variable information
+      (define (for-init f)
+        (let ((var (car f)) (kind (cadr f)) (args (cddr f)))
+          (cond
+            ((or (equal? kind 'from) (equal? kind 'to)
+                 (equal? kind 'below) (equal? kind 'above)
+                 (equal? kind 'downto))
+             (list var (car args)))
+            ((equal? kind 'in)
+             (list var (car args)))
+            ((equal? kind '=)
+             (list var (car args)))
+            (else (list var 0)))))
+
+      (define (for-step f)
+        (let ((var (car f)) (kind (cadr f)) (args (cddr f)))
+          (cond
+            ((equal? kind 'from)
+             (let* ((start (car args))
+                    (rest-args (cdr args))
+                    (dir (if (null? rest-args) 'to (car rest-args)))
+                    (end (cond
+                           ((null? rest-args) start)
+                           ((equal? (car rest-args) 'by) start)
+                           ((null? (cdr rest-args)) (car rest-args))
+                           ((equal? (cadr rest-args) 'by) (car rest-args))
+                           (else (cadr rest-args))))
+                    (by-val (cond
+                              ((null? rest-args) 1)
+                              ((equal? (car rest-args) 'by)
+                               (if (null? (cdr rest-args)) 1 (cadr rest-args)))
+                              ((null? (cdr rest-args)) 1)
+                              ((equal? (cadr rest-args) 'by)
+                               (if (null? (cddr rest-args)) 1 (caddr rest-args)))
+                              ((null? (cddr rest-args)) 1)
+                              ((equal? (caddr rest-args) 'by)
+                               (if (null? (cdddr rest-args)) 1 (car (cdddr rest-args))))
+                              (else 1))))
+               (cond
+                 ((equal? dir 'downto) (list '- var by-val))
+                 ((equal? dir 'above) (list '- var by-val))
+                 (else (list '+ var by-val)))))
+            ((equal? kind 'downto)
+             (let* ((end (car args))
+                    (rest-args (cdr args))
+                    (by-val (cond
+                              ((null? rest-args) 1)
+                              ((equal? (car rest-args) 'by)
+                               (if (null? (cdr rest-args)) 1 (cadr rest-args)))
+                              ((null? (cdr rest-args)) 1)
+                              ((equal? (cadr rest-args) 'by)
+                               (if (null? (cddr rest-args)) 1 (caddr rest-args)))
+                              (else 1))))
+               (list '- var by-val)))
+            ((equal? kind 'in)
+             (list 'cdr var))
+            ((equal? kind '=)
+             (if (and (pair? args) (not (null? (cdr args)))
+                      (equal? (cadr args) 'then))
+               (caddr args)
+               var))
+            (else var))))
+
+      (define (for-termination f)
+        (let ((var (car f)) (kind (cadr f)) (args (cddr f)))
+          (cond
+            ((equal? kind 'from)
+             (let* ((start (car args))
+                    (rest-args (cdr args))
+                    (dir (if (null? rest-args) #f (car rest-args)))
+                    (end (if (null? rest-args) #f
+                           (cadr rest-args))))
+               (cond
+                 ((not dir) #f)
+                 ((equal? dir 'to) (list '> var end))
+                 ((equal? dir 'below) (list '>= var end))
+                 ((equal? dir 'above) (list '<= var end))
+                 ((equal? dir 'downto) (list '< var end))
+                 ((equal? dir 'by) #f)
+                 (else #f))))
+            ((equal? kind 'downto)
+             (list '< var (car args)))
+            ((equal? kind 'to)
+             (list '> var (car args)))
+            ((equal? kind 'below)
+             (list '>= var (car args)))
+            ((equal? kind 'above)
+             (list '<= var (car args)))
+            ((equal? kind 'in)
+             (list 'null? var))
+            (else #f))))
+
+      ;; Build loop function body
+      (let* ((params (mapcar car for-vars))
+             (loop-name (if named named (gensym "loop-")))
+             (term-tests '())
+             (body-exprs '()))
+
+
+        ;; Termination conditions from for clauses
+        (for-each
+          (lambda (f)
+            (let ((t (for-termination f)))
+              (if t (set! term-tests (cons t term-tests)))))
+          for-vars)
+
+        ;; Termination conditions from term-list
+        (for-each
+          (lambda (t)
+            (cond
+              ((equal? (car t) 'while)
+               (set! term-tests
+                 (cons (list 'not (cadr t)) term-tests)))
+              ((equal? (car t) 'until)
+               (set! term-tests (cons (cadr t) term-tests)))
+              ((equal? (car t) 'repeat)
+               (let ((rvar (gensym "repeat-")))
+                 (set! acc-inits (cons (list rvar (cadr t)) acc-inits))
+                 (set! term-tests
+                   (cons (list '<= rvar 0) term-tests))
+                 (set! acc-updates
+                   (cons (list 'set! rvar (list '- rvar 1))
+                         (reverse acc-updates)))))))
+          (reverse term-list))
+
+        ;; Build body: do clauses first, then accumulations
+        (set! body-exprs (reverse do-list))
+
+        ;; Build body: accumulations come AFTER do-clauses
+        (set! body-exprs
+          (append body-exprs (reverse acc-updates)))
+
+        ;; If has-return and named, add return-from to body
+        (if (and has-return named)
+          (set! body-exprs
+            (append body-exprs (list (list 'return-from loop-name return-val)))))
+
+
+        ;; Add in-clause element extraction as pre-body bindings
+        (for-each
+          (lambda (p)
+            (let ((user-var (car p))
+                  (tail-var (cadr p))
+                  (list-expr (caddr p)))
+              ;; Add initial binding: (user-var (car list-expr))
+              (set! acc-inits
+                (cons (list user-var (list 'car list-expr)) acc-inits))
+              ;; Add set! at start of each iteration
+              (set! body-exprs
+                (cons (list 'set! user-var (list 'car tail-var))
+                      body-exprs))))
+          in-lets)
+
+        ;; Build the loop function
+        (let* ((result-expr
+                 (cond
+                   (has-return
+                    (let ((rv return-val))
+                      (if (member rv acc-names)
+                          (list 'reverse rv)
+                          rv)))
+                   (finish-mode
+                    (cond ((equal? finish-mode 'always) #t)
+                          ((equal? finish-mode 'never) #t)
+                          ((equal? finish-mode 'thereis)
+                           (if finish-val finish-val #f))
+                          (else #f)))
+                   ((not (null? acc-results))
+                    (if (null? (cdr acc-results))
+                      (car acc-results)
+                      (cons 'list acc-results)))
+                   (else #f)))
+               (next-vals (mapcar for-step for-vars))
+               (recurse-call (cons loop-name next-vals))
+               (body-with-result-save
+                 (if (and result-expr (not finish-mode))
+                   (append body-exprs (list (list 'set! 'loop-result result-expr)))
+                   body-exprs))
+               (full-body
+                 (if (null? term-tests)
+                   (if (null? body-with-result-save)
+                     (cons 'begin (list '(%loop-check) recurse-call))
+                     (cons 'begin
+                       (append (cons '(%loop-check) body-with-result-save) (list recurse-call))))
+                   ;; With termination check
+                   (let ((combined-term
+                           (if (null? (cdr term-tests))
+                             (car term-tests)
+                             (cons 'or term-tests))))
+                     (list 'if combined-term
+                       (if result-expr result-expr '())
+                       (if (null? body-with-result-save)
+                         (cons 'begin (list '(%loop-check) recurse-call))
+                         (cons 'begin
+                           (append (cons '(%loop-check) body-with-result-save) (list recurse-call))))))))
+               ;; finally forms
+               (post-expr
+                 (if (null? finally) '()
+                   (if (null? (cdr finally))
+                     (car finally)
+                     (cons 'begin finally))))
+               (loop-fn-body full-body))
+
+          ;; Wrap with finally
+          (let* ((no-fin (cons 'letrec
+                          (cons (list (list loop-name
+                                     (cons 'lambda (cons params
+                                       (list full-body)))))
+                                (list (cons loop-name
+                                  (mapcar (lambda (f) (cadr (for-init f)))
+                                       for-vars))))))
+                 (final-expr
+                   (if (not (null? post-expr))
+                     (let ((rev-steps (mapcar (lambda (n) (list 'set! n (list 'reverse n))) collect-acc-names)))
+                       (list 'let (list (list (gensym "loop-result-") no-fin))
+                         (if (null? (cdr finally))
+                           (if (null? rev-steps)
+                             (car finally)
+                             (cons 'begin (append rev-steps (list (car finally)))))
+                           (cons 'begin (append rev-steps finally)))))
+                     no-fin)))
+            ;; Wrap with initial forms
+            (let* ((with-bindings
+                     (if (null? with-list) '()
+                       (mapcar (lambda (w) (list (car w) (cadr w))) with-list)))
+                   (all-bindings (append acc-inits (list (list 'loop-result '())) with-bindings))
+                   (initially-expr
+                     (if (null? initially) #f
+                       (if (null? (cdr initially))
+                         (car initially)
+                         (cons 'begin initially))))
+                   (wrapped
+                     (if (null? all-bindings)
+                       final-expr
+                       (list 'let (reverse all-bindings) final-expr))))
+              (if initially-expr
+                (set! wrapped (list 'begin initially-expr wrapped)))
+              (if named
+                (list 'block named (list 'block 'nil wrapped))
+                (list 'block 'nil wrapped))))))))))
+;; The Go builtin format is registered in defPrim and takes precedence.
+
+;; -------- CL-style sequence wrappers --------
+(define (reduce fn seq . rest)
+  (if (null? rest)
+    (apply seq-reduce (list fn seq))
+    (apply seq-reduce (append (list fn seq) rest))))
+(define (find item seq . rest)
+  (apply seq-find (cons item (cons seq rest))))
+(define (position item seq . rest)
+  (apply seq-position (cons item (cons seq rest))))
+(define (remove-if pred seq . rest)
+  (apply seq-remove-if (cons pred (cons seq rest))))
+(define (remove-if-not pred seq . rest)
+  (apply seq-remove-if-not (cons pred (cons seq rest))))
+(define (substitute new old seq . rest)
+  (apply seq-substitute (cons new (cons old (cons seq rest)))))
+(define (substitute-if new pred seq . rest)
+  (apply seq-substitute-if (cons new (cons pred (cons seq rest)))))
+(define (substitute-if-not new pred seq . rest)
+  (apply seq-substitute-if-not (cons new (cons pred (cons seq rest)))))
+(define (sort seq pred . rest)
+  (apply seq-sort (cons seq (cons pred rest))))
+(define (stable-sort seq pred . rest)
+  (apply seq-sort (cons seq (cons pred rest))))
+(define (count item seq . rest)
+  (apply seq-count (cons item (cons seq rest))))
+(define (count-if pred seq . rest)
+  (apply seq-count-if (cons pred (cons seq rest))))
+(define (count-if-not pred seq . rest)
+  (apply seq-count-if-not (cons pred (cons seq rest))))
+(define (remove item seq . rest)
+  (apply seq-remove (cons item (cons seq rest))))
+(define (remove-duplicates seq . rest)
+  (apply seq-remove-duplicates (cons seq rest)))
+(define (find-if pred seq . rest)
+  (apply seq-find-if (cons pred (cons seq rest))))
+(define (find-if-not pred seq . rest)
+  (apply seq-find-if-not (cons pred (cons seq rest))))
+(define (position-if pred seq . rest)
+  (apply seq-position-if (cons pred (cons seq rest))))
+(define (position-if-not pred seq . rest)
+  (apply seq-position-if-not (cons pred (cons seq rest))))
+(define (merge seq1 seq2 pred . rest)
+  (if (or (eq? seq1 'list) (eq? seq1 'vector) (eq? seq1 'string))
+      ;; CL-style: (merge 'type seq1 seq2 pred) -- skip type, rearrange args
+      (seq-merge seq2 pred (car rest))
+      ;; MicroLisp-style: (merge seq1 seq2 pred)
+      (seq-merge seq1 seq2 pred)))
+
+
+;; -------- Condition system macros --------
+
+;; with-simple-restart: establish a simple named restart
+;; (with-simple-restart (name format-string &rest args) &body body)
+(define-macro (with-simple-restart spec . body)
+  (let ((rname (car spec)))
+    (list 'restart-case
+          (cons 'begin body)
+          (list rname '() (list 'quote 'nil)))))
+
+;; define-condition: macro for defining condition classes with :report support
+;; (define-condition name (parents) (slots...))
+;; (define-condition name (parents) (slots...) (:report fn))
+(define-macro (define-condition name parents slots . options)
+  (let ((report-expr nil))
+    (dolist (opt options)
+      (if (and (pair? opt) (eq (car opt) (quote :report)))
+          (setq report-expr (cadr opt))))
+    (let ((defclass-form (list (quote defclass) name parents slots)))
+      (if report-expr
+          (list (quote progn)
+                defclass-form
+                (list (quote defvar)
+                      (string->symbol (string-append (symbol->string name) "-cond-report"))
+                      report-expr))
+          defclass-form))))
+
+
+
+
+;; -------- with-slots, with-accessors --------
+(define-macro (with-slots slots instance . body)
+  (let ((inst (gensym)))
+    (list 'let (list (list inst instance))
+      (cons 'let
+        (cons (mapcar (lambda (s)
+                     (if (pair? s)
+                       (list (car s) (list 'slot-value inst (list 'quote (cadr s))))
+                       (list s (list 'slot-value inst (list 'quote s)))))
+                   slots)
+              body)))))
+
+(define-macro (with-accessors accessors instance . body)
+  (let ((inst (gensym)))
+    (list 'let (list (list inst instance))
+      (cons 'let
+        (cons (mapcar (lambda (a)
+                     (list (car a) (list (cadr a) inst)))
+                   accessors)
+              body)))))
+
+;; -------- with-open-file --------
+;; (with-open-file (var filespec &rest keys) &body body)
+(define-macro (with-open-file spec . body)
+  (let ((var (car spec))
+        (filespec (cadr spec))
+        (keys (cddr spec)))
+    (list 'let (list (list var (cons 'open (cons filespec keys))))
+      (list 'unwind-protect
+        (cons 'progn body)
+        (list 'close var)))))
+
+;; -------- step macro --------
+;; (step form) -- evaluate form with stepping enabled (currently just evaluates)
+;; *step* variable controls stepping behavior
+(define-macro (step form)
+  form)
+
+;; -------- defgeneric --------
+(define-macro (defgeneric name args . options)
+  (list 'define name (list 'lambda args
+    (list 'error (list 'string-append "No method defined for " (list 'symbol->string (list 'quote name)))))))
+
+;; -------- defpackage --------
+;; defpackage: create a package with optional use, export, nicknames
+;; Usage: (defpackage :name (:use :cl) (:export :foo :bar) (:nickname :n))
+(define-macro (defpackage name . options)
+  ;; Strip leading colon from keyword package names
+  (let ((pkg-str (if (keywordp name)
+                   (substring (symbol->string name) 1 (string-length (symbol->string name)))
+                   (if (symbol? name) (symbol->string name) name))))
+    (let ((use-list (defpackage-find-opt options ':use))
+          (exports (defpackage-find-opt options ':export))
+          (nicknames (defpackage-find-opt options ':nickname)))
+      (let ((base-forms (list (list 'make-package (list 'quote pkg-str))
+                              (list 'in-package (list 'quote pkg-str))))
+            (use-form (if (null? use-list)
+                        '()
+                        (list (list 'use-package
+                                (cons 'list (mapcar (lambda (p) (list 'quote p)) use-list))))))
+            (export-forms (mapcar (lambda (s) (list 'export (list 'quote s))) exports))
+            (nick-forms (if (null? nicknames)
+                          '()
+                          (list (list 'rename-package
+                                  (list 'quote pkg-str)
+                                  (list 'quote pkg-str)
+                                  (cons 'list (mapcar (lambda (n) (list 'quote n)) nicknames)))))))
+        (cons 'progn
+              (append base-forms
+                      (append use-form
+                              (append export-forms nick-forms))))))))
+
+;; Helper function for defpackage: find option by key
+(define (defpackage-find-opt opts key)
+  (cond
+    ((null? opts) '())
+    ((and (pair? (car opts)) (equal? (caar opts) key)) (cdar opts))
+    (else (defpackage-find-opt (cdr opts) key))))
+
+;; defsetf: (defsetf accessor (vars newval) body...)
+;; Registers a setter function <accessor>-setf in the global environment
+(define-macro (defsetf name vars-and-newval . body)
+  (let* ((vars-newval (if (pair? vars-and-newval) vars-and-newval (list vars-and-newval)))
+          (orig-vars (butlast vars-newval))
+          (newval-sym (car (last vars-newval)))
+          (setter-fn (string->symbol (string-append (symbol->string name) "-setf"))))
+    ;; Use eval to define the setter function in global env
+    (eval (list (quote define)
+                (cons setter-fn (cons newval-sym orig-vars))
+                (cons (quote begin) body)))
+    setter-fn))
+
+;; get-setf-expansion: returns (vars vals store-vars setter-form) for a place form
+(define (get-setf-expansion place)
+  (cond
+    ((and (pair? place) (symbol? (car place)))
+     (let ((accessor (car place))
+           (args (cdr place)))
+       (let ((vars (mapcar (lambda (_) (gensym "gs-")) args))
+             (store-var (gensym "store-")))
+         (list vars
+               args
+               (list store-var)
+               (list (string->symbol (string-append (symbol->string accessor) "-setf"))
+                     store-var
+                     (cons (quote list) vars))))))
+    (else
+     (list '() '() (list (gensym "store-")) (quote (progn))))))
+
+;; -------- Standard Condition Classes --------
+;; ANSI CL condition hierarchy with appropriate slots
+(defclass condition () (message format-arguments format-control))
+
+(defclass serious-condition (condition) ())
+
+(defclass error (serious-condition) ())
+(defclass simple-error (error) ())
+
+(defclass warning (condition) ())
+(defclass simple-warning (warning) ())
+
+(defclass type-error (error) (datum expected-type))
+(defclass simple-type-error (type-error) ())
+
+(defclass program-error (error) ())
+(defclass division-by-zero (error) ())
+(defclass arithmetic-error (error) (operation))
+(defclass control-error (error) ())
+(defclass stream-error (error) (stream))
+(defclass end-of-file (stream-error) ())
+(defclass file-error (error) (file-pathname))
+(defclass package-error (condition) (package))
+(defclass reader-error (stream-error) ())
+
+(defclass break (serious-condition) ())
+(defclass style-warning (warning) ())
+(defclass storage-condition (serious-condition) ())
+(defclass cell-error (error) (name))
+(defclass unbound-variable (cell-error) ())
+(defclass unbound-slot (cell-error) (instance))
+(defclass undefined-function (cell-error) ())
+(defclass parse-error (error) ())
+(defclass print-not-readable (error) (object))
+(defclass simple-condition (condition) (format-control format-arguments))
+
+;; -------- Condition Accessor Functions --------
+(define (condition-message c) (slot-value c 'message))
+(define (condition-format-string c) (slot-value c 'format-control))
+(define (cell-error-name c) (slot-value c 'name))
+(define (unbound-slot-instance c) (slot-value c 'instance))
+(define (print-not-readable-object c) (slot-value c 'object))
+(define (simple-condition-format-control c) (slot-value c 'format-control))
+(define (simple-condition-format-arguments c) (slot-value c 'format-arguments))
+
+;; -------- make-condition helper --------
+;; make-condition is aliased to builtinMakeInstance (which calls make-instance).
+;; Standard condition classes are defined above as CLOS defclass forms.
+
+;; Exported condition classes:
+;; condition, serious-condition, error, simple-error
+;; warning, simple-warning, type-error, simple-type-error
+;; program-error, division-by-zero, arithmetic-error
+;; control-error, stream-error, end-of-file
+;; file-error, package-error, reader-error
+
+`
+
+// -------- REPL --------
+func repl() {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Println("MicroLisp v1.0 - Type (exit) to quit")
+	for {
+		fmt.Print("λ> ")
+		var input string
+		depth := 0
+		inStr := false
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					fmt.Println()
+					return
+				}
+				fmt.Printf("read error: %v\n", err)
+				break
+			}
+			input += line
+			for _, ch := range line {
+				if inStr {
+					if ch == '"' {
+						inStr = false
+					}
+				} else {
+					switch ch {
+					case '"':
+						inStr = true
+					case '(':
+						depth++
+					case ')':
+						depth--
+					case ';':
+						// skip comment - already part of line
+					}
+				}
+			}
+			if depth <= 0 && strings.TrimSpace(input) != "" {
+				break
+			}
+			if strings.TrimSpace(input) != "" {
+				fmt.Print("  > ")
+			}
+		}
+		input = strings.TrimSpace(input)
+		if input == "" {
+			continue
+		}
+		exprs, err := parseAll(input)
+		if err != nil {
+			fmt.Printf("parse error: %v\n", err)
+			continue
+		}
+		for !isNil(exprs) {
+			loopIterationCount = 0
+			var result *Value
+			var evalErr error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// Handle tailCall panic
+						if tc, ok := r.(*tailCall); ok {
+							evalErr = fmt.Errorf("tail call error: %v", tc)
+							return
+						}
+						evalErr = fmt.Errorf("%v", r)
+					}
+				}()
+				result, evalErr = eval(exprs.car, globalEnv)
+			}()
+			if evalErr != nil {
+				fmt.Printf("error: %v\n", evalErr)
+			} else {
+				fmt.Println(writeToString(primaryValue(result)))
+			}
+			exprs = exprs.cdr
+		}
+	}
+}
+
+// -------- Main --------
+func main() {
+	initGlobalEnv()
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-e", "--eval":
+			if len(os.Args) > 2 {
+				var result *Value
+				var err error
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							err = fmt.Errorf("panic: %v", r)
+						}
+					}()
+					result, err = evalString(os.Args[2], globalEnv)
+				}()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "error: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Println(toString(primaryValue(result)))
+			}
+		case "--test":
+			runTests()
+		default:
+			_, err := loadFile(os.Args[1], globalEnv)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		return
+	}
+	repl()
+}
+
+// -------- Tests --------
+func runTests() {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"(+ 1 2)", "3"},
+		{"(* 3 4)", "12"},
+		{"(- 10 3)", "7"},
+		{"(/ 15 3)", "5"},
+		{"(quote (1 2 3))", "(1 2 3)"},
+		{"'()", "()"},
+		{"(car '(1 2 3))", "1"},
+		{"(cdr '(1 2 3))", "(2 3)"},
+		{"(cons 1 '(2 3))", "(1 2 3)"},
+		{"(null? '())", "#t"},
+		{"(null? '(1))", "#f"},
+		{"(pair? '(1 2))", "#t"},
+		{"(number? 42)", "#t"},
+		{"(string? \"hi\")", "#t"},
+		{"(symbol? 'x)", "#t"},
+		{"(eq? 'a 'a)", "#t"},
+		{"(equal? '(1 2) '(1 2))", "#t"},
+		{"(if #t 1 2)", "1"},
+		{"(if #f 1 2)", "2"},
+		{"(begin 1 2 3)", "3"},
+		{"(define x 42) x", "42"},
+		{"(define (sq x) (* x x)) (sq 5)", "25"},
+		{"(let ((x 2) (y 3)) (+ x y))", "5"},
+		{"((lambda (x) (* x x)) 7)", "49"},
+		{"(string-append \"a\" \"b\")", "\"ab\""},
+		{"(length '(1 2 3))", "3"},
+		{"(list 1 2 3)", "(1 2 3)"},
+		{"(not #t)", "#f"},
+		{"(not #f)", "#t"},
+		{"(null? '())", "#t"},
+		{"(> 3 2)", "#t"},
+		{"(< 2 3)", "#t"},
+		{"(= 5 5)", "#t"},
+		{"(>= 5 3)", "#t"},
+		{"(<= 3 5)", "#t"},
+		{"(type-of 42)", "number"},
+		{"(type-of 'x)", "symbol"},
+		{"(type-of \"hi\")", "string"},
+	}
+	passed := 0
+	for _, tt := range tests {
+		result, err := func() (r *Value, e error) {
+			defer func() {
+				if rp := recover(); rp != nil {
+					e = fmt.Errorf("panic: %v", rp)
+				}
+			}()
+			r, e = evalString(tt.input, globalEnv)
+			return
+		}()
+		if err != nil {
+			fmt.Printf("FAIL: %s => error: %v\n", tt.input, err)
+			continue
+		}
+		got := toString(result)
+		if got != tt.expected {
+			fmt.Printf("FAIL: %s => got %s, expected %s\n", tt.input, got, tt.expected)
+			continue
+		}
+		passed++
+	}
+	// Standard library tests
+	libTests := []struct {
+		input    string
+		expected string
+	}{
+		{"(caar '((1 2)))", "1"},
+		{"(cadr '(1 2 3))", "2"},
+		{"(cddr '(1 2 3))", "(3)"},
+		{"(caddr '(1 2 3))", "3"},
+		{"(not #t)", "#f"},
+		{"(mapcar (lambda (x) (* x 2)) '(1 2 3))", "(2 4 6)"},
+		{"(filter (lambda (x) (> x 2)) '(1 2 3 4))", "(3 4)"},
+		{"(fold + 0 '(1 2 3))", "6"},
+		{"(length '(1 2 3 4))", "4"},
+		{"(append '(1 2) '(3 4))", "(1 2 3 4)"},
+		{"(reverse '(1 2 3))", "(3 2 1)"},
+		{"(range 5)", "(0 1 2 3 4)"},
+		{"(list-ref '(a b c) 1)", "b"},
+		{"(member? 2 '(1 2 3))", "#t"},
+		{"(any number? '(a b 3))", "#t"},
+		{"(all number? '(1 2 3))", "#t"},
+		{"(take 2 '(1 2 3))", "(1 2)"},
+		{"(drop 2 '(1 2 3))", "(3)"},
+		{"(zip '(1 2) '(a b))", "((1 a) (2 b))"},
+		{"(abs -5)", "5"},
+	}
+	fmt.Println("\n--- Standard Library Tests ---")
+	for _, tt := range libTests {
+		result, err := evalString(tt.input, globalEnv)
+		if err != nil {
+			fmt.Printf("FAIL: %s => error: %v\n", tt.input, err)
+			continue
+		}
+		got := toString(result)
+		if got != tt.expected {
+			fmt.Printf("FAIL: %s => got %s, expected %s\n", tt.input, got, tt.expected)
+			continue
+		}
+		passed++
+	}
+
+	// Macro test
+	// Macro test
+	macroResult, err := evalString(`
+		(define-macro (twice expr) (list (quote +) expr expr))
+		(twice (+ 1 1))
+	`, globalEnv)
+	if err != nil {
+		fmt.Printf("FAIL macro: %v\n", err)
+	} else {
+		got := toString(macroResult)
+		if got != "4" {
+			fmt.Printf("FAIL macro: expected 4, got %s\n", got)
+		} else {
+			passed++
+			fmt.Printf("PASS macro test\n")
+		}
+	}
+
+	// Closure test
+	_, err = evalString(`(define (make-counter)
+		(let ((count 0))
+			(lambda ()
+				(set! count (+ count 1))
+				count)))
+	(define counter (make-counter))
+	`, globalEnv)
+	if err != nil {
+		fmt.Printf("FAIL closure setup: %v\n", err)
+	} else {
+		r1, _ := evalString(`(counter)`, globalEnv)
+		r2, _ := evalString(`(counter)`, globalEnv)
+		r3, _ := evalString(`(counter)`, globalEnv)
+		if toString(r1) == "1" && toString(r2) == "2" && toString(r3) == "3" {
+			passed++
+			fmt.Printf("PASS closure/counter test: %s %s %s\n", toString(r1), toString(r2), toString(r3))
+		} else {
+			fmt.Printf("FAIL closure: got %s %s %s\n", toString(r1), toString(r2), toString(r3))
+		}
+	}
+
+	// TCO test (no stack overflow)
+	_, err = evalString(`(define (range-tco n acc)
+		(if (= n 0) acc
+			(range-tco (- n 1) (cons n acc))))`, globalEnv)
+	if err != nil {
+		fmt.Printf("FAIL TCO setup: %v\n", err)
+	} else {
+		r, err := evalString(`(range-tco 1000 '())`, globalEnv)
+		if err != nil {
+			fmt.Printf("FAIL TCO: %v\n", err)
+		} else {
+			l := length(r)
+			if l == 1000 {
+				passed++
+				fmt.Printf("PASS TCO test: length=%d\n", l)
+			} else {
+				fmt.Printf("FAIL TCO: expected length 1000, got %d\n", l)
+			}
+		}
+	}
+
+	if passed == len(tests)+len(libTests)+3 {
+		fmt.Printf("\nAll %d tests PASSED\n", passed)
+	} else {
+		fmt.Printf("\n%d/%d passed\n", passed, len(tests)+len(libTests)+3)
+	}
+}
