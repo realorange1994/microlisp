@@ -76,3 +76,7 @@
 
 37. Go 词法分析器对超出 float64 尾数精度的大整数（>2^53）丢失精度
 38. setf 对未绑定变量报错而非创建全局绑定（ANSI CL 语义）
+39. `destructuring-bind` 的 `&key` 使用位置绑定而非关键字匹配
+40. `butlast` 对 n<=0 返回原列表而非副本
+41. `block`/`return-from` 不接受 nil 作为块名
+42. `eq`/`equal` 不将 nil 符号和 VNil（空列表）视为相等
