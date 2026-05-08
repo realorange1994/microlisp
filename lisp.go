@@ -2721,10 +2721,18 @@ evalLoop:
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("block: malformed form")
 				}
-				if v.cdr.car == nil || v.cdr.car.typ != VSym {
+				if v.cdr.car == nil {
 					return nil, fmt.Errorf("block: name must be a symbol")
 				}
-				blockName := v.cdr.car.str
+				// Accept VNil as a valid block name for (block nil ...)
+				var blockName string
+				if v.cdr.car.typ == VSym {
+					blockName = v.cdr.car.str
+				} else if v.cdr.car.typ == VNil {
+					blockName = "nil"
+				} else {
+					return nil, fmt.Errorf("block: name must be a symbol")
+				}
 				body := v.cdr.cdr
 				var result *Value
 				for !isNil(body) {
@@ -2749,10 +2757,18 @@ evalLoop:
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("return-from: malformed form")
 				}
-				if v.cdr.car == nil || v.cdr.car.typ != VSym {
+				if v.cdr.car == nil {
 					return nil, fmt.Errorf("return-from: block name must be a symbol")
 				}
-				name := v.cdr.car.str
+				// Accept VNil as a valid block name for (return-from nil ...)
+				var name string
+				if v.cdr.car.typ == VSym {
+					name = v.cdr.car.str
+				} else if v.cdr.car.typ == VNil {
+					name = "nil"
+				} else {
+					return nil, fmt.Errorf("return-from: block name must be a symbol")
+				}
 				if v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
 					return nil, fmt.Errorf("return-from: missing return value")
 				}
@@ -7437,6 +7453,20 @@ func builtinCharName(args []*Value) (*Value, error) {
 }
 
 func eqVal(a, b *Value) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	// In CL, nil (symbol) and () (empty list/VNil) are equal
+	if (a.typ == VSym && strings.EqualFold(a.str, "nil") && b.typ == VNil) ||
+		(b.typ == VSym && strings.EqualFold(b.str, "nil") && a.typ == VNil) {
+		return true
+	}
+	if a.typ != b.typ {
+		return false
+	}
 	return eqValSeen(a, b, make(map[[2]uintptr]bool))
 }
 
@@ -7542,8 +7572,78 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 				return nil
 			}
 			if symName == "&optional" || symName == "&key" {
-				// Process &optional/&key vars: bind from remaining values
+				// Process &optional vars: bind from remaining values
+				if symName == "&optional" {
+					vp = vp.cdr
+					for !isNil(vp) {
+						if vp.typ != VPair {
+							break
+						}
+						elem := vp.car
+						if elem == nil || elem.typ == VNil {
+							// nil element, skip
+						} else if elem.typ == VSym {
+							// Simple optional var: bind to value or nil
+							if !isNil(vv) {
+								env.Set(elem.str, vv.car)
+								if !isNil(vv) {
+									vv = vv.cdr
+								}
+							} else {
+								env.Set(elem.str, vnil())
+							}
+						} else if elem.typ == VPair {
+							// (var default-value) or (var)
+							varName := elem.car
+							if varName != nil && varName.typ == VSym {
+								if !isNil(vv) {
+									env.Set(varName.str, vv.car)
+									if !isNil(vv) {
+										vv = vv.cdr
+									}
+								} else {
+									// Use default value if provided, else nil
+									if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
+										// Can't eval default in Go - bind to nil as fallback
+										// The macro-based implementation handles this properly
+										env.Set(varName.str, vnil())
+									} else {
+										env.Set(varName.str, vnil())
+									}
+								}
+							}
+						} else {
+							// Non-symbol/non-list element (e.g., number literal in default),
+							// not a valid pattern variable - skip
+						}
+						vp = vp.cdr
+					}
+					return nil
+				}
+				// Process &key vars: keyword-based binding
+				// Build a keyword-to-index map from the value list
+				// Keywords are symbols starting with ':'; bind var matching after ':'
 				vp = vp.cdr
+				// Collect keyword-value pairs from the value list
+				keyValMap := make(map[string]*Value)
+				for !isNil(vv) && vv.typ == VPair {
+					key := vv.car
+					val := vnil()
+					if !isNil(vv.cdr) && vv.cdr.typ == VPair {
+						val = vv.cdr.car
+					}
+					if key != nil && key.typ == VSym && len(key.str) > 0 && key.str[0] == ':' {
+						keywordName := key.str[1:] // strip leading ':'
+						keyValMap[keywordName] = val
+					}
+					vv = vv.cdr
+					if !isNil(vv) && vv.typ == VPair {
+						vv = vv.cdr
+					} else {
+						break
+					}
+				}
+				// Bind each key pattern variable
 				for !isNil(vp) {
 					if vp.typ != VPair {
 						break
@@ -7552,38 +7652,43 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 					if elem == nil || elem.typ == VNil {
 						// nil element, skip
 					} else if elem.typ == VSym {
-						// Simple optional var: bind to value or nil
-						if !isNil(vv) {
-							env.Set(elem.str, vv.car)
-							if !isNil(vv) {
-								vv = vv.cdr
-							}
+						// Simple key var: bind matching keyword or nil
+						if val, ok := keyValMap[elem.str]; ok {
+							env.Set(elem.str, val)
 						} else {
 							env.Set(elem.str, vnil())
 						}
 					} else if elem.typ == VPair {
-						// (var default-value) or (var)
+						// (var default-value) or ((:keyword var) default-value) or (:keyword var) or (:keyword var default-value)
 						varName := elem.car
 						if varName != nil && varName.typ == VSym {
-							if !isNil(vv) {
-								env.Set(varName.str, vv.car)
-								if !isNil(vv) {
-									vv = vv.cdr
-								}
+							if val, ok := keyValMap[varName.str]; ok {
+								env.Set(varName.str, val)
 							} else {
 								// Use default value if provided, else nil
 								if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
-									// Can't eval default in Go - bind to nil as fallback
-									// The macro-based implementation handles this properly
 									env.Set(varName.str, vnil())
 								} else {
 									env.Set(varName.str, vnil())
 								}
 							}
+						} else if varName != nil && varName.typ == VPair && varName.car != nil && varName.car.typ == VSym {
+							// (:keyword var) form
+							keywordName := varName.car.str
+							if keywordName[0] == ':' {
+								keywordName = keywordName[1:]
+							}
+							subVar := varName.cdr
+							if subVar != nil && subVar.typ == VSym {
+								if val, ok := keyValMap[keywordName]; ok {
+									env.Set(subVar.str, val)
+								} else if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
+									env.Set(subVar.str, vnil())
+								} else {
+									env.Set(subVar.str, vnil())
+								}
+							}
 						}
-					} else {
-						// Non-symbol/non-list element (e.g., number literal in default),
-						// not a valid pattern variable - skip
 					}
 					vp = vp.cdr
 				}
@@ -9198,7 +9303,18 @@ func builtinEqIdentity(args []*Value) (*Value, error) {
 	if len(args) < 2 {
 		return vbool(false), nil
 	}
-	return vbool(args[0] == args[1]), nil
+	a, b := args[0], args[1]
+	if a == b {
+		return vbool(true), nil
+	}
+	// In CL, nil (symbol) and () (empty list/VNil) are eq
+	if isNil(a) || isNil(b) {
+		if (a.typ == VSym && strings.EqualFold(a.str, "nil") && b.typ == VNil) ||
+			(b.typ == VSym && strings.EqualFold(b.str, "nil") && a.typ == VNil) {
+			return vbool(true), nil
+		}
+	}
+	return vbool(false), nil
 }
 
 // equal: structural equality (recursive)
@@ -19423,10 +19539,15 @@ var initLib = `
 (define (list? x) (or (null? x) (pair? x)))
 (define (butlast lst . n)
   (let ((n (if (null? n) 1 (car n))))
-    (if (<= n 0) lst
+    (if (<= n 0) (copy-list lst)
       (let ((len (length lst)))
         (if (>= n len) '()
           (take (- len n) lst))))))
+(define (nbutlast lst . n)
+  (let ((n (if (null? n) 1 (car n))))
+    (cond
+      ((<= n 0) (copy-list lst))
+      (#t (butlast lst n)))))
 (define (last lst . n)
   (let ((n (if (null? n) 1 (car n))))
     (drop (max 0 (- (length lst) n)) lst)))
