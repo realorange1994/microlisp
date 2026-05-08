@@ -648,8 +648,9 @@ var currentPackage *Package
 func initPackages() {
 	// Create KEYWORD package
 	makePackage("KEYWORD")
-	// Create initial user package
-	makePackage("USER")
+	// Create initial user package (with CL-USER as standard nickname)
+	userPkg := makePackage("USER")
+	userPkg.nicknames = append(userPkg.nicknames, "CL-USER")
 	// Create CL package (will be synced with USER after initLib)
 	makePackage("CL")
 }
@@ -9806,11 +9807,7 @@ func builtinIntern(args []*Value) (*Value, error) {
 
 func builtinExport(args []*Value) (*Value, error) {
 	if len(args) < 1 {
-		return nil, fmt.Errorf("export: need symbol")
-	}
-	sym := primaryValue(args[0])
-	if sym.typ != VSym {
-		return nil, fmt.Errorf("export: need symbol")
+		return nil, fmt.Errorf("export: need symbol or list of symbols")
 	}
 	pkg := currentPackage
 	if len(args) >= 2 {
@@ -9819,17 +9816,38 @@ func builtinExport(args []*Value) (*Value, error) {
 			pkg = pkg2
 		}
 	}
-	symName := sym.str
-	// Strip keyword prefix
-	if isKeyword(symName) {
-		symName = keywordName(symName)
+	// CL spec: first arg can be a symbol or a list of symbols
+	var syms []*Value
+	first := primaryValue(args[0])
+	if first.typ == VPair {
+		syms = toSlice(first)
+	} else if first.typ == VSym {
+		syms = []*Value{first}
+	} else {
+		return nil, fmt.Errorf("export: need symbol or list of symbols, got %v", first.typ)
 	}
-	pkg.exports[symName] = true
-	// Also intern the symbol in the package
-	if _, ok := pkg.symbols[symName]; !ok {
-		pkg.symbols[symName] = sym
+	var lastSym *Value
+	for _, s := range syms {
+		sym := primaryValue(s)
+		if sym.typ != VSym {
+			return nil, fmt.Errorf("export: need symbol, got %v", sym.typ)
+		}
+		symName := sym.str
+		// Strip keyword prefix
+		if isKeyword(symName) {
+			symName = keywordName(symName)
+		}
+		pkg.exports[symName] = true
+		// Also intern the symbol in the package
+		if _, ok := pkg.symbols[symName]; !ok {
+			pkg.symbols[symName] = sym
+		}
+		lastSym = sym
 	}
-	return sym, nil
+	if len(syms) == 1 {
+		return lastSym, nil
+	}
+	return vbool(true), nil
 }
 
 func builtinFindSymbol(args []*Value) (*Value, error) {
