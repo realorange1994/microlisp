@@ -2992,8 +2992,8 @@ evalLoop:
 						continue
 					}
 					keys := clause.car
-					// Check for else clause
-					if keys.typ == VSym && keys.str == "else" {
+					// Check for else clause (also t and otherwise per CL spec)
+					if keys.typ == VSym && (keys.str == "else" || keys.str == "t" || keys.str == "otherwise") {
 						body := clause.cdr
 						for body.typ == VPair && !isNil(body.cdr) {
 							_, err = eval(body.car, env)
@@ -8170,7 +8170,7 @@ func builtinCompile(args []*Value) (*Value, error) {
 				globalEnv.Set(name.str, result)
 			}
 			// Return (values result nil nil)
-			return list(result, vnil(), vnil()), nil
+			return multiVal(result, vnil(), vnil()), nil
 		}
 	}
 	if name != nil && name.typ == VSym {
@@ -8178,7 +8178,7 @@ func builtinCompile(args []*Value) (*Value, error) {
 		val, err := globalEnv.Get(name.str)
 		if err == nil {
 			// Return (values val nil nil)
-			return list(val, vnil(), vnil()), nil
+			return multiVal(val, vnil(), vnil()), nil
 		}
 	}
 	if def != nil && def.typ == VPair && def.car != nil && def.car.typ == VSym && def.car.str == "lambda" {
@@ -8186,7 +8186,7 @@ func builtinCompile(args []*Value) (*Value, error) {
 		if err != nil {
 			return vnil(), nil
 		}
-		return list(result, vnil(), vnil()), nil
+		return multiVal(result, vnil(), vnil()), nil
 	}
 	return vnil(), nil
 }
