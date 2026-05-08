@@ -8789,19 +8789,19 @@ func subtypepChecks(v1, v2 *Value) (bool, bool) {
 
 func builtinSubtypep(args []*Value) (*Value, error) {
 	if len(args) < 2 {
-		return list(vbool(false), vbool(false)), nil
+		return multiVal(vbool(false), vbool(false)), nil
 	}
 	t1v := primaryValue(args[0])
 	t2v := primaryValue(args[1])
 
 	isSub, result := subtypepChecks(t1v, t2v)
 	if isSub && result {
-		return list(vbool(true), vbool(true)), nil
+		return multiVal(vbool(true), vbool(true)), nil
 	}
 	if isSub && !result {
-		return list(vbool(false), vbool(true)), nil
+		return multiVal(vbool(false), vbool(true)), nil
 	}
-	return list(vbool(false), vbool(false)), nil
+	return multiVal(vbool(false), vbool(false)), nil
 }
 
 var traceTable = make(map[string]bool)
@@ -14795,6 +14795,21 @@ func builtinSeqCopySeq(args []*Value) (*Value, error) {
 	if seq.typ == VStr {
 		return vstr(seq.str), nil
 	}
+	if seq.typ == VArray && seq.array != nil {
+		n := len(seq.array.elements)
+		elems := make([]*Value, n)
+		copy(elems, seq.array.elements)
+		arr := &LispArray{
+			dims:     make([]int, len(seq.array.dims)),
+			elements: elems,
+			fillPtr:  seq.array.fillPtr,
+		}
+		copy(arr.dims, seq.array.dims)
+		result := gcv()
+		result.typ = VArray
+		result.array = arr
+		return result, nil
+	}
 	elems := seqToList(seq)
 	result := make([]*Value, len(elems))
 	copy(result, elems)
@@ -16609,10 +16624,25 @@ func builtinMapcon(args []*Value) (*Value, error) {
 	}
 	fn := args[0]
 	lst := args[1]
-	var results []*Value
 	seen := make(map[*Value]bool)
 	cur := lst
-	for cur != nil && cur.typ == VPair {
+	// nconc-2: append list2 to end of list1, returning list1 (destructive)
+	nconc2 := func(list1, list2 *Value) *Value {
+		if isNil(list2) {
+			return list1
+		}
+		if isNil(list1) {
+			return list2
+		}
+		t := list1
+		for t.typ == VPair && !isNil(t.cdr) {
+			t = t.cdr
+		}
+		t.cdr = list2
+		return list1
+	}
+	var result *Value
+	for !isNil(cur) && cur.typ == VPair {
 		if seen[cur] {
 			break
 		}
@@ -16621,11 +16651,13 @@ func builtinMapcon(args []*Value) (*Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		elems := seqToList(r)
-		results = append(results, elems...)
+		result = nconc2(result, r)
 		cur = cur.cdr
 	}
-	return listFromSlice(results), nil
+	if result == nil {
+		return vnil(), nil
+	}
+	return result, nil
 }
 
 // -------- list* --------
@@ -19194,7 +19226,7 @@ var initLib = `
   (if (null? lst) #f
     (if (equal? x (car lst)) #t (member? x (cdr lst)))))
 (define (assoc x alist)
-  (if (null? alist) #f
+  (if (null? alist) nil
     (if (equal? x (caar alist)) (car alist) (assoc x (cdr alist)))))
 (define (any pred lst)
   (cond
@@ -19825,8 +19857,12 @@ var initLib = `
                    (cons (cons var (cons kind args)) for-list))
                  (parse-clauses tail))))
             ((equal? kw 'with)
-             (set! with-list (cons (list (car rest) (cadr rest)) with-list))
-             (parse-clauses (cddr rest)))
+             (let ((var (car rest))
+                   (val (if (and (not (null? (cdr rest))) (equal? (cadr rest) '=))
+                          (caddr rest) (cadr rest))))
+               (set! with-list (cons (list var val) with-list))
+               (parse-clauses (if (and (not (null? (cdr rest))) (equal? (cadr rest) '=))
+                               (cdddr rest) (cddr rest)))))
             ((equal? kw 'while)
              (set! term-list (cons (list 'while (car rest)) term-list))
              (parse-clauses (cdr rest)))
@@ -20129,6 +20165,8 @@ var initLib = `
              (list var (car args)))
             ((equal? kind 'in)
              (list var (car args)))
+            ((equal? kind 'on)
+             (list var (car args)))
             ((equal? kind '=)
              (list var (car args)))
             (else (list var 0)))))
@@ -20175,6 +20213,8 @@ var initLib = `
                (list '- var by-val)))
             ((equal? kind 'in)
              (list 'cdr var))
+            ((equal? kind 'on)
+             (list 'cdr var))
             ((equal? kind '=)
              (if (and (pair? args) (not (null? (cdr args)))
                       (equal? (cadr args) 'then))
@@ -20208,6 +20248,8 @@ var initLib = `
             ((equal? kind 'above)
              (list '<= var (car args)))
             ((equal? kind 'in)
+             (list 'null? var))
+            ((equal? kind 'on)
              (list 'null? var))
             (else #f))))
 
