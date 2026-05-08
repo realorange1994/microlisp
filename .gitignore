@@ -1,0 +1,3 @@
+*.exe
+sbcl-tests/
+src/
