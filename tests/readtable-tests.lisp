@@ -41,14 +41,15 @@
 (assert-equal ':UPCASE (readtable-case rt) "set-readtable-case works for :UPCASE")
 
 ;; --- get-macro-character for standard chars ---
-;; Standard macro chars are handled by Go-level code, so get-macro-character returns nil
-(assert-nil (get-macro-character '#\') "get-macro-character for ' returns nil (Go-level)")
-(assert-nil (get-macro-character '#\`) "get-macro-character for ` returns nil (Go-level)")
-(assert-nil (get-macro-character '#\,) "get-macro-character for , returns nil (Go-level)")
-(assert-nil (get-macro-character '#\;) "get-macro-character for ; returns nil (Go-level)")
-(assert-nil (get-macro-character '#\") "get-macro-character for \" returns nil (Go-level)")
-(assert-nil (get-macro-character '#\() "get-macro-character for ( returns nil (Go-level)")
-(assert-nil (get-macro-character '#\)) "get-macro-character for ) returns nil (Go-level)")
+;; Standard macro chars now return callable functions (fixing CL compliance)
+(assert-true (not (null (get-macro-character '#\'))) "get-macro-character for ' returns a function")
+(assert-true (not (null (get-macro-character '#\`)) "get-macro-character for ` returns a function")
+(assert-true (not (null (get-macro-character '#\,)) "get-macro-character for , returns a function")
+(assert-true (not (null (get-macro-character '#\;)) "get-macro-character for ; returns a function")
+(assert-true (not (null (get-macro-character '#\))) "get-macro-character for ) returns a function")
+;; ( and \" also return functions but are handled by the lexer
+(assert-true (not (null (get-macro-character '#\()) "get-macro-character for ( returns a function")
+(assert-true (not (null (get-macro-character '#\")) "get-macro-character for \" returns a function")
 
 ;; --- get-macro-character for non-macro chars ---
 (assert-nil (get-macro-character '#\a) "get-macro-character for a returns nil")
@@ -112,6 +113,12 @@
 (assert-equal '(1 2 3) '(1 2 3) "standard quote behavior unchanged")
 (assert-equal '(1 . 2) '(1 . 2) "standard dotted pair unchanged")
 (assert-equal "hello" "hello" "standard strings unchanged")
+
+;; --- close-paren copy via get-macro-character ---
+;; Setting ] to behave like ) allows reading lists terminated by ]
+(set-macro-character #\] (get-macro-character '#\)))
+(assert-equal '(1 2 3) (car (read-from-string "(1 2 3]")) "] as close-paren works")
+(set-macro-character #\] nil) ;; clean up
 
 (end-suite)
 (test-summary)

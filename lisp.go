@@ -4770,7 +4770,23 @@ func parseParams(v *Value) ([]string, string, error) {
 				return params, v.cdr.car.str, nil
 			}
 			if s == "&optional" || s == "&OPTIONAL" || s == "&key" || s == "&KEY" || s == "&allow-other-keys" || s == "&aux" || s == "&AUX" || s == "&whole" || s == "&WHOLE" || s == "&environment" || s == "&ENVIRONMENT" {
-				// Stop collecting required params at these keywords
+				// Collect remaining parameter names (from &optional, &key, &aux lists)
+				rest := v.cdr
+				for !isNil(rest) {
+					if rest.typ != VPair {
+						break
+					}
+					elem := rest.car
+					// Each element can be a symbol or a list (sym default init-supplied-p)
+					if elem != nil {
+						if elem.typ == VSym {
+							params = append(params, elem.str)
+						} else if elem.typ == VPair && elem.car != nil && elem.car.typ == VSym {
+							params = append(params, elem.car.str)
+						}
+					}
+					rest = rest.cdr
+				}
 				break
 			}
 			params = append(params, s)
@@ -4782,9 +4798,7 @@ func parseParams(v *Value) ([]string, string, error) {
 	if !isNil(v) && v.typ == VSym {
 		return params, v.str, nil
 	}
-	if !isNil(v) {
-		return nil, "", fmt.Errorf("bad lambda parameter list")
-	}
+	// Remaining content after &optional/&key/&aux is OK - just return what we collected
 	return params, "", nil
 }
 
