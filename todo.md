@@ -56,4 +56,6 @@
 17. `export` 不接受字符串参数（`defpackage` 的 `:export` 选项传递字符串时会失败）
 18. `cl:NAME` 包限定符号无法解析（CL 包没有导出符号）
 19. `nil` 类型说明符被错误当作 `null`（ANSI CL 中 nil 是空类型，null 才匹配 nil）
+20. `subtypep` 不支持复合 CONS 类型说明符（如 `(cons integer *)`）
+21. `compile` 返回值被包装成 VPair 而非 VMultiVal
 20. `defmacro` 的 `&optional`/`&key`/`&aux` 参数默认值未求值（参数名被提取，但无参数时使用 nil 而非默认值）
