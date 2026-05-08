@@ -4859,7 +4859,7 @@ func parseParams(v *Value) ([]string, string, error) {
 	return params, "", nil
 }
 
-// parseMacroParams handles &whole, &rest, &body, &environment lambda list keywords
+// parseMacroParams handles &whole, &rest, &body, &environment, &optional, &key, &aux lambda list keywords
 func parseMacroParams(v *Value) (params []string, rest string, whole string, envSym string, err error) {
 	// Check for &whole at the beginning
 	if v.typ == VPair && v.car != nil && v.car.typ == VSym && (v.car.str == "&whole" || v.car.str == "&WHOLE") {
@@ -4881,7 +4881,6 @@ func parseMacroParams(v *Value) (params []string, rest string, whole string, env
 		if v.car != nil && v.car.typ == VSym {
 			s := v.car.str
 			if s == "&rest" || s == "&body" || s == "&REST" || s == "&BODY" {
-				// Next symbol is the rest param name
 				restV := v.cdr
 				if !isNil(restV) && restV.typ == VPair && restV.car != nil && restV.car.typ == VSym {
 					rest = restV.car.str
@@ -4905,7 +4904,20 @@ func parseMacroParams(v *Value) (params []string, rest string, whole string, env
 				}
 				continue
 			}
+			// Skip &optional, &key, &aux sections - they're handled by the generated function
+			if s == "&optional" || s == "&OPTIONAL" || s == "&key" || s == "&KEY" || s == "&aux" || s == "&AUX" {
+				v = v.cdr
+				continue
+			}
 			params = append(params, s)
+		} else if v.car != nil && v.car.typ == VPair {
+			// Handle (name default) or (name default supplied-p) optional/key params
+			car := v.car.car
+			if car != nil && car.typ == VSym {
+				params = append(params, car.str)
+			} else {
+				break
+			}
 		} else {
 			break
 		}
