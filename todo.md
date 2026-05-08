@@ -58,4 +58,7 @@
 19. `nil` 类型说明符被错误当作 `null`（ANSI CL 中 nil 是空类型，null 才匹配 nil）
 20. `subtypep` 不支持复合 CONS 类型说明符（如 `(cons integer *)`）
 21. `compile` 返回值被包装成 VPair 而非 VMultiVal
+22. `make-sequence` 不接受 `:initial-element` 关键字
+23. `subseq` 对字符串返回 nil 而非子字符串
+24. `nreverse` 对列表原地修改但返回错误结果
 20. `defmacro` 的 `&optional`/`&key`/`&aux` 参数默认值未求值（参数名被提取，但无参数时使用 nil 而非默认值）
