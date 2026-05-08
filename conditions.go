@@ -729,7 +729,32 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 				}
 				return true
 			case "cons":
-				return val.typ == VPair
+				// (cons) - check if it's a pair
+				// (cons car-type) - check car matches car-type
+				// (cons car-type cdr-type) - check car and cdr match their types
+				if val.typ != VPair {
+					return false
+				}
+				// Check cdr (second element if present)
+				if typeSpec.cdr != nil && !isNil(typeSpec.cdr) {
+					if typeSpec.cdr.typ == VPair && typeSpec.cdr.car != nil {
+						carType := typeSpec.cdr.car
+						cdrRemaining := typeSpec.cdr.cdr
+						// Check car against car-type
+						if !typepCheckRec(val.car, carType, env, seen) {
+							return false
+						}
+						// If there's a cdr-type, check val.cdr against it
+						if cdrRemaining != nil && !isNil(cdrRemaining) {
+							if cdrRemaining.typ == VPair && cdrRemaining.car != nil {
+								if !typepCheckRec(val.cdr, cdrRemaining.car, env, seen) {
+									return false
+								}
+							}
+						}
+					}
+				}
+				return true
 			case "integer":
 				return (val.typ == VNum && val.num == float64(int64(val.num))) || val.typ == VRat || val.typ == VBigInt
 			case "float":
@@ -763,7 +788,7 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 	if typeName == "t" {
 		return true
 	}
-	if typeName == "nil" {
+	if typeName == "nil" || typeName == "null" {
 		return isNil(val)
 	}
 	if typeName == "integer" {
