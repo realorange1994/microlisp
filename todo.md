@@ -73,3 +73,6 @@
 34. 浮点数指数标记（d/D/f/F/s/S/l/L）不被 `parseFloatStr` 支持
 35. `ignore-errors` 出错时返回 `(nil . condition)` 而非 `nil`
 36. `destructuring-bind` 不支持 `&rest`/`&body`/`&optional`/`&key`（`&rest` 被当作普通变量绑定到错误值）
+
+37. Go 词法分析器对超出 float64 尾数精度的大整数（>2^53）丢失精度
+38. setf 对未绑定变量报错而非创建全局绑定（ANSI CL 语义）
