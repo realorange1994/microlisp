@@ -15402,10 +15402,20 @@ func builtinAbs(args []*Value) (*Value, error) {
 	return nil, fmt.Errorf("abs: not a number")
 }
 
+// isReal returns true if v is a real numeric type (not complex)
+func isReal(v *Value) bool {
+	return v.typ == VNum || v.typ == VRat || v.typ == VBigInt
+}
+
 // -------- max / min --------
 func builtinMax(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("max: need at least one number")
+	}
+	for _, a := range args {
+		if !isReal(a) {
+			return nil, fmt.Errorf("max: not a real number: %v", a)
+		}
 	}
 	result := args[0]
 	for i := 1; i < len(args); i++ {
@@ -15420,6 +15430,11 @@ func builtinMax(args []*Value) (*Value, error) {
 func builtinMin(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("min: need at least one number")
+	}
+	for _, a := range args {
+		if !isReal(a) {
+			return nil, fmt.Errorf("min: not a real number: %v", a)
+		}
 	}
 	result := args[0]
 	for i := 1; i < len(args); i++ {
