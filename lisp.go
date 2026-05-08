@@ -869,6 +869,16 @@ func gcd(a, b int64) int64 {
 
 // parseFloatStr parses a string as a float64, handling integers, floats, and rationals (e.g. "1/2")
 func parseFloatStr(s string) (float64, error) {
+	// Normalize CL float exponent markers (d, f, s, l) to Go's 'e' for ParseFloat
+	var s2 strings.Builder
+	for _, ch := range s {
+		if ch == 'd' || ch == 'D' || ch == 'f' || ch == 'F' || ch == 's' || ch == 'S' || ch == 'l' || ch == 'L' {
+			s2.WriteRune('e')
+		} else {
+			s2.WriteRune(ch)
+		}
+	}
+	s = s2.String()
 	if f, err := strconv.ParseFloat(s, 64); err == nil {
 		return f, nil
 	}
@@ -2626,14 +2636,14 @@ evalLoop:
 				}
 				return result, nil
 			case "ignore-errors":
-				// (ignore-errors body...) — returns (values nil condition) on error
+				// (ignore-errors body...) — returns nil on error
 				body := v.cdr
 				var result *Value
 				for !isNil(body) {
 					result, err = eval(body.car, env)
 					if err != nil {
-						condVal := vstr(err.Error())
-						return list(vnil(), condVal), nil
+						// On error, return nil (the primary value of (values nil condition))
+						return vnil(), nil
 					}
 					body = body.cdr
 				}
