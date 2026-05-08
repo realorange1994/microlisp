@@ -4323,7 +4323,7 @@ evalLoop:
 				}
 				return nil, fmt.Errorf("call-next-method: not inside a method")
 
-			case "load":
+				case "load":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("load: need a filename")
 				}
@@ -4332,6 +4332,50 @@ evalLoop:
 					return nil, fmt.Errorf("load: filename must be a string")
 				}
 				fname := fnameVal.str
+				// Parse keyword arguments for :if-does-not-exist
+				ifDoesNotExist := true // default per CL spec
+				rest := v.cdr.cdr
+				for !isNil(rest) {
+					if rest.typ == VPair && rest.car.typ == VSym {
+						sname := rest.car.str
+						if sname == ":if-does-not-exist" || sname == ":IF-DOES-NOT-EXIST" {
+							if rest.cdr.typ == VPair {
+								// Evaluate the keyword argument value
+								val := rest.cdr.car
+								if val.typ == VSym {
+									// Evaluate symbol to get its value (nil -> VNil, t -> VBool for #t, etc.)
+									ev, _ := eval(val, env)
+									if ev != nil {
+										val = primaryValue(ev)
+									}
+								}
+								if isNil(val) || val == globalEnv.bindings["#f"] {
+									ifDoesNotExist = false
+								}
+								rest = rest.cdr.cdr
+								continue
+							}
+						} else if sname == ":if-exists" {
+							if rest.cdr.typ == VPair {
+								rest = rest.cdr.cdr
+								continue
+							}
+						}
+					}
+					if rest.typ == VPair {
+						rest = rest.cdr
+					} else {
+						break
+					}
+				}
+				// Check if file exists
+				info, statErr := os.Stat(fname)
+				if statErr != nil || info == nil {
+					if !ifDoesNotExist {
+						return vnil(), nil
+					}
+					return nil, fmt.Errorf("load: open %s: %v", fname, statErr)
+				}
 				return loadFile(fname, env)
 			case "with-open-file":
 				// (with-open-file (var pathname &key direction ...) body...)
