@@ -80,3 +80,5 @@
 40. `butlast` 对 n<=0 返回原列表而非副本
 41. `block`/`return-from` 不接受 nil 作为块名
 42. `eq`/`equal` 不将 nil 符号和 VNil（空列表）视为相等
+43. 双反引号嵌套求值错误（`(quasiquote (quasiquote X))` 未正确解包）
+44. `unquote`/`unquote-splicing` 在 depth>0 时未递归处理
