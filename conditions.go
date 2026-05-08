@@ -788,8 +788,11 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 	if typeName == "t" {
 		return true
 	}
-	if typeName == "nil" || typeName == "null" {
+	if typeName == "null" {
 		return isNil(val)
+	}
+	if typeName == "nil" {
+		return false // nil is the empty type - never matches any value
 	}
 	if typeName == "integer" {
 		return (val.typ == VNum && val.num == float64(int64(val.num))) || val.typ == VRat || val.typ == VBigInt

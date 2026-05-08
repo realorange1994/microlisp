@@ -655,7 +655,9 @@ func initPackages() {
 	makePackage("CL")
 }
 
-// syncCLPackage copies all symbols from USER to CL so (defpackage ... (:use :cl)) works
+// syncCLPackage copies all symbols from USER to CL so (defpackage ... (:use :cl)) works.
+// It also adds special operators and all builtin function names to the CL package's
+// exports so that cl:NAME syntax works for all standard CL names.
 func syncCLPackage() {
 	userPkg := findPackage("USER")
 	clPkg := findPackage("CL")
@@ -669,6 +671,18 @@ func syncCLPackage() {
 		if exported {
 			clPkg.exports[name] = true
 		}
+	}
+	// Add all special operators to CL package exports
+	for _, name := range specialOpNames {
+		sym := vsym(name)
+		clPkg.symbols[name] = sym
+		clPkg.exports[name] = true
+	}
+	// Add all builtin functions to CL package exports
+	for _, b := range builtins {
+		sym := vsym(b.name)
+		clPkg.symbols[b.name] = sym
+		clPkg.exports[b.name] = true
 	}
 }
 
@@ -700,7 +714,19 @@ func mkKeyword(modeStr string) *Value {
 	return vsym(modeStr)
 }
 
-// resolvePackageSymbol splits "pkg:sym" or "pkg::sym" and resolves the symbol
+// isSpecialOp returns true if name is a special operator handled by eval.
+func isSpecialOp(name string) bool {
+	for _, s := range specialOpNames {
+		if s == name {
+			return true
+		}
+	}
+	return false
+}
+
+// resolvePackageSymbol splits "pkg:sym" or "pkg::sym" and resolves the symbol.
+// For single-colon forms (pkg:sym), it returns nil if the symbol is not exported.
+// For double-colon forms (pkg::sym), it interns the symbol internally if not found.
 func resolvePackageSymbol(s string) *Value {
 	if strings.Contains(s, "::") {
 		parts := strings.SplitN(s, "::", 2)
@@ -723,6 +749,20 @@ func resolvePackageSymbol(s string) *Value {
 		}
 		symName := parts[1]
 		if sym, ok := pkg.symbols[symName]; ok && pkg.exports[symName] {
+			return sym
+		}
+		// For package-qualified special operators (e.g. cl:defparameter),
+		// intern the symbol in the package even if not explicitly exported,
+		// since special operators are part of the package's API.
+		if isSpecialOp(symName) {
+			sym := vsym(symName)
+			pkg.symbols[symName] = sym
+			pkg.exports[symName] = true
+			return sym
+		}
+		// Fallback: check global symbolTable for canonical symbols like nil, t
+		// This handles cl:nil, cl:t, etc.
+		if sym, ok := symbolTable[symName]; ok {
 			return sym
 		}
 		return nil // not found or not exported
@@ -4935,6 +4975,25 @@ func typeStr(v *Value) string {
 type builtinDef struct {
 	name string
 	fn   NativeFunc
+}
+
+// specialOpNames is the list of all special operator names handled by eval.
+var specialOpNames = []string{
+	"quote", "function", "if", "progn", "let", "letrec", "labels",
+	"flet", "set!", "setq", "defvar", "defparameter", "defconstant",
+	"defmacro", "defun", "declare", "the", "block", "return-from",
+	"return", "tagbody", "go", "catch", "throw", "unwind-protect",
+	"multiple-value-bind", "multiple-value-list", "multiple-value-setq",
+	"multiple-value-prog1", "multiple-value-call", "proclaim", "declaim",
+	"progv", "funcall", "macrolet", "symbol-macrolet", "eval-when",
+	"locally", "define", "define-macro", "lambda", "step", "time",
+	"ignore-errors", "loop-finish", "and", "or", "not", "begin",
+	"case", "typecase", "ecase", "etypecase", "ctypcase", "ctypecase",
+	"destructuring-bind", "handler-case", "handler-bind",
+	"restart-case", "restart-bind", "setf", "cond", "defclass",
+	"defmethod", "call-next-method", "load", "with-open-file",
+	"with-output-to-string", "with-input-from-string", "quasiquote",
+	"macro-expand", "nth-value",
 }
 
 var builtins = []builtinDef{
