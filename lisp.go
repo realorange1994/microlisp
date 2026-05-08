@@ -1840,7 +1840,7 @@ evalLoop:
 				}
 				arg := v.cdr.car
 				if arg.typ == VSym {
-					val, err := globalEnv.Get(arg.str)
+					val, err := env.Get(arg.str)
 					if err != nil {
 						return nil, fmt.Errorf("function: undefined: %s", arg.str)
 					}
@@ -19061,10 +19061,8 @@ var initLib = `
 ;; assert: simple version - (assert condition)
 (define-macro (assert test . opts)
   (list 'if test
-    (cons 'begin opts)
-    (if (null? opts)
-        (list 'error "assertion failed")
-        (list 'error (car opts)))))
+    nil
+    (list 'error "assertion failed")))
 
 ;; builtin describe is used instead
 
