@@ -101,6 +101,35 @@ func findClass(name string) *Value {
 	return globalEnv.bindings[name]
 }
 
+// signalDivisionByZero creates a division-by-zero condition and checks handlers.
+// If a handler catches it, panics with handledError. Otherwise returns a fallback error.
+func signalDivisionByZero() error {
+	cond := makeSimpleCondition("division-by-zero", "division by zero")
+	checkBreakOnSignals(cond)
+	if len(handlerStack) > 0 {
+		for i := len(handlerStack) - 1; i >= 0; i-- {
+			h := handlerStack[i]
+			if conditionMatchesType(cond, h.typeSymbol) {
+				fn := h.handlerFn
+				if fn.typ == VPrim {
+					result, err := fn.fn([]*Value{cond})
+					if err != nil {
+						panic(fmt.Errorf("handler-function panicked: %v", err))
+					}
+					panic(&handledError{condition: cond, result: result})
+				} else if fn.typ == VFunc {
+					result, err := apply(fn, cons(cond, vnil()), h.env)
+					if err != nil {
+						panic(fmt.Errorf("handler-function panicked: %v", err))
+					}
+					panic(&handledError{condition: cond, result: result})
+				}
+			}
+		}
+	}
+	return fmt.Errorf("division by zero")
+}
+
 // makeSimpleCondition is a helper to create a condition instance of the given class.
 func makeSimpleCondition(className, msg string) *Value {
 	cond := gcv()

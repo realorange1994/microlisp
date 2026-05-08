@@ -102,7 +102,6 @@ type LispArray struct {
 	elements   []*Value // flat storage (row-major)
 	fillPtr    int      // fill-pointer for vectors (-1 if no fill-pointer)
 	adjustable bool     // whether array is adjustable
-	displaced  *Value   // displaced-to array, or nil
 }
 
 type Value struct {
@@ -150,7 +149,6 @@ type genMethod struct {
 	specializers []string
 	body         *Value
 	env          *Env
-	rest         string
 }
 
 type HashTable struct {
@@ -238,7 +236,6 @@ var lispFeatures map[string]bool
 var lispModules map[string]bool
 
 // Threading globals
-var evalMu sync.Mutex
 var nextThreadID int64
 
 type threadResult struct {
@@ -278,13 +275,6 @@ var evalDepth int
 const maxLoopIterations = 10000000
 
 var loopIterationCount int
-
-type conditionSignal struct {
-	typeSymbol string
-	condition  *Value
-}
-
-func (c *conditionSignal) Error() string { return "<condition>" }
 
 // handledError is used internally by error/signal to carry a handled condition result.
 // restartInvoke is used by invoke-restart to transfer control to restart-case.
@@ -909,22 +899,6 @@ func multiValList(v *Value) *Value {
 }
 func isPair(v *Value) bool { return v != nil && v.typ == VPair }
 
-// pairCar returns v.car if v is a VPair, nil otherwise.
-func pairCar(v *Value) *Value {
-	if v == nil || v.typ != VPair {
-		return nil
-	}
-	return v.car
-}
-
-// pairCdr returns v.cdr if v is a VPair, nil otherwise.
-func pairCdr(v *Value) *Value {
-	if v == nil || v.typ != VPair {
-		return nil
-	}
-	return v.cdr
-}
-
 func isTruthy(v *Value) bool {
 	if v == nil {
 		return false
@@ -1458,17 +1432,6 @@ type Parser struct {
 	env       *Env // for calling Lisp-level macro functions
 }
 
-func parse(s string) (*Value, error) {
-	p := &Parser{l: lex(s), readtable: currentReadtable, env: globalEnv}
-	p.advance()
-	v, err := p.readExpr()
-	if err != nil {
-		return nil, err
-	}
-	// handle reader macros
-	return p.expandReaderMacros(v), nil
-}
-
 func (p *Parser) advance() {
 	if p.pi < len(p.ptoks) {
 		p.tok = p.ptoks[p.pi]
@@ -1609,20 +1572,6 @@ func (p *Parser) readList() (*Value, error) {
 	return head, nil
 }
 
-func (p *Parser) expandReaderMacros(v *Value) *Value {
-	if !isPair(v) {
-		return v
-	}
-	if v.car == nil {
-		return v
-	}
-	switch v.car.typ {
-	case VPair:
-		return cons(p.expandReaderMacros(v.car), p.expandReaderMacros(v.cdr))
-	case VSym:
-	}
-	return cons(p.expandReaderMacros(v.car), p.expandReaderMacros(v.cdr))
-}
 
 func tokName(t TokType) string {
 	switch t {
@@ -1770,10 +1719,6 @@ func parseAll(s string) (*Value, error) {
 }
 
 // -------- Evaluator --------
-var symQuote = vsym("quote")
-var symQq = vsym("quasiquote")
-var symUnq = vsym("unquote")
-var symUnqS = vsym("unquote-splicing")
 
 func evalString(s string, env *Env) (*Value, error) {
 	// Use lazy parsing: parse and evaluate one expression at a time.
@@ -2032,7 +1977,7 @@ evalLoop:
 				newEnv := NewEnv(env)
 				for i, sym := range syms {
 					if sym.typ != VSym {
-						return nil, fmt.Errorf("progv: expected symbol at position ~D", i)
+						return nil, fmt.Errorf("progv: expected symbol at position %d", i)
 					}
 					var val *Value = vnil()
 					if i < len(vals) {
@@ -3129,7 +3074,7 @@ evalLoop:
 					}
 					clauses = clauses.cdr
 				}
-				return nil, fmt.Errorf("ecase: no match for ~A", keyVal)
+				return nil, fmt.Errorf("ecase: no match for %s", toString(keyVal))
 			case "etypecase":
 				// (etypecase keyform (type body...) ...)
 				if v.cdr == nil || v.cdr.typ != VPair {
@@ -3165,7 +3110,7 @@ evalLoop:
 					}
 					clauses = clauses.cdr
 				}
-				return nil, fmt.Errorf("etypecase: no match for ~A", keyVal)
+				return nil, fmt.Errorf("etypecase: no match for %s", toString(keyVal))
 
 			case "ctypecase":
 				// (ctypecase keyplace (type body...) ...)
@@ -3203,7 +3148,7 @@ evalLoop:
 					}
 					clauses = clauses.cdr
 				}
-				return nil, fmt.Errorf("ctypecase: no match for ~A", keyVal)
+				return nil, fmt.Errorf("ctypecase: no match for %s", toString(keyVal))
 
 			case "destructuring-bind":
 				// (destructuring-bind (pattern) expr body...)
@@ -3741,7 +3686,7 @@ evalLoop:
 				}
 				env = symEnv
 				for symBody.typ == VPair && !isNil(symBody.cdr) {
-					v = symBody.car
+					_ = symBody.car
 					symBody = symBody.cdr
 					continue
 				}
@@ -5503,9 +5448,6 @@ func vpathname(p *LispPathname) *Value {
 	return v
 }
 
-func isPathname(v *Value) bool {
-	return v.typ == VPathname
-}
 
 func vpkg(p *Package) *Value {
 	v := gcv()
@@ -5527,23 +5469,6 @@ func vrt(rt *Readtable) *Value {
 
 func isReadtable(v *Value) bool {
 	return v != nil && v.typ == VReadtable
-}
-
-func getCurrentReadtable() *Readtable {
-	if currentReadtable != nil {
-		return currentReadtable
-	}
-	return standardReadtable
-}
-
-func resolveReadtable(v *Value) *Readtable {
-	if v == nil || isNil(v) {
-		return getCurrentReadtable()
-	}
-	if v.typ == VReadtable {
-		return v.readtable
-	}
-	return getCurrentReadtable()
 }
 
 func getPathname(v *Value) *LispPathname {
@@ -6568,7 +6493,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 			// 1 / (ar + ai*i) = ar/(ar²+ai²) - ai/(ar²+ai²)*i
 			den := ar*ar + ai*ai
 			if den == 0 {
-				return nil, fmt.Errorf("division by zero")
+				return nil, signalDivisionByZero()
 			}
 			return vcomplex(ar/den, -ai/den), nil
 		}
@@ -6576,7 +6501,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 			br, bi := toComplexParts(a)
 			den := br*br + bi*bi
 			if den == 0 {
-				return nil, fmt.Errorf("division by zero")
+				return nil, signalDivisionByZero()
 			}
 			// (ar + ai*i) / (br + bi*i) = (ar*br + ai*bi)/den + (ai*br - ar*bi)/den * i
 			newR := (ar*br + ai*bi) / den
@@ -6588,13 +6513,13 @@ func builtinDiv(args []*Value) (*Value, error) {
 	if len(args) == 1 {
 		if args[0].typ == VBigInt {
 			if args[0].bigInt.Sign() == 0 {
-				return nil, fmt.Errorf("division by zero")
+				return nil, signalDivisionByZero()
 			}
 			return vnum(1.0 / toNum(args[0])), nil
 		}
 		if args[0].typ == VRat {
 			if args[0].irat == 0 {
-				return nil, fmt.Errorf("division by zero")
+				return nil, signalDivisionByZero()
 			}
 			// 1 / (a/b) = b/a
 			n := args[0].iden
@@ -6606,7 +6531,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 			return vrat(n, d), nil
 		}
 		if toNum(args[0]) == 0 {
-			return nil, fmt.Errorf("division by zero")
+			return nil, signalDivisionByZero()
 		}
 		return vnum(1.0 / toNum(args[0])), nil
 	}
@@ -6617,7 +6542,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 			r := toNum(args[0])
 			for _, a := range args[1:] {
 				if toNum(a) == 0 {
-					return nil, fmt.Errorf("division by zero")
+					return nil, signalDivisionByZero()
 				}
 				r /= toNum(a)
 			}
@@ -6629,14 +6554,14 @@ func builtinDiv(args []*Value) (*Value, error) {
 				r := toNum(args[0])
 				for _, a2 := range args[1:] {
 					if toNum(a2) == 0 {
-						return nil, fmt.Errorf("division by zero")
+						return nil, signalDivisionByZero()
 					}
 					r /= toNum(a2)
 				}
 				return vnum(r), nil
 			}
 			if bi.Sign() == 0 {
-				return nil, fmt.Errorf("division by zero")
+				return nil, signalDivisionByZero()
 			}
 			den.Mul(den, bi)
 		}
@@ -6673,7 +6598,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 				break
 			}
 			if an == 0 {
-				return nil, fmt.Errorf("division by zero")
+				return nil, signalDivisionByZero()
 			}
 			// (n0/d0) / (an/ad) = n0*ad / (d0*an)
 			n0 *= ad
@@ -6693,7 +6618,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 			r := toNum(args[0])
 			for _, a := range args[1:] {
 				if toNum(a) == 0 {
-					return nil, fmt.Errorf("division by zero")
+					return nil, signalDivisionByZero()
 				}
 				r /= toNum(a)
 			}
@@ -6704,7 +6629,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 	r := toNum(args[0])
 	for _, a := range args[1:] {
 		if toNum(a) == 0 {
-			return nil, fmt.Errorf("division by zero")
+			return nil, signalDivisionByZero()
 		}
 		r /= toNum(a)
 	}
@@ -6800,6 +6725,9 @@ func builtinCar(args []*Value) (*Value, error) {
 	if v != nil && v.typ == VMultiVal {
 		return primaryValue(v), nil
 	}
+	if isNil(v) {
+		return vnil(), nil
+	}
 	if !isPair(v) {
 		return nil, fmt.Errorf("car: not a pair")
 	}
@@ -6810,10 +6738,17 @@ func builtinCdr(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("cdr: need 1 argument")
 	}
-	if !isPair(args[0]) {
+	v := args[0]
+	if v != nil && v.typ == VMultiVal {
+		v = primaryValue(v)
+	}
+	if isNil(v) {
+		return vnil(), nil
+	}
+	if !isPair(v) {
 		return nil, fmt.Errorf("cdr: not a pair")
 	}
-	return args[0].cdr, nil
+	return v.cdr, nil
 }
 
 func builtinSetCar(args []*Value) (*Value, error) {
@@ -7323,55 +7258,7 @@ func eqValSeen(a, b *Value, seen map[[2]uintptr]bool) bool {
 	return false
 }
 
-// typeMatches checks if a value matches a type name for typecase.
-func typeMatches(v *Value, typeName string) bool {
-	switch typeName {
-	case "number", "integer", "float", "rational", "real", "complex":
-		if v.typ == VNum || v.typ == VRat || v.typ == VComplex || v.typ == VBigInt {
-			if typeName == "integer" {
-				return v.typ == VNum && v.num == math.Trunc(v.num) || v.typ == VRat || v.typ == VBigInt
-			}
-			if typeName == "float" {
-				return v.typ == VNum && v.num != math.Trunc(v.num)
-			}
-			if typeName == "rational" {
-				return v.typ == VRat || v.typ == VNum || v.typ == VBigInt
-			}
-			if typeName == "real" {
-				return v.typ == VNum || v.typ == VRat || v.typ == VBigInt
-			}
-			if typeName == "complex" {
-				return v.typ == VComplex
-			}
-			return true
-		}
-		return false
-	case "string":
-		return v.typ == VStr
-	case "symbol":
-		return v.typ == VSym
-	case "character":
-		return v.typ == VChar
-	case "list", "cons":
-		return v.typ == VPair
-	case "null", "nil":
-		return v.typ == VNil
-	case "boolean":
-		return v.typ == VBool
-	case "vector", "hash-table":
-		return v.typ == VVHash
-	case "function", "procedure":
-		return v.typ == VFunc || v.typ == VPrim
-	case "atom":
-		return v.typ != VPair
-	default:
-		// Check if it's a class name
-		if v.typ == VInstance && v.instClass != nil && v.instClass.str == typeName {
-			return true
-		}
-		return false
-	}
-}
+
 
 // bindPattern binds a destructuring pattern to a value in the given env.
 func bindPattern(pattern *Value, val *Value, env *Env) error {
@@ -7741,7 +7628,7 @@ func builtinErr(args []*Value) (*Value, error) {
 	for _, a := range args {
 		msg += toString(a)
 	}
-	return nil, fmt.Errorf(msg)
+	return nil, fmt.Errorf("%s", msg)
 }
 
 func builtinExit(args []*Value) (*Value, error) {
@@ -9715,9 +9602,7 @@ func builtinFFI(args []*Value) (*Value, error) {
 		if len(fixedArgs) > numIn-1 {
 			fixedArgs = callArgs[:numIn-1]
 			varArgs := callArgs[numIn-1:]
-			for _, va := range varArgs {
-				fixedArgs = append(fixedArgs, va)
-			}
+			fixedArgs = append(fixedArgs, varArgs...)
 			callArgs = fixedArgs
 		}
 	}
@@ -12142,13 +12027,7 @@ func builtinSubseqSetf(args []*Value) (*Value, error) {
 		if newval.typ == VStr {
 			newStr = newval.str
 		}
-		newRunes := []rune(newStr)
-		// Replace the range with newRunes (truncate or extend as needed)
-		replaceLen := len(newRunes)
-		if replaceLen > end-start {
-			replaceLen = end - start
-		}
-		// Build new string: before + newRunes + rest
+		// Build new string: before + newStr + rest
 		result := string(runes[:start]) + newStr + string(runes[end:])
 		// Modify the string in place
 		seq.str = result
@@ -12899,16 +12778,7 @@ func builtinNsublis(args []*Value) (*Value, error) {
 	return helper(args[1]), nil
 }
 
-// -------- multiple-value-list (builtin) --------
-func builtinMultipleValueList(args []*Value) (*Value, error) {
-	if len(args) < 1 {
-		return nil, fmt.Errorf("multiple-value-list: need a form")
-	}
-	// This is a special form in CL, but as a builtin it receives
-	// already-evaluated args. We need to handle it as a special form.
-	// For now, just return the single value as a list.
-	return list(args[0]), nil
-}
+
 
 // -------- stable-sort (builtin) --------
 func builtinStableSort(args []*Value) (*Value, error) {
@@ -13654,9 +13524,6 @@ func builtinDelete(args []*Value) (*Value, error) {
 	}
 	if start < 0 {
 		start = 0
-	}
-	if end > start {
-		end = start + (end - start)
 	}
 
 	// Destructive in-place deletion by rewiring .cdr pointers
@@ -14951,7 +14818,24 @@ func builtinNStringCapitalize(args []*Value) (*Value, error) {
 	if len(args) < 1 || args[0].typ != VStr {
 		return nil, fmt.Errorf("nstring-capitalize: need a string")
 	}
-	return vstr(strings.Title(args[0].str)), nil
+	return vstr(titleCaseString(args[0].str)), nil
+}
+
+func titleCaseString(s string) string {
+	var result []rune
+	capitalize := true
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			capitalize = true
+		}
+		if capitalize && unicode.IsLetter(r) {
+			result = append(result, unicode.ToTitle(r))
+			capitalize = false
+		} else {
+			result = append(result, r)
+		}
+	}
+	return string(result)
 }
 
 // -------- string-equal (case-insensitive) --------
@@ -16196,55 +16080,6 @@ func builtinNreconc(args []*Value) (*Value, error) {
 
 // -------- concatenate (already exists) --------
 
-// -------- map --------
-func builtinSeqMapResult(args []*Value) (*Value, error) {
-	if len(args) < 3 {
-		return nil, fmt.Errorf("map: need result-type, function, and sequence")
-	}
-	resultType := args[0]
-	fn := args[1]
-	seqs := args[2:]
-	// Get element lists
-	allElems := make([][]*Value, len(seqs))
-	minLen := -1
-	for i, seq := range seqs {
-		elems := seqToList(seq)
-		allElems[i] = elems
-		if minLen < 0 || len(elems) < minLen {
-			minLen = len(elems)
-		}
-	}
-	if minLen <= 0 {
-		if resultType.typ == VSym && resultType.str == "string" {
-			return vstr(""), nil
-		}
-		return vnil(), nil
-	}
-	var result []*Value
-	for i := 0; i < minLen; i++ {
-		callArgs := make([]*Value, len(seqs))
-		for j, elems := range allElems {
-			callArgs[j] = elems[i]
-		}
-		r, err := callFnOnSeq(fn, callArgs, globalEnv)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, r)
-	}
-	if resultType.typ == VSym && resultType.str == "string" {
-		var sb strings.Builder
-		for _, v := range result {
-			if v.typ == VChar {
-				sb.WriteRune(v.ch)
-			} else {
-				sb.WriteString(toString(v))
-			}
-		}
-		return vstr(sb.String()), nil
-	}
-	return listFromSlice(result), nil
-}
 
 // -------- mapl / maplist / mapc / mapcon --------
 func builtinMaplist(args []*Value) (*Value, error) {
@@ -17683,7 +17518,7 @@ func formatDispatch(fs *fmtState) {
 		fs.argIdx = subFs.argIdx
 		s := subFs.buf.String()
 		if colon && at {
-			s = strings.Title(strings.ToLower(s))
+			s = titleCaseString(strings.ToLower(s))
 		} else if colon {
 			s = strings.ToUpper(s)
 		} else if at {
@@ -18232,15 +18067,7 @@ func c3Linearize(c *Value, parents []*Value) []*Value {
 	return result
 }
 
-// findMethodClass finds the class in the CPL matching a given class name
-func findInCPL(cpl []*Value, name string) int {
-	for i, c := range cpl {
-		if c.str == name {
-			return i
-		}
-	}
-	return -1
-}
+
 
 func lispToReflect(v *Value, t reflect.Type) reflect.Value {
 	switch v.typ {

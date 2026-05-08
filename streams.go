@@ -639,28 +639,6 @@ func builtinPrint(args []*Value) (*Value, error) {
 	return vnil(), nil
 }
 
-func builtinPrintObj(args []*Value) (*Value, error) {
-	if len(args) < 1 {
-		return nil, fmt.Errorf("print: need an object")
-	}
-	stream := stdoutStream
-	if len(args) > 1 {
-		stream = args[1]
-		if stream.typ != VStream {
-			return nil, fmt.Errorf("print: not a stream")
-		}
-	}
-	if err := stream.stream.writeChar('\n'); err != nil {
-		return nil, err
-	}
-	if err := stream.stream.writeString(writeToString(primaryValue(args[0]))); err != nil {
-		return nil, err
-	}
-	if err := stream.stream.writeChar(' '); err != nil {
-		return nil, err
-	}
-	return vnil(), nil
-}
 
 func builtinPrincl(args []*Value) (*Value, error) {
 	if len(args) < 1 {
