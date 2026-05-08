@@ -72,3 +72,4 @@
 33. `subtypep` 返回 list 而非 VMultiVal（导致 `not` 接收整个列表）
 34. 浮点数指数标记（d/D/f/F/s/S/l/L）不被 `parseFloatStr` 支持
 35. `ignore-errors` 出错时返回 `(nil . condition)` 而非 `nil`
+36. `destructuring-bind` 不支持 `&rest`/`&body`/`&optional`/`&key`（`&rest` 被当作普通变量绑定到错误值）
