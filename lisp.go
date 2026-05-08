@@ -8680,30 +8680,126 @@ func builtinWriteSequence(args []*Value) (*Value, error) {
 	}
 }
 
+// subtypepChecks recursively checks subtype relationship between two type specifier Values.
+// It returns (isKnown, isSubtype).
+func subtypepChecks(v1, v2 *Value) (bool, bool) {
+	typeName := func(v *Value) string {
+		if v.typ == VSym {
+			return v.str
+		}
+		if v.typ == VPair && v.car != nil && v.car.typ == VSym {
+			return v.car.str
+		}
+		return ""
+	}
+
+	simpleSubtype := func(t1, t2 string) bool {
+		if t1 == t2 {
+			return true
+		}
+		types := map[string][]string{"integer": {"rational", "real", "number", "atom", "t"}, "float": {"real", "number", "atom", "t"}, "rational": {"real", "number", "atom", "t"}, "complex": {"number", "atom", "t"}, "real": {"number", "atom", "t"}, "ratio": {"rational", "real", "number", "atom", "t"}, "fixnum": {"integer", "rational", "real", "number", "atom", "t"}, "bignum": {"integer", "rational", "real", "number", "atom", "t"}, "bit": {"integer", "rational", "real", "number", "atom", "t"}, "short-float": {"float", "real", "number", "atom", "t"}, "single-float": {"float", "real", "number", "atom", "t"}, "double-float": {"float", "real", "number", "atom", "t"}, "long-float": {"float", "real", "number", "atom", "t"}, "string": {"array", "vector", "sequence", "atom", "t"}, "simple-string": {"string", "array", "vector", "sequence", "atom", "t"}, "character": {"atom", "t"}, "base-char": {"standard-char", "character", "atom", "t"}, "standard-char": {"character", "atom", "t"}, "extended-char": {"character", "atom", "t"}, "symbol": {"atom", "t"}, "keyword": {"symbol", "atom", "t"}, "null": {"symbol", "list", "sequence", "atom", "t"}, "cons": {"list", "sequence", "t"}, "pair": {"cons", "list", "sequence", "t"}, "list": {"sequence", "t"}, "sequence": {"t"}, "vector": {"array", "sequence", "t"}, "simple-vector": {"vector", "array", "sequence", "t"}, "array": {"t"}, "function": {"t"}, "compiled-function": {"function", "t"}, "hash-table": {"t"}, "stream": {"t"}, "package": {"t"}, "pathname": {"t"}, "random-state": {"t"}, "readtable": {"t"}, "instance": {"t"}, "structure": {"instance", "t"}, "boolean": {"atom", "t"}}
+		if subtypes, ok := types[t1]; ok {
+			for _, s := range subtypes {
+				if s == t2 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	n1 := typeName(v1)
+	n2 := typeName(v2)
+
+	// If both are simple type names
+	if v1.typ == VSym && v2.typ == VSym {
+		if n1 == n2 {
+			return true, true
+		}
+		// * is universal type
+		if n1 == "*" {
+			if n2 == "*" || n2 == "t" {
+				return true, true
+			}
+			return true, false
+		}
+		if n2 == "*" || n2 == "t" {
+			return true, true
+		}
+		if simpleSubtype(n1, n2) {
+			return true, true
+		}
+		cls1 := findClass(n1)
+		cls2 := findClass(n2)
+		if cls1 != nil && cls2 != nil {
+			if classHasAncestor(cls1, n2) {
+				return true, true
+			}
+		}
+		return true, false
+	}
+
+	// Handle compound (cons ...) types
+	if n1 == "cons" || n2 == "cons" {
+		extractConsParts := func(v *Value) (carType *Value, cdrType *Value) {
+			cdrType = vsym("*")
+			if v.typ == VSym {
+				carType = vsym("*")
+				return
+			}
+			if v.typ == VPair && v.car != nil && v.car.typ == VSym && v.car.str == "cons" {
+				rest := v.cdr
+				if rest != nil && !isNil(rest) && rest.typ == VPair {
+					carType = rest.car
+					rest = rest.cdr
+					if rest != nil && !isNil(rest) && rest.typ == VPair {
+						cdrType = rest.car
+					}
+				} else {
+					carType = vsym("*")
+				}
+			}
+			return
+		}
+
+		ct1, cd1 := extractConsParts(v1)
+		ct2, cd2 := extractConsParts(v2)
+
+		if ct1 != nil && ct2 != nil {
+			isCarKnown, isCarSub := subtypepChecks(ct1, ct2)
+			isCdrKnown, isCdrSub := subtypepChecks(cd1, cd2)
+			if !isCarKnown || !isCdrKnown {
+				return false, false
+			}
+			if isCarSub && isCdrSub {
+				return true, true
+			}
+			return true, false
+		}
+		return false, false
+	}
+
+	// If t2 is t or *, anything is a subtype
+	if n2 == "t" || n2 == "*" {
+		return true, true
+	}
+
+	return false, false
+}
+
 func builtinSubtypep(args []*Value) (*Value, error) {
 	if len(args) < 2 {
 		return list(vbool(false), vbool(false)), nil
 	}
-	t1 := primaryValue(args[0]).str
-	t2 := primaryValue(args[1]).str
-	types := map[string][]string{"integer": {"rational", "real", "number", "atom", "t"}, "float": {"real", "number", "atom", "t"}, "rational": {"real", "number", "atom", "t"}, "complex": {"number", "atom", "t"}, "real": {"number", "atom", "t"}, "ratio": {"rational", "real", "number", "atom", "t"}, "fixnum": {"integer", "rational", "real", "number", "atom", "t"}, "bignum": {"integer", "rational", "real", "number", "atom", "t"}, "bit": {"integer", "rational", "real", "number", "atom", "t"}, "short-float": {"float", "real", "number", "atom", "t"}, "single-float": {"float", "real", "number", "atom", "t"}, "double-float": {"float", "real", "number", "atom", "t"}, "long-float": {"float", "real", "number", "atom", "t"}, "string": {"array", "vector", "sequence", "atom", "t"}, "simple-string": {"string", "array", "vector", "sequence", "atom", "t"}, "character": {"atom", "t"}, "base-char": {"standard-char", "character", "atom", "t"}, "standard-char": {"character", "atom", "t"}, "extended-char": {"character", "atom", "t"}, "symbol": {"atom", "t"}, "keyword": {"symbol", "atom", "t"}, "null": {"symbol", "list", "sequence", "atom", "t"}, "cons": {"list", "sequence", "t"}, "pair": {"cons", "list", "sequence", "t"}, "list": {"sequence", "t"}, "sequence": {"t"}, "vector": {"array", "sequence", "t"}, "simple-vector": {"vector", "array", "sequence", "t"}, "array": {"t"}, "function": {"t"}, "compiled-function": {"function", "t"}, "hash-table": {"t"}, "stream": {"t"}, "package": {"t"}, "pathname": {"t"}, "random-state": {"t"}, "readtable": {"t"}, "instance": {"t"}, "structure": {"instance", "t"}, "boolean": {"atom", "t"}}
-	if t1 == t2 {
+	t1v := primaryValue(args[0])
+	t2v := primaryValue(args[1])
+
+	isSub, result := subtypepChecks(t1v, t2v)
+	if isSub && result {
 		return list(vbool(true), vbool(true)), nil
 	}
-	if subtypes, ok := types[t1]; ok {
-		for _, s := range subtypes {
-			if s == t2 {
-				return list(vbool(true), vbool(true)), nil
-			}
-		}
-	}
-	// Check CLOS class hierarchy
-	cls1 := findClass(t1)
-	cls2 := findClass(t2)
-	if cls1 != nil && cls2 != nil {
-		if classHasAncestor(cls1, t2) {
-			return list(vbool(true), vbool(true)), nil
-		}
+	if isSub && !result {
+		return list(vbool(false), vbool(true)), nil
 	}
 	return list(vbool(false), vbool(false)), nil
 }
