@@ -2016,7 +2016,18 @@ evalLoop:
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("quasiquote: malformed form")
 				}
-				return evalQuasiquote(v.cdr.car, 0, env)
+				res, e := evalQuasiquote(v.cdr.car, 0, env)
+				if e != nil {
+					return nil, e
+				}
+				// Handle double backquote: when result is ((quasiquote X)),
+				// return (quasiquote X) so the second eval processes it normally.
+				if isPair(res) && isNil(res.cdr) && isPair(res.car) &&
+					res.car.car != nil && res.car.car.typ == VSym &&
+					res.car.car.str == "quasiquote" {
+					return res.car, nil
+				}
+				return res, nil
 			case "if":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("if: malformed form")
@@ -4834,6 +4845,14 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote" && depth == 0 {
 		return eval(v.cdr.car, env)
 	}
+	// (unquote-splicing expr) at depth > 0 - recursively process
+	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote-splicing" && depth > 0 {
+		inner, e := evalQuasiquote(v.cdr.car, depth-1, env)
+		if e != nil {
+			return nil, e
+		}
+		return list(vsym("quasiquote"), list(vsym("unquote-splicing"), inner)), nil
+	}
 	// (unquote-splicing expr) at depth 0 - not valid here
 	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote-splicing" && depth == 0 {
 		return nil, fmt.Errorf("unquote-splicing outside list")
@@ -4843,7 +4862,11 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 		return evalQuasiquote(v.cdr.car, depth+1, env)
 	}
 	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote" && depth > 0 {
-		return list(vsym("quasiquote"), list(vsym("unquote"), v.cdr.car)), nil
+		inner, e := evalQuasiquote(v.cdr.car, depth-1, env)
+		if e != nil {
+			return nil, e
+		}
+		return list(vsym("quasiquote"), list(vsym("unquote"), inner)), nil
 	}
 	// Build list
 	var result *Value = vnil()
