@@ -4127,11 +4127,24 @@ evalLoop:
 						paramNames = append(paramNames, params.car.str)
 						specializers = append(specializers, "")
 					} else if params.car != nil && params.car.typ == VPair && params.car.car != nil && params.car.car.typ == VSym {
-						// Specialized parameter: ((d dog))
+						// Specialized parameter: ((d dog)) or ((x (eql val)))
 						paramNames = append(paramNames, params.car.car.str)
 						sp := params.car.cdr
-						if sp.typ == VPair && sp.car != nil && sp.car.typ == VSym {
-							specializers = append(specializers, sp.car.str)
+						if sp.typ == VPair && sp.car != nil {
+							if sp.car.typ == VSym {
+								// Class specializer: ((d dog))
+								specializers = append(specializers, sp.car.str)
+							} else if sp.car.typ == VPair && sp.car.car != nil && sp.car.car.typ == VSym && sp.car.car.str == "eql" {
+								// EQL specializer: ((x (eql val)))
+								eqlVal := sp.car.cdr
+								if eqlVal.typ == VPair && eqlVal.car != nil {
+									specializers = append(specializers, "#EQL:"+valueToEQLKey(eqlVal.car))
+								} else {
+									specializers = append(specializers, "")
+								}
+							} else {
+								specializers = append(specializers, "")
+							}
 						} else {
 							specializers = append(specializers, "")
 						}
@@ -7414,7 +7427,7 @@ func builtinLength(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("length: need argument")
 	}
 	v := primaryValue(args[0])
-	if v.typ != VPair && v.typ != VNil && v.typ != VStr {
+	if v.typ != VPair && v.typ != VNil && v.typ != VStr && v.typ != VArray {
 		return nil, fmt.Errorf("length: %s is not a sequence", toString(v))
 	}
 	return vnum(float64(lengthSafe(v))), nil
@@ -7423,6 +7436,12 @@ func builtinLength(args []*Value) (*Value, error) {
 func lengthSafe(v *Value) int64 {
 	if v.typ == VStr {
 		return int64(utf8.RuneCountInString(v.str))
+	}
+	if v.typ == VArray && v.array != nil {
+		if v.array.fillPtr >= 0 {
+			return int64(v.array.fillPtr)
+		}
+		return int64(len(v.array.elements))
 	}
 	n := int64(0)
 	visited := make(map[*Value]bool)
@@ -10784,6 +10803,123 @@ func builtinClassSlotDefs(args []*Value) (*Value, error) {
 	return vnil(), nil
 }
 
+// valueToEQLKey produces a stable string key for an EQL specializer value
+func valueToEQLKey(v *Value) string {
+	v = primaryValue(v)
+	switch v.typ {
+	case VSym:
+		return "S:" + v.str
+	case VNum:
+		if v.imag != 0 {
+			return fmt.Sprintf("C:%v+%vi", v.num, v.imag)
+		}
+		return fmt.Sprintf("N:%v", v.num)
+	case VStr:
+		return "STR:" + v.str
+	case VChar:
+		return fmt.Sprintf("CH:%d", v.ch)
+	case VNil:
+		return "NIL"
+	case VBool:
+		if v.num != 0 {
+			return "T"
+		}
+		return "NIL"
+	default:
+		return fmt.Sprintf("V:%s", toString(v))
+	}
+}
+
+// valueMatchesEQLKey checks if a runtime value matches an EQL specializer key
+func valueMatchesEQLKey(arg *Value, key string) bool {
+	arg = primaryValue(arg)
+	switch {
+	case key == "NIL":
+		return isNil(arg)
+	case key == "T":
+		return arg.typ == VBool && arg.num != 0
+	case strings.HasPrefix(key, "S:"):
+		name := key[2:]
+		if arg.typ == VSym && arg.str == name {
+			return true
+		}
+		// Special case: (eql nil) / (eql t) — the parsed form is a symbol,
+		// but the evaluated argument may be VNil/VBool
+		if name == "nil" && isNil(arg) {
+			return true
+		}
+		if name == "t" && arg.typ == VBool && arg.num != 0 {
+			return true
+		}
+		return false
+	case strings.HasPrefix(key, "N:"):
+		if arg.typ != VNum {
+			return false
+		}
+		n, _ := strconv.ParseFloat(key[2:], 64)
+		return arg.num == n
+	case strings.HasPrefix(key, "STR:"):
+		return arg.typ == VStr && arg.str == key[4:]
+	case strings.HasPrefix(key, "CH:"):
+		if arg.typ != VChar {
+			return false
+		}
+		n, _ := strconv.ParseInt(key[3:], 10, 32)
+		return arg.ch == rune(n)
+	case strings.HasPrefix(key, "C:"):
+		if arg.typ != VNum {
+			return false
+		}
+		parts := strings.SplitN(key[2:], "+", 2)
+		if len(parts) == 2 {
+			re, _ := strconv.ParseFloat(parts[0], 64)
+			imStr := strings.TrimSuffix(parts[1], "i")
+			im, _ := strconv.ParseFloat(imStr, 64)
+			return arg.num == re && arg.imag == im
+		}
+		return false
+	}
+	return false
+}
+
+// isTypeSpecializerMatch checks if arg matches a built-in type specializer
+func isTypeSpecializerMatch(arg *Value, typeName string) bool {
+	arg = primaryValue(arg)
+	switch typeName {
+	case "t":
+		return true
+	case "null":
+		return isNil(arg)
+	case "list":
+		return isNil(arg) || arg.typ == VPair
+	case "cons":
+		return arg.typ == VPair
+	case "symbol":
+		return arg.typ == VSym || isNil(arg)
+	case "string":
+		return arg.typ == VStr
+	case "number":
+		return arg.typ == VNum
+	case "integer":
+		return arg.typ == VNum && arg.imag == 0 && arg.num == float64(int64(arg.num))
+	case "float":
+		return arg.typ == VNum && arg.imag == 0
+	case "character":
+		return arg.typ == VChar
+	case "vector":
+		return arg.typ == VArray && arg.array != nil && len(arg.array.dims) == 1
+	case "array":
+		return arg.typ == VArray
+	case "function":
+		return arg.typ == VFunc || arg.typ == VPrim || arg.typ == VGeneric
+	case "hash-table":
+		return arg.typ == VVHash
+	case "stream":
+		return arg.typ == VStream
+	}
+	return false
+}
+
 // methodApplicable checks if a method is applicable to the given evaluated arguments
 func methodApplicable(m genMethod, evArgs []*Value) bool {
 	if len(m.specializers) == 0 {
@@ -10797,39 +10933,65 @@ func methodApplicable(m genMethod, evArgs []*Value) bool {
 			return false
 		}
 		arg := evArgs[i]
-		if arg.typ != VInstance {
+		// Handle EQL specializer: "#EQL:<key>"
+		if strings.HasPrefix(sp, "#EQL:") {
+			if valueMatchesEQLKey(arg, sp[5:]) {
+				continue
+			}
 			return false
 		}
-		// Check if arg's class (or any ancestor) matches the specializer
-		found := false
-		for _, c := range arg.instClass.cpl {
-			if c.typ == VClass && c.str == sp {
-				found = true
-				break
+		// Handle built-in type specializers (t, null, list, cons, etc.)
+		if isTypeSpecializerMatch(arg, sp) {
+			continue
+		}
+		// Handle class specializers for instances
+		if arg.typ == VInstance {
+			found := false
+			for _, c := range arg.instClass.cpl {
+				if c.typ == VClass && c.str == sp {
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
 			}
 		}
-		if !found {
-			return false
-		}
+		return false
 	}
 	return true
 }
-
 // methodSpecificity returns a score for method specificity (lower = more specific)
 // Only meaningful for methods with specializers on the first argument
 func methodSpecificity(m genMethod, evArgs []*Value) int {
 	baseScore := 999
 	if len(m.specializers) > 0 && m.specializers[0] != "" && len(evArgs) > 0 {
-		if evArgs[0].typ == VInstance {
+		sp := m.specializers[0]
+		// EQL specializers are most specific (score 0)
+		if strings.HasPrefix(sp, "#EQL:") {
+			baseScore = 0
+		} else if evArgs[0].typ == VInstance {
 			for i, c := range evArgs[0].instClass.cpl {
-				if c.typ == VClass && c.str == m.specializers[0] {
+				if c.typ == VClass && c.str == sp {
 					baseScore = i
 					break
 				}
 			}
+		} else if isTypeSpecializerMatch(evArgs[0], sp) {
+			// Built-in type specializers: more specific types get lower scores
+			switch sp {
+			case "null":
+				baseScore = 1
+			case "cons":
+				baseScore = 2
+			case "list":
+				baseScore = 3
+			default:
+				baseScore = 5
+			}
 		}
 	}
-	// Parse numeric auxiliary qualifier (e.g., ":around 2" → 2)
+	// Parse numeric auxiliary qualifier (e.g., ":around 2" -> 2)
 	// Higher number = more specific = lower score
 	if m.qualifier != "" {
 		parts := strings.Split(m.qualifier, " ")
@@ -10841,7 +11003,6 @@ func methodSpecificity(m genMethod, evArgs []*Value) int {
 	}
 	return baseScore
 }
-
 // callNextMethodChain applies the next method(s) in a chain with the original arguments
 func callNextMethodChain(methods []genMethod, evArgs []*Value) (*Value, error) {
 	if len(methods) == 0 {
