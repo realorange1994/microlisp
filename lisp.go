@@ -408,6 +408,9 @@ func initGlobalEnv() {
 	globalEnv.Set("*print-length*", vnil())
 	globalEnv.Set("*print-level*", vnil())
 	globalEnv.Set("*print-pretty*", vbool(false))
+	// Standard load-time special variables (bound dynamically during load)
+	globalEnv.Set("*load-pathname*", vnil())
+	globalEnv.Set("*load-truename*", vnil())
 	if initLib != "" {
 		_, err := evalString(initLib, globalEnv)
 		if err != nil {
@@ -18622,7 +18625,28 @@ func loadFile(fname string, env *Env) (*Value, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load: %v", err)
 	}
-	return evalString(string(data), env)
+	// Save old values of *load-pathname* and *load-truename*
+	oldPathname, _ := env.Get("*load-pathname*")
+	oldTruename, _ := env.Get("*load-truename*")
+	// Set *load-pathname* to the pathname of the file being loaded
+	absPath, _ := filepath.Abs(fname)
+	env.Set("*load-pathname*", vpathname(parsePathnameString(absPath)))
+	// Set *load-truename* to the truename (resolved absolute path)
+	env.Set("*load-truename*", vpathname(parsePathnameString(absPath)))
+	// Evaluate the file contents
+	result, evalErr := evalString(string(data), env)
+	// Restore old values
+	if oldPathname != nil {
+		env.Set("*load-pathname*", oldPathname)
+	} else {
+		env.Set("*load-pathname*", vnil())
+	}
+	if oldTruename != nil {
+		env.Set("*load-truename*", oldTruename)
+	} else {
+		env.Set("*load-truename*", vnil())
+	}
+	return result, evalErr
 }
 
 func builtinMakeThread(args []*Value) (*Value, error) {

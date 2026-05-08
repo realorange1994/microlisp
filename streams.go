@@ -636,7 +636,8 @@ func builtinPrint(args []*Value) (*Value, error) {
 		return nil, err
 	}
 	stream.stream.flush()
-	return vnil(), nil
+	// CL: print returns the object printed
+	return primaryValue(args[0]), nil
 }
 
 
@@ -654,7 +655,8 @@ func builtinPrincl(args []*Value) (*Value, error) {
 	if err := stream.stream.writeString(princToString(primaryValue(args[0]))); err != nil {
 		return nil, err
 	}
-	return vnil(), nil
+	// CL: princ returns the object printed
+	return primaryValue(args[0]), nil
 }
 
 func builtinPrin1(args []*Value) (*Value, error) {
@@ -671,7 +673,8 @@ func builtinPrin1(args []*Value) (*Value, error) {
 	if err := stream.stream.writeString(writeToString(primaryValue(args[0]))); err != nil {
 		return nil, err
 	}
-	return vnil(), nil
+	// CL: prin1 returns the object printed
+	return primaryValue(args[0]), nil
 }
 
 func builtinFinishOutput(args []*Value) (*Value, error) {
