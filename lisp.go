@@ -1030,6 +1030,7 @@ const (
 	TFuncQuote
 	TPathname
 	TComplex
+	TVector  // #( elements ) vector literal
 	TMacro // readtable macro character
 )
 
@@ -1171,6 +1172,28 @@ func (l *Lexer) next() Tok {
 			// Not followed by string, treat #P as symbol
 			return l.lexSym()
 		}
+		if l.pos < len(l.src) && l.src[l.pos] == '(' {
+			// #(...) is vector literal
+			l.pos++ // skip (
+			depth := 1
+			start := l.pos
+			for l.pos < len(l.src) && depth > 0 {
+				if l.src[l.pos] == '(' {
+					depth++
+				} else if l.src[l.pos] == ')' {
+					depth--
+				}
+				l.pos++
+			}
+			inner := string(l.src[start : l.pos-1])
+			l.tok = Tok{typ: TVector, lit: inner, pos: p}
+			return l.tok
+		}
+		// #+ and #- feature conditionals — return as symbol so parser can handle them
+		if l.pos < len(l.src) && (l.src[l.pos] == '+' || l.src[l.pos] == '-') {
+			l.pos++ // consume +/-
+			return l.lexSymFrom(p)
+		}
 		// Not #\, fall through to symbol/number handling
 		return l.lexSym()
 	default:
@@ -1288,19 +1311,36 @@ func (l *Lexer) lexNum() Tok {
 			l.pos++
 		}
 	}
-	// Check for scientific notation
+	// Check for scientific notation (exponent marker: e, f, d, s, l - all case variants)
 	hasExponent := false
-	if l.pos < len(l.src) && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
-		hasExponent = true
-		l.pos++
-		if l.pos < len(l.src) && (l.src[l.pos] == '-' || l.src[l.pos] == '+') {
+	if l.pos < len(l.src) {
+		switch l.src[l.pos] {
+		case 'e', 'E', 'f', 'F', 'd', 'D', 's', 'S', 'l', 'L':
+			hasExponent = true
 			l.pos++
-		}
-		for l.pos < len(l.src) && unicode.IsDigit(l.src[l.pos]) {
-			l.pos++
+			if l.pos < len(l.src) && (l.src[l.pos] == '-' || l.src[l.pos] == '+') {
+				l.pos++
+			}
+			for l.pos < len(l.src) && unicode.IsDigit(l.src[l.pos]) {
+				l.pos++
+			}
 		}
 	}
 	numStr := string(l.src[start:l.pos])
+	// Normalize CL float exponent markers (d, f, s, l) to Go's 'e' for ParseFloat
+	if hasExponent {
+		var b strings.Builder
+		foundExponent := false
+		for _, ch := range numStr {
+			if !foundExponent && (ch == 'd' || ch == 'D' || ch == 'f' || ch == 'F' || ch == 's' || ch == 'S' || ch == 'l' || ch == 'L') {
+				b.WriteRune('e')
+				foundExponent = true
+			} else {
+				b.WriteRune(ch)
+			}
+		}
+		numStr = b.String()
+	}
 	// If pure integer (no decimal, no exponent), try big.Int first
 	if !hasDecimal && !hasExponent {
 		n, err := strconv.ParseInt(numStr, 10, 64)
@@ -1737,6 +1777,31 @@ func (p *Parser) readExpr() (*Value, error) {
 			}
 		}
 		return nil, fmt.Errorf("invalid complex number literal: #C(%s)", inner)
+	case TVector:
+		// #(elem1 elem2 ...) - parse vector literal
+		inner := p.tok.lit
+		p.advance()
+		// Parse inner contents as a list of expressions
+		innerParser := &Parser{l: lex(inner), ptoks: make([]Tok, 0, 64), readtable: currentReadtable, env: globalEnv}
+		innerParser.advance()
+		var elements []*Value
+		for innerParser.tok.typ != TEOF {
+			elem, err := innerParser.readExpr()
+			if err != nil {
+				return nil, fmt.Errorf("vector literal parse error: %v", err)
+			}
+			elements = append(elements, elem)
+		}
+		arr := &LispArray{
+			dims:     []int{len(elements)},
+			elements: make([]*Value, len(elements)),
+			fillPtr:  -1,
+		}
+		copy(arr.elements, elements)
+		v := gcv()
+		v.typ = VArray
+		v.array = arr
+		return v, nil
 	case TMacro:
 		// Readtable macro character: call the registered macro function
 		result, err := p.invokeMacro(p.tok.ch)
@@ -1836,7 +1901,7 @@ func eval(v *Value, env *Env) (result *Value, err error) {
 evalLoop:
 	for {
 		switch v.typ {
-		case VNum, VStr, VBool, VNil, VPrim, VFunc, VRat, VComplex, VBigInt, VChar, VInstance, VClass, VMultiVal, VPathname, VPackage, VReadtable:
+		case VNum, VStr, VBool, VNil, VPrim, VFunc, VRat, VComplex, VBigInt, VChar, VInstance, VClass, VMultiVal, VPathname, VPackage, VReadtable, VArray:
 			return v, nil
 		case VSym:
 			// Keywords are self-evaluating (symbols in KEYWORD package)
@@ -19272,7 +19337,6 @@ var initLib = `
 (define (zero? n) (= n 0))
 (define (positive? n) (> n 0))
 (define (negative? n) (< n 0))
-(define (copy-seq s) (if (string? s) (string-append s) (append s '())))
 (define (nreverse lst) (reverse lst))
 (define (nconc . lsts)
   (define (nconc-2 a b)

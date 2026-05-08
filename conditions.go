@@ -839,6 +839,9 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 	if typeName == "array" {
 		return val.typ == VArray
 	}
+	if typeName == "vector" {
+		return val.typ == VArray && len(val.array.dims) == 1
+	}
 	if typeName == "procedure" {
 		return val.typ == VPrim || val.typ == VFunc
 	}
@@ -853,6 +856,9 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 	}
 	if typeName == "sequence" {
 		return val.typ == VStr || val.typ == VPair || val.typ == VNil || val.typ == VArray
+	}
+	if typeName == "atom" {
+		return val.typ != VPair
 	}
 	// Try as a class name
 	if val.typ == VInstance && val.instClass != nil {
