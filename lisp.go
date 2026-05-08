@@ -19486,6 +19486,28 @@ var initLib = `
 (define (checked-eval form) (eval form))
 (define (ctu:asm-search pattern source) nil)
 
+;; SBCL test utility stubs
+(define-macro (assert-error form . type)
+  (list 'ignore-errors form))
+
+(define-macro (assert-signal form condition)
+  (list 'ignore-errors form))
+
+(define-macro (assert-type fn expected-type)
+  nil)
+
+(define-macro (checked-compile-and-assert opts form cases)
+  (list 'let (list (list '_ form))
+    nil))
+
+(define (ctu:find-code-constants fn) nil)
+(define (ctu:ir1-named-calls fn) nil)
+(define-macro (ctu:assert-no-consing form) form)
+(define (ctu:find-named-callees fn) nil)
+(define (sb-int:encapsulate fn name impl) nil)
+(define (sb-int:unencapsulate fn name) nil)
+(define (sb-impl::%remf indicator list) (remf list indicator))
+
 (define (not x) (if x #f #t))
 (define (caar x) (car (car x)))
 (define (cadr x) (car (cdr x)))
@@ -20379,6 +20401,8 @@ var initLib = `
            (idx 0)
            ;; Expand in-clauses: (x in list) -> (tail-N in list) + (x (car tail-N))
            (in-lets '())
+           ;; Expand = clauses without then: (x = expr) -> param with nil init + body set!
+           (eq-lets '())
            (expanded '()))
       (for-each
         (lambda (f)
@@ -20388,10 +20412,17 @@ var initLib = `
                    (tail (gensym "in-")))
               (set! in-lets (cons (list user-var tail list-expr) in-lets))
               (set! expanded (cons (list tail 'in list-expr) expanded)))
-            (set! expanded (cons f expanded))))
+            (if (equal? (cadr f) '=)
+              (let* ((var (car f))
+                     (args (cddr f))
+                     (init-expr (car args)))
+                (set! eq-lets (cons (list var init-expr) eq-lets))
+                (set! expanded (cons (list var '= 'nil) expanded)))
+              (set! expanded (cons f expanded)))))
         raw-for-vars)
       (let* ((for-vars (reverse expanded))
-             (in-lets (reverse in-lets)))
+             (in-lets (reverse in-lets))
+             (eq-lets (reverse eq-lets)))
 
       ;; Build accumulator information
       (define (setup-accumulators)
@@ -20476,7 +20507,8 @@ var initLib = `
             ((equal? kind 'on)
              (list var (car args)))
             ((equal? kind '=)
-             (list var (car args)))
+             ;; =: body rebinds each iteration
+             (list var #f))
             (else (list var 0)))))
 
       (define (for-step f)
@@ -20524,10 +20556,8 @@ var initLib = `
             ((equal? kind 'on)
              (list 'cdr var))
             ((equal? kind '=)
-             (if (and (pair? args) (not (null? (cdr args)))
-                      (equal? (cadr args) 'then))
-               (caddr args)
-               var))
+             ;; =: body rebinds each iteration, step doesn't matter
+             #f)
             (else var))))
 
       (define (for-termination f)
@@ -20621,6 +20651,16 @@ var initLib = `
                 (cons (list 'set! user-var (list 'car tail-var))
                       body-exprs))))
           in-lets)
+
+        ;; Add = clause bindings as pre-body set! operations
+        (for-each
+          (lambda (e)
+            (let ((var (car e))
+                  (init-expr (cadr e)))
+              ;; recompute expr each iteration
+              (set! body-exprs
+                (cons (list 'set! var init-expr) body-exprs))))
+          eq-lets)
 
         ;; Build the loop function
         (let* ((result-expr
