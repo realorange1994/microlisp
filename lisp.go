@@ -16134,6 +16134,12 @@ func builtinRandom(args []*Value) (*Value, error) {
 			break
 		}
 	}
+	// If no :random-state provided, use *random-state* special variable
+	if randState == nil {
+		if rv, err := globalEnv.Get("*random-state*"); err == nil && rv.typ == VRandomState && rv.randState != nil {
+			randState = rv.randState
+		}
+	}
 	// Float argument: return random float in [0, limit)
 	if v.typ == VNum && (math.Abs(limit-math.Trunc(limit)) > 1e-12 || limit == 0) {
 		if limit == 0 {

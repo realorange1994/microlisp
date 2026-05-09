@@ -29,7 +29,7 @@
 ### 其他
 - [x] `#p""` pathname 字面量语法未支持 — 已修复（lexer 和 parser 均已实现）
 - [ ] `*posix-argv*` 未实现（sbcl 扩展）
-- [ ] `*random-state*` 未定义为特殊变量
+- [x] `*random-state*` 未定义为特殊变量 — 已修复（`builtinRandom` 现在会从 `globalEnv` 查找 `*random-state*` 作为默认 rng）
 - [x] `|...|` 转义符号读取不支持 — 已修复（添加 lexBarSym，保留大小写，支持 \\ 和 \| 转义）
 - [ ] `sb-int:constant-form-value` 不适用（sbcl 特有）
 - [ ] `checked-compile` 不适用（sbcl 特有）
@@ -96,7 +96,7 @@
 55. `nth-value` 无法从 VMultiVal 正确提取第 n 个值
 56. `delete-if`/`nsubstitute-if` 谓词函数调用方式错误（eval 而非 callFnOnSeq）
 57. `delete-duplicates` 使用指针相等而非值相等判断重复
-58. `*random-state*` 未初始化
+58. `*random-state*` 未初始化 — 已修复
 59. `coerce` 不支持 `'vector` 和 `'array` 结果类型
 60. `typep` 不处理复合 `vector` 类型说明符如 `(vector *)`
 61. `logand`/`logior`/`logxor` 对非整数参数静默转为0而非报type-error
