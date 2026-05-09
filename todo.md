@@ -33,7 +33,7 @@
 - [ ] `sb-int:constant-form-value` 不适用（sbcl 特有）
 - [ ] `checked-compile` 不适用（sbcl 特有）
 - [x] `char-code-limit` 未定义为常量 — 已修复，定义为 1114112（Unicode 码点上限）
-- [ ] `#+sb-unicode` 特性不存在
+- [x] `#+sb-unicode` 特性不存在 — 已修复（添加 `:sb-unicode` 到 features 列表，并修复 feature lookup 大小写不敏感问题）
 
 ## 已修复的 Bug（来自 sbcl-tests 测试）
 

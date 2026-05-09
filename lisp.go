@@ -311,7 +311,7 @@ func initFeatures() {
 	features := []string{
 		":microlisp", ":common-lisp", ":ansi-cl",
 		":windows", ":x86-64",
-		":threading",
+		":threading", ":sb-unicode",
 	}
 	for _, f := range features {
 		lispFeatures[f] = true
@@ -334,10 +334,10 @@ func featureSatisfied(spec *Value) bool {
 
 func featureSatisfiedEnv(spec *Value, env *Env, seen map[*Value]bool) bool {
 	if spec.typ == VSym && len(spec.str) > 0 && spec.str[0] == ':' {
-		return lispFeatures[spec.str]
+		return lispFeatures[strings.ToLower(spec.str)]
 	}
 	if spec.typ == VSym {
-		return lispFeatures[":"+spec.str] || lispFeatures[spec.str]
+		return lispFeatures[strings.ToLower(":"+spec.str)] || lispFeatures[strings.ToLower(spec.str)]
 	}
 	if spec.typ == VPair {
 		if seen[spec] {
