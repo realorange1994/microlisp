@@ -99,3 +99,5 @@
 59. `coerce` 不支持 `'vector` 和 `'array` 结果类型
 60. `typep` 不处理复合 `vector` 类型说明符如 `(vector *)`
 61. `logand`/`logior`/`logxor` 对非整数参数静默转为0而非报type-error
+62. `(setf (values ...) ...)` 未实现
+63. `char-name` 对 C1 控制字符（128-159）返回 nil
