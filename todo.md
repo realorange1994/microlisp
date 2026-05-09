@@ -86,3 +86,4 @@
 46. `load` 不支持 `:if-does-not-exist nil` 关键字参数
 47. `stringp`/`numberp` 谓词函数未实现
 48. `loop` 不支持 `being each present-symbol/external-symbol of package` 子句
+49. `random` 函数接受浮点数参数时总是返回 0（截断为整数导致 rand.Intn(0/1)）
