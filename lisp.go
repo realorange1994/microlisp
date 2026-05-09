@@ -949,7 +949,7 @@ func vchar(ch rune) *Value    { v := gcv(); v.typ = VChar; v.ch = ch; return v }
 func vnil() *Value            { return globalEnv.bindings["nil"] }
 func cons(a, b *Value) *Value { v := gcv(); v.typ = VPair; v.car = a; v.cdr = b; return v }
 
-func isNil(v *Value) bool { return v == nil || v.typ == VNil }
+func isNil(v *Value) bool { return v == nil || v.typ == VNil || (v.typ == VSym && strings.EqualFold(v.str, "nil")) }
 
 // primaryValue extracts the primary value from a potentially multi-valued result.
 func primaryValue(v *Value) *Value {
@@ -1446,6 +1446,30 @@ func (l *Lexer) lexChar(pos int) Tok {
 		"backspace": '\x08',
 		"rubout":    '\x7f',
 		"page":      '\f',
+		"null":      '\x00',
+		"bell":      '\x07',
+		"escape":    '\x1b',
+		// Additional standard ASCII control character names
+		"soh":       '\x01',
+		"stx":       '\x02',
+		"etx":       '\x03',
+		"eot":       '\x04',
+		"enq":       '\x05',
+		"ack":       '\x06',
+		"nak":       '\x15',
+		"syn":       '\x16',
+		"etb":       '\x17',
+		"can":       '\x18',
+		"em":        '\x19',
+		"sub":       '\x1a',
+		"fs":        '\x1c',
+		"gs":        '\x1d',
+		"rs":        '\x1e',
+		"us":        '\x1f',
+		"del":       '\x7f',
+		// Common abbreviations
+		"xoff":      '\x13',
+		"xon":       '\x11',
 	}
 
 	// Skip the \ after #
@@ -7669,6 +7693,27 @@ var charNameMap = map[string]rune{
 	"escape":    '\x1b',
 	"rubout":    '\x7f',
 	"null":      '\x00',
+	// Additional standard ASCII control character names
+	"soh":       '\x01',
+	"stx":       '\x02',
+	"etx":       '\x03',
+	"eot":       '\x04',
+	"enq":       '\x05',
+	"ack":       '\x06',
+	"nak":       '\x15',
+	"syn":       '\x16',
+	"etb":       '\x17',
+	"can":       '\x18',
+	"em":        '\x19',
+	"sub":       '\x1a',
+	"fs":        '\x1c',
+	"gs":        '\x1d',
+	"rs":        '\x1e',
+	"us":        '\x1f',
+	"del":       '\x7f',
+	// Common abbreviations
+	"xoff":      '\x13',
+	"xon":       '\x11',
 }
 
 func builtinNameChar(args []*Value) (*Value, error) {
@@ -7707,18 +7752,59 @@ func builtinCharName(args []*Value) (*Value, error) {
 			return vstr(strings.ToUpper(name[:1]) + name[1:]), nil
 		}
 	}
-	// For control characters (C0: 0-31)
+	// For control characters (C0: 0-31) that don't have specific names
 	if ch < 32 && ch >= 0 {
-		return vstr("control"), nil
+		// Check if already in charNameMap (specific name like Newline)
+		if _, ok := charNameMapRev[ch]; ok {
+			// handled above
+		} else {
+			return vstr("control"), nil
+		}
 	}
 	// C1 control characters (128-159)
 	if ch >= 128 && ch < 160 {
+		return vstr("control"), nil
+	}
+	// Other non-printing characters (e.g. NBSP, soft hyphen)
+	if !unicode.IsPrint(ch) {
 		return vstr("control"), nil
 	}
 	if ch == 127 {
 		return vstr("rubout"), nil
 	}
 	return vnil(), nil
+}
+
+// charNameMapRev is the reverse of charNameMap (rune -> string name)
+var charNameMapRev = map[rune]string{
+	' ':     "space",
+	'\n':    "newline",
+	'\t':    "tab",
+	'\r':    "return",
+	'\x08':  "backspace",
+	'\x7f':  "rubout",
+	'\f':    "page",
+	'\x00':  "null",
+	'\x07':  "bell",
+	'\x1b':  "escape",
+	'\x01':  "soh",
+	'\x02':  "stx",
+	'\x03':  "etx",
+	'\x04':  "eot",
+	'\x05':  "enq",
+	'\x06':  "ack",
+	'\x15':  "nak",
+	'\x16':  "syn",
+	'\x17':  "etb",
+	'\x18':  "can",
+	'\x19':  "em",
+	'\x1a':  "sub",
+	'\x1c':  "fs",
+	'\x1d':  "gs",
+	'\x1e':  "rs",
+	'\x1f':  "us",
+	'\x13':  "xoff",
+	'\x11':  "xon",
 }
 
 func eqVal(a, b *Value) bool {
@@ -8030,7 +8116,11 @@ func builtinLength(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("length: need argument")
 	}
 	v := primaryValue(args[0])
-	if v.typ != VPair && v.typ != VNil && v.typ != VStr && v.typ != VArray {
+	// In CL, nil is a valid sequence (empty list), length = 0
+	if isNil(v) {
+		return vnum(0), nil
+	}
+	if v.typ != VPair && v.typ != VStr && v.typ != VArray {
 		return nil, fmt.Errorf("length: %s is not a sequence", toString(v))
 	}
 	return vnum(float64(lengthSafe(v))), nil
@@ -17058,8 +17148,9 @@ func builtinGraphicCharP(args []*Value) (*Value, error) {
 	} else {
 		return vbool(false), nil
 	}
-	// Graphic chars are printable characters excluding Space and Newline
-	return vbool(unicode.IsPrint(ch) && !unicode.IsSpace(ch)), nil
+	// Graphic chars are printable characters (including space, excluding control chars)
+	// Per CL spec: characters that print something, includes space (code 32)
+	return vbool(unicode.IsPrint(ch)), nil
 }
 
 // -------- upper-case-p / lower-case-p / both-case-p --------
@@ -19399,6 +19490,48 @@ func toString(v *Value) string {
 			return "#\\rubout"
 		case '\f':
 			return "#\\page"
+		case '\x00':
+			return "#\\null"
+		case '\x07':
+			return "#\\bell"
+		case '\x1b':
+			return "#\\escape"
+		case '\x01':
+			return "#\\soh"
+		case '\x02':
+			return "#\\stx"
+		case '\x03':
+			return "#\\etx"
+		case '\x04':
+			return "#\\eot"
+		case '\x05':
+			return "#\\enq"
+		case '\x06':
+			return "#\\ack"
+		case '\x15':
+			return "#\\nak"
+		case '\x16':
+			return "#\\syn"
+		case '\x17':
+			return "#\\etb"
+		case '\x18':
+			return "#\\can"
+		case '\x19':
+			return "#\\em"
+		case '\x1a':
+			return "#\\sub"
+		case '\x1c':
+			return "#\\fs"
+		case '\x1d':
+			return "#\\gs"
+		case '\x1e':
+			return "#\\rs"
+		case '\x1f':
+			return "#\\us"
+		case '\x11':
+			return "#\\xon"
+		case '\x13':
+			return "#\\xoff"
 		default:
 			return "#\\" + string(v.ch)
 		}
