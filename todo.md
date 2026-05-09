@@ -112,3 +112,8 @@
 71. 关键字参数大小写不匹配（reader 大写化后 Go 侧用小写匹配）
 72. `checked-compile` 宏引用 bug（`eval` 未正确展开变量）
 73. `destructuring-bind` 点对模式匹配 nil 值时 Go nil 指针崩溃
+74. `string-upcase/downcase/capitalize` 不接受 string designators（符号/字符）
+75. `string-capitalize` 不支持 `:start`/`:end` 关键字参数
+76. `nstring-upcase/downcase/capitalize` 不支持 VArray 和 fill-pointer
+77. `(setf fill-pointer)` 未实现
+78. `butlast` 对 dotted list 处理错误
