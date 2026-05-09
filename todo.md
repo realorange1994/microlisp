@@ -102,3 +102,4 @@
 62. `(setf (values ...) ...)` 未实现
 63. `char-name` 对 C1 控制字符（128-159）返回 nil
 64. `type-of` 返回 `"unknown"` 对于 `pathname`、`random-state`、`array`、`integer`（大整数）类型
+65. `typep`/`subtypep` 类型比较大小写不敏感问题（符号名大写后比较失败）
