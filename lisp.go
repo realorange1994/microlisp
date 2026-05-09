@@ -424,6 +424,9 @@ func initGlobalEnv() {
 	// Standard load-time special variables (bound dynamically during load)
 	globalEnv.Set("*load-pathname*", vnil())
 	globalEnv.Set("*load-truename*", vnil())
+	// Initialize *random-state* per CL spec
+	rs, _ := builtinMakeRandomState(nil)
+	globalEnv.Set("*random-state*", rs)
 	if initLib != "" {
 		_, err := evalString(initLib, globalEnv)
 		if err != nil {
@@ -2698,14 +2701,16 @@ evalLoop:
 				}
 				return result, nil
 			case "ignore-errors":
-				// (ignore-errors body...) — returns nil on error
+				// (ignore-errors body...) — returns (values result nil) on success,
+				// or (values nil condition) on error
 				body := v.cdr
 				var result *Value
 				for !isNil(body) {
 					result, err = eval(body.car, env)
 					if err != nil {
-						// On error, return nil (the primary value of (values nil condition))
-						return vnil(), nil
+						// On error, return (values nil condition)
+						cond := goErrorToCondition(err)
+						return multiVal(vnil(), cond), nil
 					}
 					body = body.cdr
 				}
@@ -13249,7 +13254,18 @@ func builtinNthValue(args []*Value) (*Value, error) {
 		return nil, err
 	}
 	// Get the nth value from a multiple-values result
-	// For simplicity, return the primary value for index 0, nil otherwise
+	if result != nil && result.typ == VMultiVal {
+		vals := cons(result.car, result.cdr) // full list of values
+		i := 0
+		for !isNil(vals) && vals.typ == VPair {
+			if i == n {
+				return vals.car, nil
+			}
+			vals = vals.cdr
+			i++
+		}
+		return vnil(), nil
+	}
 	if n == 0 {
 		return primaryValue(result), nil
 	}
@@ -14495,7 +14511,7 @@ func builtinDeleteIf(args []*Value) (*Value, error) {
 	if seq.typ != VPair {
 		return nil, fmt.Errorf("delete-if: expected a list, got %s", typeStr(seq))
 	}
-	_, _, _, count, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, _, _, count, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -14519,7 +14535,15 @@ func builtinDeleteIf(args []*Value) (*Value, error) {
 	for !isNil(cur) && cur.typ == VPair {
 		match := false
 		if i >= start && i < end && (count < 0 || removed < count) {
-			res, err := eval(list(pred, cur.car), globalEnv)
+			v := cur.car
+			if !isNil(keyFn) {
+				var err2 error
+				v, err2 = callFnOnSeq(keyFn, []*Value{cur.car}, globalEnv)
+				if err2 != nil {
+					return nil, err2
+				}
+			}
+			res, err := callFnOnSeq(pred, []*Value{v}, globalEnv)
 			if err == nil && isTruthy(res) {
 				match = true
 				removed++
@@ -14576,7 +14600,7 @@ func builtinDeleteDuplicates(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	seen := make(map[*Value]bool)
+	seen := make(map[string]bool)
 	head := seq
 	prev := (*Value)(nil)
 	cur := seq
@@ -14586,9 +14610,10 @@ func builtinDeleteDuplicates(args []*Value) (*Value, error) {
 		if withinRange {
 			key := cur.car
 			if !isNil(keyFn) {
-				key, _ = eval(list(keyFn, key), globalEnv)
+				key, _ = callFnOnSeq(keyFn, []*Value{cur.car}, globalEnv)
 			}
-			if seen[key] {
+			keyStr := toString(key)
+			if seen[keyStr] {
 				// duplicate: remove by rewiring
 				if prev == nil {
 					head = cur.cdr
@@ -14597,7 +14622,7 @@ func builtinDeleteDuplicates(args []*Value) (*Value, error) {
 				}
 				cur = cur.cdr
 			} else {
-				seen[key] = true
+				seen[keyStr] = true
 				prev = cur
 				cur = cur.cdr
 			}
@@ -14618,7 +14643,7 @@ func builtinNsubstituteIf(args []*Value) (*Value, error) {
 	newVal := args[0]
 	pred := args[1]
 	seq := args[2]
-		_, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+		keyFn, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -14643,9 +14668,17 @@ func builtinNsubstituteIf(args []*Value) (*Value, error) {
 			cellPtrs = append(cellPtrs, cur)
 			cur = cur.cdr
 		}
-		for i := len(elements) - 1; i >= start && i < end; i-- {
+		for i := end - 1; i >= start; i-- {
 			if count >= 0 && replaced >= count { break }
-			predVal, perr := eval(list(pred, elements[i]), globalEnv)
+			v := elements[i]
+			if !isNil(keyFn) {
+				var err2 error
+				v, err2 = callFnOnSeq(keyFn, []*Value{elements[i]}, globalEnv)
+				if err2 != nil {
+					return nil, err2
+				}
+			}
+			predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
 			if perr == nil && isTruthy(predVal) {
 				cellPtrs[i].car = newVal
 				replaced++
@@ -14655,7 +14688,15 @@ func builtinNsubstituteIf(args []*Value) (*Value, error) {
 		i := 0
 		for cur := seq; !isNil(cur) && cur.typ == VPair; {
 			if i >= start && i < end && (count < 0 || replaced < count) {
-				predVal, perr := eval(list(pred, cur.car), globalEnv)
+				v := cur.car
+				if !isNil(keyFn) {
+					var err2 error
+					v, err2 = callFnOnSeq(keyFn, []*Value{cur.car}, globalEnv)
+					if err2 != nil {
+						return nil, err2
+					}
+				}
+				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
 				if perr == nil && isTruthy(predVal) {
 					cur.car = newVal
 					replaced++
@@ -14999,7 +15040,7 @@ func builtinNsubstitute(args []*Value) (*Value, error) {
 			cellPtrs = append(cellPtrs, cur)
 			cur = cur.cdr
 		}
-		for i := len(elements) - 1; i >= start && i < end; i-- {
+		for i := end - 1; i >= start; i-- {
 			if count >= 0 && replaced >= count { break }
 			if testItemMatch(oldVal, elements[i], testFn, keyFn) {
 				cellPtrs[i].car = newVal

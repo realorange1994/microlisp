@@ -986,3 +986,49 @@ func builtinBreak(args []*Value) (*Value, error) {
 	fmt.Fprintf(os.Stderr, "\n;; BREAK: %s\n", msg)
 	return vnil(), nil
 }
+
+// goErrorToCondition converts a Go error to a Lisp condition object.
+// For file-related errors (containing "load: open"), creates a file-error condition.
+// Otherwise creates a simple-error condition.
+func goErrorToCondition(err error) *Value {
+	msg := err.Error()
+	cond := gcv()
+	cond.typ = VInstance
+
+	// Try to create a file-error for file-related errors
+	if strings.Contains(msg, "load: open") || strings.Contains(msg, "open ") {
+		cond.instClass = findClass("file-error")
+		if cond.instClass != nil {
+			// Try to extract filename from error message
+			// Format is typically: "load: open <filename>: <error>"
+			parts := strings.SplitN(msg, "open ", 2)
+			if len(parts) >= 2 {
+				fnameParts := strings.SplitN(parts[1], ":", 2)
+				fname := strings.TrimSpace(fnameParts[0])
+				fname = strings.Trim(fname, "\"")
+				cond.instSlots = map[string]*Value{
+					"file-pathname":  vstr(fname),
+					"message":        vstr(msg),
+					"format-control": vstr(msg),
+					"format-arguments": vnil(),
+				}
+				return cond
+			}
+		}
+	}
+
+	// Default: simple-error condition
+	cond.instClass = findClass("simple-error")
+	if cond.instClass == nil {
+		cond.instClass = findClass("error")
+		if cond.instClass == nil {
+			cond.instClass = findClass("condition")
+		}
+	}
+	cond.instSlots = map[string]*Value{
+		"message":          vstr(msg),
+		"format-control":   vstr(msg),
+		"format-arguments": vnil(),
+	}
+	return cond
+}
