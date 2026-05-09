@@ -2492,7 +2492,7 @@ evalLoop:
 						return nil, fmt.Errorf("defun: unsupported compound name: %s", toString(head))
 					}
 					symName := head.cdr.car.str
-					name = fmt.Sprintf("(setf %s)", symName)
+					name = symName + "-setf"
 				} else {
 					return nil, fmt.Errorf("defun: name must be a symbol")
 				}

@@ -10,7 +10,7 @@
 - [ ] `destructuring-bind` 不支持 `&key` 参数
 
 ### Setf 扩展
-- [ ] `(defun (setf foo) ...)` 不支持复合函数名
+- [x] `(defun (setf foo) ...)` 不支持复合函数名 — 已修复
 - [ ] `(setf (values ...))` 不支持
 - [ ] `(setf (macro-function ...))` 不支持
 - [ ] `defsetf` 不支持 `&environment` 参数
@@ -90,4 +90,4 @@
 50. `macroexpand` 不展开 quasiquote 形式（返回原始形式不变）
 51. `loop` 不支持解构模式如 `(for (a b) in list)`
 52. `functionp` 谓词函数未实现
-53. `defun` 不接受 `(setf name)` 作为函数名
+53. ✅ `defun` 接受 `(setf name)` 作为函数名 — 已修复
