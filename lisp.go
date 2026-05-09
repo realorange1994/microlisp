@@ -1075,6 +1075,7 @@ type Tok struct {
 	ch     rune
 	pos    int
 	bigInt *big.Int
+	isBar  bool // true if symbol was read via |...| escapes (preserves case)
 }
 
 type Lexer struct {
@@ -1115,6 +1116,8 @@ func (l *Lexer) next() Tok {
 		}
 	case '"':
 		return l.lexStr()
+	case '|':
+		return l.lexBarSym()
 	case ';':
 		for l.pos < len(l.src) && l.src[l.pos] != '\n' {
 			l.pos++
@@ -1290,6 +1293,36 @@ func (l *Lexer) lexStr() Tok {
 	}
 	l.err = fmt.Errorf("unclosed string at %d", start)
 	l.tok = Tok{typ: TErr, lit: "unclosed string"}
+	return l.tok
+}
+
+func (l *Lexer) lexBarSym() Tok {
+	start := l.pos
+	var b strings.Builder
+	for l.pos < len(l.src) {
+		ch := l.src[l.pos]
+		l.pos++
+		if ch == '|' {
+			l.tok = Tok{typ: TSym, lit: b.String(), pos: start, isBar: true}
+			return l.tok
+		}
+		if ch == '\\' && l.pos < len(l.src) {
+			ch2 := l.src[l.pos]
+			if ch2 == '|' || ch2 == '\\' {
+				b.WriteRune(ch2)
+				l.pos++
+				continue
+			}
+			// Backslash before other character: just include both literally
+			b.WriteRune(ch)
+			b.WriteRune(ch2)
+			l.pos++
+			continue
+		}
+		b.WriteRune(ch)
+	}
+	// Unterminated bar-escaped symbol — treat as empty
+	l.tok = Tok{typ: TSym, lit: b.String(), pos: start, isBar: true}
 	return l.tok
 }
 
@@ -1643,6 +1676,43 @@ func (p *Parser) read() (*Value, error) {
 			}
 			// Feature not satisfied — skip and read next form
 			return p.readExpr()
+		}
+		if p.tok.isBar {
+			// Bar-escaped symbol: preserve case and handle package syntax
+			name := p.tok.lit
+			if idx := strings.Index(name, ":"); idx >= 0 {
+				pkgName := name[:idx]
+				symName := name[idx+1:]
+				if pkg := findPackage(pkgName); pkg != nil {
+					if sym, ok := pkg.symbols[symName]; ok {
+						v := sym
+						p.advance()
+						return v, nil
+					}
+					v := internSymbol(symName, pkg)
+					p.advance()
+					return v, nil
+				}
+			}
+			if strings.HasPrefix(name, ":") {
+				kPkg := findPackage("KEYWORD")
+				if kPkg != nil {
+					if sym, ok := kPkg.symbols[name]; ok {
+						v := sym
+						p.advance()
+						return v, nil
+					}
+					sym := gcv()
+					sym.typ = VSym
+					sym.str = name
+					kPkg.symbols[name] = sym
+					p.advance()
+					return sym, nil
+				}
+			}
+			v := vsym(name)
+			p.advance()
+			return v, nil
 		}
 		v := internOrVsym(p.tok.lit)
 		p.advance()
