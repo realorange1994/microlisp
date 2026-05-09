@@ -7755,8 +7755,8 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 		head := vp.car
 		// Skip &rest, &optional, &key keywords and handle them specially
 		if head != nil && head.typ == VSym {
-			symName := head.str
-			if symName == "&rest" || symName == "&body" {
+			symName := strings.ToUpper(head.str)
+			if symName == "&REST" || symName == "&BODY" {
 				// &rest var: bind var to the remaining value list
 				restVar := vp.cdr
 				if restVar == nil || restVar.typ != VPair || restVar.car == nil || restVar.car.typ != VSym {
@@ -7765,9 +7765,9 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 				env.Set(restVar.car.str, vv)
 				return nil
 			}
-			if symName == "&optional" || symName == "&key" {
+			if symName == "&OPTIONAL" || symName == "&KEY" {
 				// Process &optional vars: bind from remaining values
-				if symName == "&optional" {
+				if symName == "&OPTIONAL" {
 					vp = vp.cdr
 					for !isNil(vp) {
 						if vp.typ != VPair {
@@ -20239,27 +20239,9 @@ var initLib = `
     ((eq? type-spec 'instance) (instance? obj))
     (else #f)))
 
-;; -------- destructuring-bind --------
-(define-macro (destructuring-bind pattern expr . body)
-  (list 'let (list (list (gensym) expr))
-    (cons 'begin (destructure-pattern pattern (gensym) body))))
-
-(define (destructure-pattern pattern var body)
-  (if (null? pattern) body
-    (if (symbol? pattern)
-      (list 'let (list (list pattern var))
-        (cons 'begin body))
-      (if (pair? pattern)
-        (let ((head (car pattern))
-              (tail (cdr pattern))
-              (next-var (gensym "d-")))
-          (if (null? tail)
-            (list 'let (list (list head (list 'car var)))
-              (cons 'begin body))
-            (list 'let (list (list head (list 'car var))
-                            (list next-var (list 'cdr var)))
-              (cons 'begin (destructure-pattern tail next-var body)))))
-        body))))
+;; destructure-pattern and destructuring-bind macro removed:
+;; Go special form (bindPatternRec) handles &rest/&optional/&key properly
+;; The old Lisp macro shadowed the Go implementation and was broken
 
 (define (for-each f lst)
   (if (null? lst) #t
