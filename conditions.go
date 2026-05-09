@@ -661,8 +661,8 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 	if isNil(typeSpec) || typeSpec.typ != VSym {
 		if typeSpec.typ == VPair && typeSpec.car != nil && typeSpec.car.typ == VSym {
 			seen[typeSpec] = true
-			switch typeSpec.car.str {
-			case "and":
+			switch strings.ToUpper(typeSpec.car.str) {
+			case "AND":
 				// (and type1 type2 ...) - all must match
 				body := typeSpec.cdr
 				for !isNil(body) {
@@ -672,7 +672,7 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 					body = body.cdr
 				}
 				return true
-			case "or":
+			case "OR":
 				// (or type1 type2 ...) - any must match
 				body := typeSpec.cdr
 				for !isNil(body) {
@@ -682,13 +682,13 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 					body = body.cdr
 				}
 				return false
-			case "not":
+			case "NOT":
 				// (not type) - must NOT match
 				if typeSpec.cdr == nil || isNil(typeSpec.cdr) || typeSpec.cdr.typ != VPair {
 					return false
 				}
 				return !typepCheckRec(val, typeSpec.cdr.car, env, seen)
-			case "satisfies":
+			case "SATISFIES":
 				// (satisfies fn) - predicate must return true
 				body := typeSpec.cdr
 				if !isNil(body) && body.typ == VPair && body.car != nil && body.car.typ == VSym {
@@ -705,14 +705,14 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 					}
 				}
 				return false
-			case "eql":
+			case "EQL":
 				// (eql value) - must be eql to value
 				body := typeSpec.cdr
 				if !isNil(body) {
 					return eqlCheck(val, body.car)
 				}
 				return false
-			case "member":
+			case "MEMBER":
 				// (member v1 v2 ...) - must be eql to one of the values
 				body := typeSpec.cdr
 				for !isNil(body) {
@@ -722,20 +722,20 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 					body = body.cdr
 				}
 				return false
-			case "array":
+			case "ARRAY":
 				// (array element-type) - check if array
 				if val.typ != VArray {
 					return false
 				}
 				return true
-			case "vector":
+			case "VECTOR":
 				// (vector) - check if 1D array
 				// (vector element-type) - check if 1D array
 				if val.typ != VArray {
 					return false
 				}
 				return len(val.array.dims) == 1
-			case "cons":
+			case "CONS":
 				// (cons) - check if it's a pair
 				// (cons car-type) - check car matches car-type
 				// (cons car-type cdr-type) - check car and cdr match their types
@@ -762,21 +762,21 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 					}
 				}
 				return true
-			case "integer":
+			case "INTEGER":
 				return (val.typ == VNum && val.num == float64(int64(val.num))) || val.typ == VRat || val.typ == VBigInt
-			case "float":
+			case "FLOAT":
 				return val.typ == VNum && val.num != float64(int64(val.num))
-			case "number":
+			case "NUMBER":
 				return val.typ == VNum || val.typ == VRat || val.typ == VComplex || val.typ == VBigInt
-			case "real":
+			case "REAL":
 				return val.typ == VNum || val.typ == VRat || val.typ == VBigInt
-			case "string":
+			case "STRING":
 				return val.typ == VStr
-			case "symbol":
+			case "SYMBOL":
 				return val.typ == VSym || val.typ == VNil
-			case "list":
+			case "LIST":
 				return val.typ == VPair || val.typ == VNil
-			case "function":
+			case "FUNCTION":
 				return val.typ == VPrim || val.typ == VFunc || val.typ == VGeneric
 			default:
 				// Try as a class name
@@ -791,80 +791,80 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 		return false
 	}
 	// Symbol type specifier
-	typeName := typeSpec.str
-	if typeName == "t" {
+	typeName := strings.ToUpper(typeSpec.str)
+	if typeName == "T" {
 		return true
 	}
-	if typeName == "null" {
+	if typeName == "NULL" {
 		return isNil(val)
 	}
-	if typeName == "nil" {
+	if typeName == "NIL" {
 		return false // nil is the empty type - never matches any value
 	}
-	if typeName == "integer" {
+	if typeName == "INTEGER" {
 		return (val.typ == VNum && val.num == float64(int64(val.num))) || val.typ == VRat || val.typ == VBigInt
 	}
-	if typeName == "float" {
+	if typeName == "FLOAT" {
 		return val.typ == VNum && val.num != float64(int64(val.num))
 	}
-	if typeName == "number" {
+	if typeName == "NUMBER" {
 		return val.typ == VNum || val.typ == VRat || val.typ == VComplex || val.typ == VBigInt
 	}
-	if typeName == "real" {
+	if typeName == "REAL" {
 		return val.typ == VNum || val.typ == VRat || val.typ == VBigInt
 	}
-	if typeName == "rational" {
+	if typeName == "RATIONAL" {
 		return val.typ == VRat || val.typ == VNum || val.typ == VBigInt
 	}
-	if typeName == "complex" {
+	if typeName == "COMPLEX" {
 		return val.typ == VComplex
 	}
-	if typeName == "string" {
+	if typeName == "STRING" {
 		return val.typ == VStr
 	}
-	if typeName == "symbol" {
+	if typeName == "SYMBOL" {
 		return val.typ == VSym || val.typ == VNil
 	}
-	if typeName == "list" {
+	if typeName == "LIST" {
 		return val.typ == VPair || val.typ == VNil
 	}
-	if typeName == "cons" || typeName == "pair" {
+	if typeName == "CONS" || typeName == "PAIR" {
 		return val.typ == VPair
 	}
-	if typeName == "function" {
+	if typeName == "FUNCTION" {
 		return val.typ == VPrim || val.typ == VFunc || val.typ == VGeneric
 	}
-	if typeName == "hash-table" {
+	if typeName == "HASH-TABLE" {
 		return val.typ == VVHash
 	}
-	if typeName == "character" {
+	if typeName == "CHARACTER" {
 		return val.typ == VChar
 	}
-	if typeName == "stream" {
+	if typeName == "STREAM" {
 		return val.typ == VStream
 	}
-	if typeName == "array" {
+	if typeName == "ARRAY" {
 		return val.typ == VArray
 	}
-	if typeName == "vector" {
+	if typeName == "VECTOR" {
 		return val.typ == VArray && len(val.array.dims) == 1
 	}
-	if typeName == "procedure" {
+	if typeName == "PROCEDURE" {
 		return val.typ == VPrim || val.typ == VFunc
 	}
-	if typeName == "macro" {
+	if typeName == "MACRO" {
 		return val.typ == VMacro
 	}
-	if typeName == "class" {
+	if typeName == "CLASS" {
 		return val.typ == VClass
 	}
-	if typeName == "boolean" {
+	if typeName == "BOOLEAN" {
 		return val.typ == VBool || isNil(val)
 	}
-	if typeName == "sequence" {
+	if typeName == "SEQUENCE" {
 		return val.typ == VStr || val.typ == VPair || val.typ == VNil || val.typ == VArray
 	}
-	if typeName == "atom" {
+	if typeName == "ATOM" {
 		return val.typ != VPair
 	}
 	// Try as a class name

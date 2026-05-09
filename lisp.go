@@ -811,7 +811,10 @@ func resolvePackageFromDesignator(v *Value) *Package {
 
 // internOrVsym creates a symbol, properly interning it into the current package.
 // This should be used by the reader instead of bare vsym().
+// CL requires the reader to upcase unescaped symbol names by default.
 func internOrVsym(name string) *Value {
+	// CL reader upcases symbol names by default (*readtable-case* = :upcase)
+	name = strings.ToUpper(name)
 	// Handle qualified symbols: pkg:sym or pkg::sym
 	if resolved := resolvePackageSymbol(name); resolved != nil {
 		return resolved
@@ -1990,8 +1993,10 @@ evalLoop:
 				}
 				return r, nil
 			}
-			switch v.car.str {
-			case "funcall":
+			// CL requires symbols to be case-insensitive: upcase for special form dispatch
+			opName := strings.ToUpper(v.car.str)
+			switch opName {
+			case "FUNCALL":
 				// funcall as special form to pass lexical env to callFnOnSeq
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("funcall: malformed arguments")
@@ -2025,12 +2030,12 @@ evalLoop:
 					return nil, e
 				}
 				return r, nil
-			case "quote":
+			case "QUOTE":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("quote: malformed form")
 				}
 				return v.cdr.car, nil
-			case "function":
+			case "FUNCTION":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("function: malformed form")
 				}
@@ -2042,11 +2047,11 @@ evalLoop:
 					}
 					return val, nil
 				}
-				if arg.typ == VPair && arg.car != nil && arg.car.typ == VSym && arg.car.str == "lambda" {
+				if arg.typ == VPair && arg.car != nil && arg.car.typ == VSym && arg.car.str == "LAMBDA" {
 					return eval(arg, env)
 				}
 				return eval(arg, env)
-			case "quasiquote":
+			case "QUASIQUOTE":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("quasiquote: malformed form")
 				}
@@ -2058,11 +2063,11 @@ evalLoop:
 				// return (quasiquote X) so the second eval processes it normally.
 				if isPair(res) && isNil(res.cdr) && isPair(res.car) &&
 					res.car.car != nil && res.car.car.typ == VSym &&
-					res.car.car.str == "quasiquote" {
+					res.car.car.str == "QUASIQUOTE" {
 					return res.car, nil
 				}
 				return res, nil
-			case "if":
+			case "IF":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("if: malformed form")
 				}
@@ -2083,7 +2088,7 @@ evalLoop:
 					return vnil(), nil
 				}
 				continue
-			case "begin":
+			case "BEGIN":
 				exprs := v.cdr
 				if isNil(exprs) {
 					return vnil(), nil
@@ -2097,7 +2102,7 @@ evalLoop:
 				}
 				v = exprs.car
 				continue
-			case "lambda":
+			case "LAMBDA":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("lambda: need lambda list")
 				}
@@ -2112,7 +2117,7 @@ evalLoop:
 				fn.body = v.cdr.cdr
 				fn.env = env
 				return fn, nil
-			case "progn":
+			case "PROGN":
 				exprs := v.cdr
 				if isNil(exprs) {
 					return vnil(), nil
@@ -2126,20 +2131,20 @@ evalLoop:
 				}
 				v = exprs.car
 				continue
-			case "declare":
+			case "DECLARE":
 				// Declarations are advisory, ignored in interpreter
 				return vnil(), nil
-			case "the":
+			case "THE":
 				// (the type-specifier form) — evaluate form, ignore type check
 				if v.cdr == nil || v.cdr.typ != VPair || v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
 					return nil, fmt.Errorf("the: need type and form")
 				}
 				v = v.cdr.cdr.car
 				continue
-			case "locally":
+			case "LOCALLY":
 				// (locally declaration... body...) — skip declarations, eval body
 				body := v.cdr
-				for !isNil(body) && body.car != nil && body.car.typ == VPair && body.car.car != nil && body.car.car.typ == VSym && body.car.car.str == "declare" {
+				for !isNil(body) && body.car != nil && body.car.typ == VPair && body.car.car != nil && body.car.car.typ == VSym && body.car.car.str == "DECLARE" {
 					body = body.cdr
 				}
 				if isNil(body) {
@@ -2157,13 +2162,13 @@ evalLoop:
 				}
 				v = body.car
 				continue
-			case "proclaim":
+			case "PROCLAIM":
 				// (proclaim decl-spec...) — advisory, ignored
 				return vnil(), nil
-			case "declaim":
+			case "DECLAIM":
 				// (declaim decl-spec...) — advisory, ignored
 				return vnil(), nil
-			case "progv":
+			case "PROGV":
 				// (progv symbols-list values-list body...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("progv: malformed form")
@@ -2211,7 +2216,7 @@ evalLoop:
 				}
 				return vnil(), nil
 
-			case "flet":
+			case "FLET":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("flet: malformed form")
 				}
@@ -2262,7 +2267,7 @@ evalLoop:
 				}
 				v = body.car
 				continue
-			case "labels":
+			case "LABELS":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("labels: malformed form")
 				}
@@ -2329,7 +2334,7 @@ evalLoop:
 				v = body.car
 				continue
 
-			case "define":
+			case "DEFINE":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("define: malformed form")
 				}
@@ -2368,7 +2373,7 @@ evalLoop:
 				}
 				env.Set(name, ev)
 				return vsym(name), nil
-			case "set!", "setq":
+			case "SET!", "SETQ":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("set!: malformed form")
 				}
@@ -2391,7 +2396,7 @@ evalLoop:
 					}
 				}
 				return nil, fmt.Errorf("set!: undefined %s", name)
-			case "defvar":
+			case "DEFVAR":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("defvar: malformed form")
 				}
@@ -2410,7 +2415,7 @@ evalLoop:
 				}
 				// defvar without initial value: leave unbound (no binding created)
 				return vsym(name), nil
-			case "defparameter":
+			case "DEFPARAMETER":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("defparameter: malformed form")
 				}
@@ -2427,7 +2432,7 @@ evalLoop:
 				}
 				globalEnv.Set(name, ev)
 				return vsym(name), nil
-			case "defconstant":
+			case "DEFCONSTANT":
 				// (defconstant name initial-value-form &optional documentation)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("defconstant: malformed form")
@@ -2447,7 +2452,7 @@ evalLoop:
 				// to a different value. MicroLisp allows redefinition.
 				globalEnv.Set(name, ev)
 				return vsym(name), nil
-			case "defmacro":
+			case "DEFMACRO":
 				// (defmacro name lambda-list . body)
 				// CL standard syntax: name is a symbol, lambda-list follows
 				if v.cdr == nil || v.cdr.typ != VPair {
@@ -2478,7 +2483,7 @@ evalLoop:
 				_ = envSym
 				env.Set(name, m)
 				return vsym(name), nil
-			case "defun":
+			case "DEFUN":
 				// (defun name lambda-list . body)
 				// Also supports: (defun (setf name) lambda-list . body)
 				if v.cdr == nil || v.cdr.typ != VPair {
@@ -2490,7 +2495,7 @@ evalLoop:
 					name = head.str
 				} else if head.typ == VPair {
 					// (setf foo) syntax
-					if head.car == nil || head.car.typ != VSym || head.car.str != "setf" {
+					if head.car == nil || head.car.typ != VSym || head.car.str != "SETF" {
 						return nil, fmt.Errorf("defun: unsupported compound name: %s", toString(head))
 					}
 					if isNil(head.cdr) || head.cdr.car.typ != VSym || !isNil(head.cdr.cdr) {
@@ -2519,7 +2524,7 @@ evalLoop:
 				fn.env = NewEnv(globalEnv)
 				globalEnv.Set(name, fn)
 				return vsym(name), nil
-			case "let":
+			case "LET":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("let: malformed form")
 				}
@@ -2553,7 +2558,7 @@ evalLoop:
 					params = cons(vsym(names[i]), params)
 					args = cons(vals[i], args)
 				}
-				lam := list(vsym("lambda"), params)
+				lam := list(vsym("LAMBDA"), params)
 				// append body to lambda
 				t := lam.cdr
 				for !isNil(body) {
@@ -2563,7 +2568,7 @@ evalLoop:
 				}
 				v = cons(lam, args)
 				continue
-			case "letrec":
+			case "LETREC":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("letrec: malformed form")
 				}
@@ -2614,7 +2619,7 @@ evalLoop:
 					body = body.cdr
 				}
 				return result, nil
-			case "define-macro":
+			case "DEFINE-MACRO":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("define-macro: malformed form")
 				}
@@ -2654,7 +2659,7 @@ evalLoop:
 				_ = envSym // stored in envSym field via macro env
 				env.Set(name, m)
 				return vsym(name), nil
-			case "macro-expand":
+			case "MACRO-EXPAND":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("macro-expand: malformed form")
 				}
@@ -2674,7 +2679,7 @@ evalLoop:
 					return nil, fmt.Errorf("macro-expand: not a macro: %s", fnSym.str)
 				}
 				return expandMacro(fn, expr.cdr, env)
-			case "step":
+			case "STEP":
 				// (step expr) — evaluate expr with stepping info
 				body := v.cdr
 				if isNil(body) || body.typ != VPair {
@@ -2688,7 +2693,7 @@ evalLoop:
 				}
 				fmt.Fprintf(os.Stderr, "; Step: => %s\n", writeToString(result))
 				return result, nil
-			case "time":
+			case "TIME":
 				// (time expr) — evaluate expr and print timing info
 				body := v.cdr
 				if isNil(body) || body.typ != VPair {
@@ -2702,7 +2707,7 @@ evalLoop:
 					return nil, err
 				}
 				return result, nil
-			case "ignore-errors":
+			case "IGNORE-ERRORS":
 				// (ignore-errors body...) — returns (values result nil) on success,
 				// or (values nil condition) on error
 				body := v.cdr
@@ -2717,7 +2722,7 @@ evalLoop:
 					body = body.cdr
 				}
 				return result, nil
-			case "unwind-protect":
+			case "UNWIND-PROTECT":
 				// (unwind-protect protected-form cleanup-form...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("unwind-protect: malformed form")
@@ -2737,7 +2742,7 @@ evalLoop:
 					result, err = eval(protected, env)
 				}()
 				return result, err
-			case "and":
+			case "AND":
 				args := v.cdr
 				if isNil(args) {
 					return vbool(true), nil
@@ -2757,7 +2762,7 @@ evalLoop:
 					continue
 				}
 				return vnil(), nil
-			case "or":
+			case "OR":
 				args := v.cdr
 				if isNil(args) {
 					return vbool(false), nil
@@ -2777,7 +2782,7 @@ evalLoop:
 					continue
 				}
 				return vnil(), nil
-			case "block":
+			case "BLOCK":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("block: malformed form")
 				}
@@ -2789,7 +2794,7 @@ evalLoop:
 				if v.cdr.car.typ == VSym {
 					blockName = v.cdr.car.str
 				} else if v.cdr.car.typ == VNil {
-					blockName = "nil"
+					blockName = "NIL"
 				} else {
 					return nil, fmt.Errorf("block: name must be a symbol")
 				}
@@ -2801,7 +2806,7 @@ evalLoop:
 						if br, ok := err.(*blockReturn); ok && br.name == blockName {
 							if br.isLoopFinish {
 								// loop-finish: return loop-result if set, otherwise result
-								if lr, lerr := env.Get("loop-result"); lerr == nil && lr != nil && lr != vnil() {
+								if lr, lerr := env.Get("LOOP-RESULT"); lerr == nil && lr != nil && lr != vnil() {
 									return lr, nil
 								}
 								return result, nil
@@ -2813,7 +2818,7 @@ evalLoop:
 					body = body.cdr
 				}
 				return result, nil
-			case "return-from":
+			case "RETURN-FROM":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("return-from: malformed form")
 				}
@@ -2825,7 +2830,7 @@ evalLoop:
 				if v.cdr.car.typ == VSym {
 					name = v.cdr.car.str
 				} else if v.cdr.car.typ == VNil {
-					name = "nil"
+					name = "NIL"
 				} else {
 					return nil, fmt.Errorf("return-from: block name must be a symbol")
 				}
@@ -2837,13 +2842,13 @@ evalLoop:
 					return nil, err
 				}
 				return nil, &blockReturn{name: name, value: val}
-			case "loop-finish":
+			case "LOOP-FINISH":
 				// Check if loop-result is bound and return its value
-				if v, lerr := env.Get("loop-result"); lerr == nil && v != nil && v != vnil() {
-					return nil, &blockReturn{name: "nil", value: v}
+				if v, lerr := env.Get("LOOP-RESULT"); lerr == nil && v != nil && v != vnil() {
+					return nil, &blockReturn{name: "NIL", value: v}
 				}
-				return nil, &blockReturn{name: "nil", value: vnil(), isLoopFinish: true}
-			case "return":
+				return nil, &blockReturn{name: "NIL", value: vnil(), isLoopFinish: true}
+			case "RETURN":
 				rval := vnil()
 				if v.cdr != nil && v.cdr.typ == VPair && !isNil(v.cdr) {
 					var e2 error
@@ -2852,9 +2857,9 @@ evalLoop:
 						return nil, e2
 					}
 				}
-				return nil, &blockReturn{name: "nil", value: rval}
+				return nil, &blockReturn{name: "NIL", value: rval}
 
-			case "tagbody":
+			case "TAGBODY":
 				body := v.cdr
 				if body.typ != VPair && !isNil(body) {
 					return nil, fmt.Errorf("tagbody: malformed form")
@@ -2901,7 +2906,7 @@ evalLoop:
 					body = body.cdr
 				}
 				return vnil(), nil
-			case "go":
+			case "GO":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("go: malformed form")
 				}
@@ -2912,7 +2917,7 @@ evalLoop:
 					return nil, &goTag{tag: strconv.FormatFloat(tag.num, 'f', 0, 64)}
 				}
 				return nil, fmt.Errorf("go: tag must be symbol or number")
-			case "catch":
+			case "CATCH":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("catch: malformed form")
 				}
@@ -2942,7 +2947,7 @@ evalLoop:
 					body = body.cdr
 				}
 				return result, nil
-			case "throw":
+			case "THROW":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("throw: malformed form")
 				}
@@ -2967,7 +2972,7 @@ evalLoop:
 					return nil, err
 				}
 				return nil, &throwValue{tag: tagName, value: val}
-			case "multiple-value-bind":
+			case "MULTIPLE-VALUE-BIND":
 				// (multiple-value-bind (var1 var2 ...) values-form body...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("multiple-value-bind: malformed form")
@@ -3016,7 +3021,7 @@ evalLoop:
 				}
 				v = body.car
 				continue
-			case "multiple-value-list":
+			case "MULTIPLE-VALUE-LIST":
 				// (multiple-value-list form)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("multiple-value-list: need a form")
@@ -3027,7 +3032,7 @@ evalLoop:
 					return nil, e
 				}
 				return multiValList(result), nil
-			case "multiple-value-setq":
+			case "MULTIPLE-VALUE-SETQ":
 				// (multiple-value-setq (var1 var2 ...) form)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("multiple-value-setq: malformed form")
@@ -3051,7 +3056,7 @@ evalLoop:
 				}
 				v = result
 				continue
-			case "multiple-value-prog1":
+			case "MULTIPLE-VALUE-PROG1":
 				// (multiple-value-prog1 form1 form2 ...)
 				// Evaluates all forms, returns values of the first form
 				if isNil(v.cdr) {
@@ -3070,7 +3075,7 @@ evalLoop:
 					}
 				}
 				return result, nil
-			case "multiple-value-call":
+			case "MULTIPLE-VALUE-CALL":
 				// (multiple-value-call fn form1 form2 ...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("multiple-value-call: malformed form")
@@ -3105,7 +3110,7 @@ evalLoop:
 					forms = forms.cdr
 				}
 				return apply(fnVal, allArgs, env)
-			case "nth-value":
+			case "NTH-VALUE":
 				// (nth-value n form) => nth value (0-based)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("nth-value: malformed form")
@@ -3128,7 +3133,7 @@ evalLoop:
 				}
 				return vals.car, nil
 
-			case "case":
+			case "CASE":
 				// (case keyform ((key1 key2 ...) body...) ... (else body...))
 				// Also supports single key: (case keyform (key body...) ...)
 				if v.cdr == nil || v.cdr.typ != VPair {
@@ -3153,7 +3158,7 @@ evalLoop:
 					}
 					keys := clause.car
 					// Check for else clause (also t and otherwise per CL spec)
-					if keys.typ == VSym && (keys.str == "else" || keys.str == "t" || keys.str == "otherwise") {
+					if keys.typ == VSym && (keys.str == "ELSE" || keys.str == "T" || keys.str == "OTHERWISE") {
 						body := clause.cdr
 						for body.typ == VPair && !isNil(body.cdr) {
 							_, err = eval(body.car, env)
@@ -3202,7 +3207,7 @@ evalLoop:
 				}
 				return vnil(), nil
 
-			case "typecase":
+			case "TYPECASE":
 				// (typecase keyform ((type) body...) ... (else body...))
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("typecase: malformed form")
@@ -3226,7 +3231,7 @@ evalLoop:
 					}
 					typeSpec := clause.car
 					// Check for else clause
-					if typeSpec != nil && typeSpec.typ == VSym && (typeSpec.str == "else" || typeSpec.str == "otherwise" || typeSpec.str == "t") {
+					if typeSpec != nil && typeSpec.typ == VSym && (typeSpec.str == "ELSE" || typeSpec.str == "OTHERWISE" || typeSpec.str == "T") {
 						body := clause.cdr
 						for body.typ == VPair && !isNil(body.cdr) {
 							_, err = eval(body.car, env)
@@ -3259,7 +3264,7 @@ evalLoop:
 					clauses = clauses.cdr
 				}
 				return vnil(), nil
-			case "ecase":
+			case "ECASE":
 				// (ecase keyform (key body...) ...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("ecase: malformed form")
@@ -3314,7 +3319,7 @@ evalLoop:
 					clauses = clauses.cdr
 				}
 				return nil, fmt.Errorf("ecase: no match for %s", toString(keyVal))
-			case "etypecase":
+			case "ETYPECASE":
 				// (etypecase keyform (type body...) ...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("etypecase: malformed form")
@@ -3351,7 +3356,7 @@ evalLoop:
 				}
 				return nil, fmt.Errorf("etypecase: no match for %s", toString(keyVal))
 
-			case "ctypecase":
+			case "CTYPECASE":
 				// (ctypecase keyplace (type body...) ...)
 				// Like etypecase but keyplace is a place (setf-able)
 				if v.cdr == nil || v.cdr.typ != VPair {
@@ -3389,7 +3394,7 @@ evalLoop:
 				}
 				return nil, fmt.Errorf("ctypecase: no match for %s", toString(keyVal))
 
-			case "destructuring-bind":
+			case "DESTRUCTURING-BIND":
 				// (destructuring-bind (pattern) expr body...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("destructuring-bind: malformed form")
@@ -3421,7 +3426,7 @@ evalLoop:
 				v = body.car
 				continue
 
-			case "handler-case":
+			case "HANDLER-CASE":
 				// (handler-case expr (type (var) body...) ... (:no-error (vars...) body...))
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("handler-case: malformed form")
@@ -3584,7 +3589,7 @@ evalLoop:
 				}
 				return hcResult, nil
 
-			case "handler-bind":
+			case "HANDLER-BIND":
 				// (handler-bind ((type handler-fn) ...) body...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("handler-bind: malformed form")
@@ -3656,7 +3661,7 @@ evalLoop:
 				}()
 				return hbResult, hbErr
 
-			case "restart-case":
+			case "RESTART-CASE":
 				// (restart-case expr (name (arg) body...) ...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("restart-case: malformed form")
@@ -3792,7 +3797,7 @@ evalLoop:
 				}
 				return rcResult, nil
 
-			case "restart-bind":
+			case "RESTART-BIND":
 				// (restart-bind ((name fn) ...) body...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("restart-bind: malformed form")
@@ -3845,7 +3850,7 @@ evalLoop:
 				v = rbody.car
 				continue
 
-			case "macrolet":
+			case "MACROLET":
 				// (macrolet ((name (args...) body...) ...) expr...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("macrolet: malformed form")
@@ -3893,7 +3898,7 @@ evalLoop:
 				}
 				v = body.car
 				continue
-			case "symbol-macrolet":
+			case "SYMBOL-MACROLET":
 				// (symbol-macrolet ((sym expansion) ...) expr...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("symbol-macrolet: malformed form")
@@ -3931,7 +3936,7 @@ evalLoop:
 				}
 				v = symBody.car
 				continue
-			case "eval-when":
+			case "EVAL-WHEN":
 				// (eval-when (situations) body...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("eval-when: malformed form")
@@ -3943,8 +3948,8 @@ evalLoop:
 					s := situations.car
 					if s.typ == VSym {
 						switch s.str {
-						case ":execute", "execute", ":eval", "eval",
-							":load-toplevel", "load-toplevel", ":load", "load":
+						case ":execute", "EXECUTE", ":eval", "EVAL",
+							":load-toplevel", "LOAD-TOPLEVEL", ":load", "LOAD":
 							execute = true
 						}
 					}
@@ -3962,7 +3967,7 @@ evalLoop:
 					continue
 				}
 				return vnil(), nil
-			case "setf":
+			case "SETF":
 				// (setf var newval) or (setf (accessor args...) newval)
 				if v.cdr == nil || v.cdr.typ != VPair || v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
 					return nil, fmt.Errorf("setf: malformed form")
@@ -3992,7 +3997,7 @@ evalLoop:
 				}
 				if target.car == nil { return nil, fmt.Errorf("setf: empty accessor") }
 				// Handle (setf (values place1 place2 ...) newval)
-				if target.car.typ == VSym && target.car.str == "values" {
+				if target.car.typ == VSym && target.car.str == "VALUES" {
 					// Evaluate the newval expression to get all values
 					vals, err := eval(newValExpr, env)
 					if err != nil {
@@ -4016,7 +4021,7 @@ evalLoop:
 						}
 						// Build (setf place val) AST and evaluate recursively
 						setfCall := &Value{typ: VPair,
-							car: &Value{typ: VSym, str: "setf"},
+							car: &Value{typ: VSym, str: "SETF"},
 							cdr: &Value{typ: VPair, car: places.car,
 								cdr: &Value{typ: VPair, car: val, cdr: vnil()}}}
 						r, err := eval(setfCall, env)
@@ -4057,7 +4062,7 @@ evalLoop:
 				}
 				v = &Value{typ: VPair, car: setter, cdr: callArgs}
 				continue
-			case "cond":
+			case "COND":
 				clauses := v.cdr
 				seen := make(map[*Value]bool)
 				for !isNil(clauses) && clauses.typ == VPair {
@@ -4070,7 +4075,7 @@ evalLoop:
 						clauses = clauses.cdr
 						continue
 					}
-					if cl.car != nil && cl.car.typ == VSym && cl.car.str == "else" {
+					if cl.car != nil && cl.car.typ == VSym && cl.car.str == "ELSE" {
 						body := cl.cdr
 						if isNil(body) {
 							return vnil(), nil
@@ -4114,7 +4119,7 @@ evalLoop:
 				}
 				return vnil(), nil
 
-			case "defclass":
+			case "DEFCLASS":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("defclass: malformed form")
 				}
@@ -4131,7 +4136,7 @@ evalLoop:
 				}
 				slotsVal := v.cdr.cdr.cdr.car
 				// Strip (quote ...) wrapper if present
-				if !isNil(slotsVal) && slotsVal.typ == VPair && slotsVal.car != nil && slotsVal.car.typ == VSym && slotsVal.car.str == "quote" {
+				if !isNil(slotsVal) && slotsVal.typ == VPair && slotsVal.car != nil && slotsVal.car.typ == VSym && slotsVal.car.str == "QUOTE" {
 					if !isNil(slotsVal.cdr) && slotsVal.cdr.typ == VPair {
 						slotsVal = slotsVal.cdr.car
 					} else {
@@ -4265,9 +4270,9 @@ evalLoop:
 						gf.str = accessorName
 						m := genMethod{
 							qualifier:    "",
-							params:       []string{"inst"},
+							params:       []string{"INST"},
 							specializers: []string{className},
-							body:         list(list(vsym("slot-value"), vsym("inst"), list(vsym("quote"), vsym(slotName)))),
+							body:         list(list(vsym("SLOT-VALUE"), vsym("INST"), list(vsym("QUOTE"), vsym(slotName)))),
 							env:          env,
 						}
 						gf.genMethods = append(gf.genMethods, m)
@@ -4278,9 +4283,9 @@ evalLoop:
 						gf.str = readerName
 						m := genMethod{
 							qualifier:    "",
-							params:       []string{"inst"},
+							params:       []string{"INST"},
 							specializers: []string{className},
-							body:         list(list(vsym("slot-value"), vsym("inst"), list(vsym("quote"), vsym(slotName)))),
+							body:         list(list(vsym("SLOT-VALUE"), vsym("INST"), list(vsym("QUOTE"), vsym(slotName)))),
 							env:          env,
 						}
 						gf.genMethods = append(gf.genMethods, m)
@@ -4293,9 +4298,9 @@ evalLoop:
 						gf.str = writerName
 						m := genMethod{
 							qualifier:    "",
-							params:       []string{"val", "inst"},
+							params:       []string{"VAL", "INST"},
 							specializers: []string{"", className},
-							body:         list(list(vsym("setf"), list(vsym("slot-value"), vsym("inst"), list(vsym("quote"), vsym(slotName))), vsym("val"))),
+							body:         list(list(vsym("SETF"), list(vsym("SLOT-VALUE"), vsym("INST"), list(vsym("QUOTE"), vsym(slotName))), vsym("VAL"))),
 							env:          env,
 						}
 						gf.genMethods = append(gf.genMethods, m)
@@ -4305,7 +4310,7 @@ evalLoop:
 
 				return vsym(className), nil
 
-			case "defmethod":
+			case "DEFMETHOD":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("defmethod: malformed form")
 				}
@@ -4379,7 +4384,7 @@ evalLoop:
 							if sp.car.typ == VSym {
 								// Class specializer: ((d dog))
 								specializers = append(specializers, sp.car.str)
-							} else if sp.car.typ == VPair && sp.car.car != nil && sp.car.car.typ == VSym && sp.car.car.str == "eql" {
+							} else if sp.car.typ == VPair && sp.car.car != nil && sp.car.car.typ == VSym && sp.car.car.str == "EQL" {
 								// EQL specializer: ((x (eql val)))
 								eqlVal := sp.car.cdr
 								if eqlVal.typ == VPair && eqlVal.car != nil {
@@ -4407,14 +4412,14 @@ evalLoop:
 				gf.genMethods = append(gf.genMethods, m)
 				return vsym(gfName), nil
 
-			case "call-next-method":
+			case "CALL-NEXT-METHOD":
 				// Check if call-next-method is bound locally (inside a method)
-				if cnmFn, cnmErr := env.Get("call-next-method"); cnmErr == nil {
+				if cnmFn, cnmErr := env.Get("CALL-NEXT-METHOD"); cnmErr == nil {
 					return apply(cnmFn, v.cdr, env)
 				}
 				return nil, fmt.Errorf("call-next-method: not inside a method")
 
-				case "load":
+				case "LOAD":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("load: need a filename")
 				}
@@ -4468,7 +4473,7 @@ evalLoop:
 					return nil, fmt.Errorf("load: open %s: %v", fname, statErr)
 				}
 				return loadFile(fname, env)
-			case "with-open-file":
+			case "WITH-OPEN-FILE":
 				// (with-open-file (var pathname &key direction ...) body...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("with-open-file: malformed form")
@@ -4485,7 +4490,7 @@ evalLoop:
 					return nil, fmt.Errorf("with-open-file: need a pathname")
 				}
 				body := v.cdr.cdr
-				openCallArgs := []*Value{vsym("open"), spec.cdr.car}
+				openCallArgs := []*Value{vsym("OPEN"), spec.cdr.car}
 				rest := spec.cdr.cdr
 				for !isNil(rest) {
 					openCallArgs = append(openCallArgs, rest.car)
@@ -4523,7 +4528,7 @@ evalLoop:
 					}
 				}()
 				return result, err
-			case "with-output-to-string":
+			case "WITH-OUTPUT-TO-STRING":
 				// (with-output-to-string (var) body...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("with-output-to-string: malformed form")
@@ -4558,7 +4563,7 @@ evalLoop:
 					}
 				}
 				return vstr(stream.stream.getStringOutput()), nil
-			case "with-input-from-string":
+			case "WITH-INPUT-FROM-STRING":
 				// (with-input-from-string (var string) body...)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("with-input-from-string: malformed form")
@@ -4977,11 +4982,11 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 		return v, nil
 	}
 	// (unquote expr) at depth 0
-	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote" && depth == 0 {
+	if v.car != nil && v.car.typ == VSym && v.car.str == "UNQUOTE" && depth == 0 {
 		return eval(v.cdr.car, env)
 	}
 	// (unquote-splicing expr) at depth > 0 - recursively process
-	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote-splicing" && depth > 0 {
+	if v.car != nil && v.car.typ == VSym && v.car.str == "UNQUOTE-SPLICING" && depth > 0 {
 		inner, e := evalQuasiquote(v.cdr.car, depth-1, env)
 		if e != nil {
 			return nil, e
@@ -4989,14 +4994,14 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 		return list(vsym("quasiquote"), list(vsym("unquote-splicing"), inner)), nil
 	}
 	// (unquote-splicing expr) at depth 0 - not valid here
-	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote-splicing" && depth == 0 {
+	if v.car != nil && v.car.typ == VSym && v.car.str == "UNQUOTE-SPLICING" && depth == 0 {
 		return nil, fmt.Errorf("unquote-splicing outside list")
 	}
 	// (quasiquote expr)
-	if v.car != nil && v.car.typ == VSym && v.car.str == "quasiquote" {
+	if v.car != nil && v.car.typ == VSym && v.car.str == "QUASIQUOTE" {
 		return evalQuasiquote(v.cdr.car, depth+1, env)
 	}
-	if v.car != nil && v.car.typ == VSym && v.car.str == "unquote" && depth > 0 {
+	if v.car != nil && v.car.typ == VSym && v.car.str == "UNQUOTE" && depth > 0 {
 		inner, e := evalQuasiquote(v.cdr.car, depth-1, env)
 		if e != nil {
 			return nil, e
@@ -5014,7 +5019,7 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 		}
 		seen[iter] = true
 		elem := iter.car
-		if isPair(elem) && elem.car != nil && elem.car.typ == VSym && elem.car.str == "unquote-splicing" && depth == 0 {
+		if isPair(elem) && elem.car != nil && elem.car.typ == VSym && elem.car.str == "UNQUOTE-SPLICING" && depth == 0 {
 			if elem.cdr == nil || elem.cdr.typ != VPair {
 				return nil, fmt.Errorf("unquote-splicing: malformed form")
 			}
@@ -8629,7 +8634,7 @@ func builtinCompile(args []*Value) (*Value, error) {
 	}
 	if name != nil && name.typ == VSym && def != nil {
 		// Compile a lambda definition
-		if def.typ == VPair && def.car != nil && def.car.typ == VSym && def.car.str == "lambda" {
+		if def.typ == VPair && def.car != nil && def.car.typ == VSym && def.car.str == "LAMBDA" {
 			// It's a lambda, eval it and return
 			result, err := eval(def, globalEnv)
 			if err != nil {
@@ -8651,7 +8656,7 @@ func builtinCompile(args []*Value) (*Value, error) {
 			return multiVal(val, vnil(), vnil()), nil
 		}
 	}
-	if def != nil && def.typ == VPair && def.car != nil && def.car.typ == VSym && def.car.str == "lambda" {
+	if def != nil && def.typ == VPair && def.car != nil && def.car.typ == VSym && def.car.str == "LAMBDA" {
 		result, err := eval(def, globalEnv)
 		if err != nil {
 			return vnil(), nil
@@ -9155,7 +9160,7 @@ func subtypepChecks(v1, v2 *Value) (bool, bool) {
 		if t1 == t2 {
 			return true
 		}
-		types := map[string][]string{"integer": {"rational", "real", "number", "atom", "t"}, "float": {"real", "number", "atom", "t"}, "rational": {"real", "number", "atom", "t"}, "complex": {"number", "atom", "t"}, "real": {"number", "atom", "t"}, "ratio": {"rational", "real", "number", "atom", "t"}, "fixnum": {"integer", "rational", "real", "number", "atom", "t"}, "bignum": {"integer", "rational", "real", "number", "atom", "t"}, "bit": {"integer", "rational", "real", "number", "atom", "t"}, "short-float": {"float", "real", "number", "atom", "t"}, "single-float": {"float", "real", "number", "atom", "t"}, "double-float": {"float", "real", "number", "atom", "t"}, "long-float": {"float", "real", "number", "atom", "t"}, "string": {"array", "vector", "sequence", "atom", "t"}, "simple-string": {"string", "array", "vector", "sequence", "atom", "t"}, "character": {"atom", "t"}, "base-char": {"standard-char", "character", "atom", "t"}, "standard-char": {"character", "atom", "t"}, "extended-char": {"character", "atom", "t"}, "symbol": {"atom", "t"}, "keyword": {"symbol", "atom", "t"}, "null": {"symbol", "list", "sequence", "atom", "t"}, "cons": {"list", "sequence", "t"}, "pair": {"cons", "list", "sequence", "t"}, "list": {"sequence", "t"}, "sequence": {"t"}, "vector": {"array", "sequence", "t"}, "simple-vector": {"vector", "array", "sequence", "t"}, "array": {"t"}, "function": {"t"}, "compiled-function": {"function", "t"}, "hash-table": {"t"}, "stream": {"t"}, "package": {"t"}, "pathname": {"t"}, "random-state": {"t"}, "readtable": {"t"}, "instance": {"t"}, "structure": {"instance", "t"}, "boolean": {"atom", "t"}}
+		types := map[string][]string{"INTEGER": {"RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "FLOAT": {"REAL", "NUMBER", "ATOM", "T"}, "RATIONAL": {"REAL", "NUMBER", "ATOM", "T"}, "COMPLEX": {"NUMBER", "ATOM", "T"}, "REAL": {"NUMBER", "ATOM", "T"}, "RATIO": {"RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "FIXNUM": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "BIGNUM": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "BIT": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "SHORT-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "SINGLE-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "DOUBLE-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "LONG-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "STRING": {"ARRAY", "VECTOR", "SEQUENCE", "ATOM", "T"}, "SIMPLE-STRING": {"STRING", "ARRAY", "VECTOR", "SEQUENCE", "ATOM", "T"}, "CHARACTER": {"ATOM", "T"}, "BASE-CHAR": {"STANDARD-CHAR", "CHARACTER", "ATOM", "T"}, "STANDARD-CHAR": {"CHARACTER", "ATOM", "T"}, "EXTENDED-CHAR": {"CHARACTER", "ATOM", "T"}, "SYMBOL": {"ATOM", "T"}, "KEYWORD": {"SYMBOL", "ATOM", "T"}, "NULL": {"SYMBOL", "LIST", "SEQUENCE", "ATOM", "T"}, "CONS": {"LIST", "SEQUENCE", "T"}, "PAIR": {"CONS", "LIST", "SEQUENCE", "T"}, "LIST": {"SEQUENCE", "T"}, "SEQUENCE": {"T"}, "VECTOR": {"ARRAY", "SEQUENCE", "T"}, "SIMPLE-VECTOR": {"VECTOR", "ARRAY", "SEQUENCE", "T"}, "ARRAY": {"T"}, "FUNCTION": {"T"}, "COMPILED-FUNCTION": {"FUNCTION", "T"}, "HASH-TABLE": {"T"}, "STREAM": {"T"}, "PACKAGE": {"T"}, "PATHNAME": {"T"}, "RANDOM-STATE": {"T"}, "READTABLE": {"T"}, "INSTANCE": {"T"}, "STRUCTURE": {"INSTANCE", "T"}, "BOOLEAN": {"ATOM", "T"}}
 		if subtypes, ok := types[t1]; ok {
 			for _, s := range subtypes {
 				if s == t2 {
@@ -9176,12 +9181,12 @@ func subtypepChecks(v1, v2 *Value) (bool, bool) {
 		}
 		// * is universal type
 		if n1 == "*" {
-			if n2 == "*" || n2 == "t" {
+			if n2 == "*" || n2 == "T" {
 				return true, true
 			}
 			return true, false
 		}
-		if n2 == "*" || n2 == "t" {
+		if n2 == "*" || n2 == "T" {
 			return true, true
 		}
 		if simpleSubtype(n1, n2) {
@@ -9198,14 +9203,14 @@ func subtypepChecks(v1, v2 *Value) (bool, bool) {
 	}
 
 	// Handle compound (cons ...) types
-	if n1 == "cons" || n2 == "cons" {
+	if n1 == "CONS" || n2 == "CONS" {
 		extractConsParts := func(v *Value) (carType *Value, cdrType *Value) {
 			cdrType = vsym("*")
 			if v.typ == VSym {
 				carType = vsym("*")
 				return
 			}
-			if v.typ == VPair && v.car != nil && v.car.typ == VSym && v.car.str == "cons" {
+			if v.typ == VPair && v.car != nil && v.car.typ == VSym && v.car.str == "CONS" {
 				rest := v.cdr
 				if rest != nil && !isNil(rest) && rest.typ == VPair {
 					carType = rest.car
@@ -9238,7 +9243,7 @@ func subtypepChecks(v1, v2 *Value) (bool, bool) {
 	}
 
 	// If t2 is t or *, anything is a subtype
-	if n2 == "t" || n2 == "*" {
+	if n2 == "T" || n2 == "*" {
 		return true, true
 	}
 
@@ -10359,7 +10364,7 @@ func builtinMacroexpand(args []*Value) (*Value, error) {
 	const maxMacroExpandDepth = 1000
 
 	// Handle quasiquote specially since it's not a VMacro
-	if form.typ == VPair && form.car != nil && form.car.typ == VSym && form.car.str == "quasiquote" {
+	if form.typ == VPair && form.car != nil && form.car.typ == VSym && form.car.str == "QUASIQUOTE" {
 		if len(args) >= 1 && args[0].cdr != nil && args[0].cdr.typ == VPair && args[0].cdr.car != nil {
 			expanded, e := evalQuasiquote(args[0].cdr.car, 0, globalEnv)
 			if e != nil {
@@ -12996,7 +13001,7 @@ func builtinSeqConcatenate(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("concatenate: need result-type and sequences")
 	}
 	resultType := args[0]
-	if resultType.typ == VSym && resultType.str == "string" {
+	if resultType.typ == VSym && resultType.str == "STRING" {
 		var result string
 		for i := 1; i < len(args); i++ {
 			if args[i].typ == VStr {
@@ -13212,7 +13217,7 @@ func builtinMap(args []*Value) (*Value, error) {
 		result = append(result, val)
 	}
 	// Convert based on result-type
-	if isNil(resultType) || (resultType.typ == VSym && resultType.str == "nil") {
+	if isNil(resultType) || (resultType.typ == VSym && resultType.str == "NIL") {
 		return vnil(), nil
 	}
 	if resultType.typ != VSym {
@@ -21625,13 +21630,13 @@ func runTests() {
 		{"(append '(1 2) '(3 4))", "(1 2 3 4)"},
 		{"(reverse '(1 2 3))", "(3 2 1)"},
 		{"(range 5)", "(0 1 2 3 4)"},
-		{"(list-ref '(a b c) 1)", "b"},
+		{"(list-ref '(a b c) 1)", "B"},
 		{"(member? 2 '(1 2 3))", "#t"},
 		{"(any number? '(a b 3))", "#t"},
 		{"(all number? '(1 2 3))", "#t"},
 		{"(take 2 '(1 2 3))", "(1 2)"},
 		{"(drop 2 '(1 2 3))", "(3)"},
-		{"(zip '(1 2) '(a b))", "((1 a) (2 b))"},
+		{"(zip '(1 2) '(a b))", "((1 A) (2 B))"},
 		{"(abs -5)", "5"},
 	}
 	fmt.Println("\n--- Standard Library Tests ---")
