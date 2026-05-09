@@ -88,3 +88,6 @@
 48. `loop` 不支持 `being each present-symbol/external-symbol of package` 子句
 49. `random` 函数接受浮点数参数时总是返回 0（截断为整数导致 rand.Intn(0/1)）
 50. `macroexpand` 不展开 quasiquote 形式（返回原始形式不变）
+51. `loop` 不支持解构模式如 `(for (a b) in list)`
+52. `functionp` 谓词函数未实现
+53. `defun` 不接受 `(setf name)` 作为函数名
