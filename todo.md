@@ -5,6 +5,7 @@
 ### Reader / Readtable
 - [ ] `set-dispatch-macro-character` 注册的 dispatch 函数未被 parser 调用（# 分发完全硬编码）
 - [ ] `read-delimited-list` 未实现
+- [x] `readtable-case` 的 `:preserve` 和 `:invert` 模式未实现（lexer 总是 uppercase 符号名）— 已修复
 
 ### Destructuring
 - [x] `destructuring-bind` 不支持 `&key` 参数 — 已修复

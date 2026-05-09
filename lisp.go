@@ -813,8 +813,29 @@ func resolvePackageFromDesignator(v *Value) *Package {
 // This should be used by the reader instead of bare vsym().
 // CL requires the reader to upcase unescaped symbol names by default.
 func internOrVsym(name string) *Value {
-	// CL reader upcases symbol names by default (*readtable-case* = :upcase)
-	name = strings.ToUpper(name)
+	// CL reader case handling per *readtable-case*
+	if currentReadtable != nil {
+		switch currentReadtable.caseMode {
+		case ":UPCASE":
+			name = strings.ToUpper(name)
+		case ":DOWNCASE":
+			name = strings.ToLower(name)
+		case ":PRESERVE":
+			// keep name as-is
+		case ":INVERT":
+			// Flip case: if all uppercase, make lowercase; if all lowercase, make uppercase
+			if name == strings.ToUpper(name) {
+				name = strings.ToLower(name)
+			} else if name == strings.ToLower(name) {
+				name = strings.ToUpper(name)
+			}
+		default:
+			name = strings.ToUpper(name)
+		}
+	} else {
+		// CL default: upcase
+		name = strings.ToUpper(name)
+	}
 	// Handle qualified symbols: pkg:sym or pkg::sym
 	if resolved := resolvePackageSymbol(name); resolved != nil {
 		return resolved
