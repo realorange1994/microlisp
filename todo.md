@@ -96,3 +96,5 @@
 56. `delete-if`/`nsubstitute-if` 谓词函数调用方式错误（eval 而非 callFnOnSeq）
 57. `delete-duplicates` 使用指针相等而非值相等判断重复
 58. `*random-state*` 未初始化
+59. `coerce` 不支持 `'vector` 和 `'array` 结果类型
+60. `typep` 不处理复合 `vector` 类型说明符如 `(vector *)`
