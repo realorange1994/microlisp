@@ -5382,6 +5382,7 @@ var builtins = []builtinDef{
 	{"find-symbol", builtinFindSymbol},
 	{"keywordp", builtinKeywordP},
 	{"symbolp", builtinSymP},
+	{"stringp", builtinStringP},
 	{"copy-symbol", builtinCopySymbol},
 	{"get", builtinGet},
 	{"putprop", builtinPutprop},
@@ -5405,6 +5406,8 @@ var builtins = []builtinDef{
 	{"rename-package", builtinRenamePackage},
 	{"delete-package", builtinDeletePackage},
 	{"package-nicknames", builtinPackageNicknames},
+	{"package-symbols", builtinPackageSymbols},
+	{"package-external-symbols", builtinPackageExternalSymbols},
 	{"unexport", builtinUnexport},
 	{"make-instance", builtinMakeInstance},
 	{"make-condition", builtinMakeCondition},
@@ -5707,6 +5710,7 @@ var builtins = []builtinDef{
 	{"complexp", builtinComplexp},
 	{"float", builtinFloat},
 	{"rational", builtinRational},
+	{"numberp", builtinNumberP},
 	{"numerator", builtinNumerator},
 	{"denominator", builtinDenominator},
 	{"ash", builtinAsh},
@@ -7323,6 +7327,13 @@ func builtinSymP(args []*Value) (*Value, error) {
 	return vbool(args[0].typ == VSym), nil
 }
 
+func builtinStringP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("stringp: need 1 argument")
+	}
+	return vbool(args[0].typ == VStr), nil
+}
+
 func builtinBoolP(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("boolean?: need 1 argument")
@@ -7342,6 +7353,13 @@ func builtinCharP(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("character?: need 1 argument")
 	}
 	return vbool(args[0].typ == VChar), nil
+}
+
+func builtinNumberP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("numberp: need 1 argument")
+	}
+	return vbool(args[0].typ == VNum), nil
 }
 
 func builtinChar(args []*Value) (*Value, error) {
@@ -10760,6 +10778,40 @@ func builtinPackageNicknames(args []*Value) (*Value, error) {
 	result := vnil()
 	for i := len(pkg.nicknames) - 1; i >= 0; i-- {
 		result = cons(vsym(pkg.nicknames[i]), result)
+	}
+	return result, nil
+}
+
+func builtinPackageSymbols(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("package-symbols: need package designator")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return vnil(), nil
+	}
+	result := vnil()
+	for _, sym := range pkg.symbols {
+		result = cons(sym, result)
+	}
+	return result, nil
+}
+
+func builtinPackageExternalSymbols(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("package-external-symbols: need package designator")
+	}
+	pkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if pkg == nil {
+		return vnil(), nil
+	}
+	result := vnil()
+	for name, isExported := range pkg.exports {
+		if isExported {
+			if sym, ok := pkg.symbols[name]; ok {
+				result = cons(sym, result)
+			}
+		}
 	}
 	return result, nil
 }
@@ -19526,7 +19578,7 @@ var initLib = `
 
 ;; SBCL test harness stubs
 (define (enable-test-parallelism) nil)
-(define (checked-compile form) form)
+(define-macro (checked-compile form . rest) form)
 (define (checked-eval form) (eval form))
 (define (ctu:asm-search pattern source) nil)
 
@@ -19541,8 +19593,26 @@ var initLib = `
   nil)
 
 (define-macro (checked-compile-and-assert opts form cases)
-  (list 'let (list (list '_ form))
-    nil))
+  (let ((fn-sym (gensym "cca-")))
+    (let ((is-pair (pair? cases))
+          (is-nested #f))
+      (if is-pair
+          (set! is-nested (pair? (car cases)))
+          (set! is-nested #f))
+      (cons 'let
+        (list (list (list fn-sym form))
+              (cons 'begin
+                (let ((case-list (if is-nested (car cases) (list cases))))
+                  (let ((gen-case (lambda (c)
+                                    (if (pair? c)
+                                        (let ((inputs (car c))
+                                              (expected (if (pair? (cdr c)) (car (cdr c)) nil)))
+                                          (list 'assert
+                                                (list 'equal
+                                                      (list 'apply fn-sym (list 'quote inputs))
+                                                      (list 'quote expected))))
+                                        (list 'begin)))))
+                    (mapcar gen-case case-list)))))))))
 
 (define (ctu:find-code-constants fn) nil)
 (define (ctu:ir1-named-calls fn) nil)
@@ -20222,7 +20292,7 @@ var initLib = `
                (let ((args '()))
                  (while (and (pair? tail)
                              (not (member (car tail)
-                                    '(for with while until repeat collect sum count
+                                    '(being for with while until repeat collect sum count
                                       maximize minimize append nconc when unless
                                       if do named initially finally return always never thereis and by))))
                    (set! args (append args (list (car tail))))
@@ -20456,13 +20526,31 @@ var initLib = `
                    (tail (gensym "in-")))
               (set! in-lets (cons (list user-var tail list-expr) in-lets))
               (set! expanded (cons (list tail 'in list-expr) expanded)))
+            (if (equal? (cadr f) 'being)
+              ;; Handle: for sym being each present-symbol of package
+              ;;   args = (each present-symbol of <pkg-expr>)
+              (let* ((user-var (car f))
+                     (args (cddr f))
+                     (skip-each (if (and (pair? args) (equal? (car args) 'each)) (cdr args) args))
+                     (sym-kind (if (pair? skip-each) (car skip-each) #f))
+                     (after-kind (if (pair? skip-each) (cdr skip-each) '()))
+                     (pkg-expr (if (and (pair? after-kind) (equal? (car after-kind) 'of) (pair? (cdr after-kind)))
+                                   (cadr after-kind) #f)))
+                (if (and sym-kind pkg-expr)
+                  (let* ((list-expr (if (equal? sym-kind 'present-symbol)
+                                       (list 'package-symbols pkg-expr)
+                                       (list 'package-external-symbols pkg-expr)))
+                         (tail (gensym "in-")))
+                    (set! in-lets (cons (list user-var tail list-expr) in-lets))
+                    (set! expanded (cons (list tail 'in list-expr) expanded)))
+                  (set! expanded (cons f expanded))))
             (if (equal? (cadr f) '=)
               (let* ((var (car f))
                      (args (cddr f))
                      (init-expr (car args)))
                 (set! eq-lets (cons (list var init-expr) eq-lets))
                 (set! expanded (cons (list var '= 'nil) expanded)))
-              (set! expanded (cons f expanded)))))
+              (set! expanded (cons f expanded))))))
         raw-for-vars)
       (let* ((for-vars (reverse expanded))
              (in-lets (reverse in-lets))
@@ -20681,7 +20769,17 @@ var initLib = `
             (append body-exprs (list (list 'return-from loop-name return-val)))))
 
 
-        ;; Add in-clause element extraction as pre-body bindings
+        ;; Add = clause bindings as pre-body set! operations
+        (for-each
+          (lambda (e)
+            (let ((var (car e))
+                  (init-expr (cadr e)))
+              ;; recompute expr each iteration
+              (set! body-exprs
+                (cons (list 'set! var init-expr) body-exprs))))
+          eq-lets)
+
+        ;; Add in-clause element extraction as pre-body bindings (after eq-lets so in-lets come first)
         (for-each
           (lambda (p)
             (let ((user-var (car p))
@@ -20695,16 +20793,6 @@ var initLib = `
                 (cons (list 'set! user-var (list 'car tail-var))
                       body-exprs))))
           in-lets)
-
-        ;; Add = clause bindings as pre-body set! operations
-        (for-each
-          (lambda (e)
-            (let ((var (car e))
-                  (init-expr (cadr e)))
-              ;; recompute expr each iteration
-              (set! body-exprs
-                (cons (list 'set! var init-expr) body-exprs))))
-          eq-lets)
 
         ;; Build the loop function
         (let* ((result-expr
