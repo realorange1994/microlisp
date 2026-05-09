@@ -2085,6 +2085,9 @@ evalLoop:
 			if e != nil {
 				return nil, e
 			}
+			if val == nil {
+				return vnil(), nil
+			}
 			if val.typ == VSymMacro {
 				v = val.car
 				continue
@@ -5416,10 +5419,10 @@ var builtins = []builtinDef{
 	{"car", builtinCar},
 	{"cdr", builtinCdr},
 	{"set-car!", builtinSetCar},
+	{"set", builtinSet},
 	{"set-cdr!", builtinSetCdr},
 	{"car-setf", builtinSetCarAsSetter},
 	{"cdr-setf", builtinSetCdrAsSetter},
-	{"set-car!", builtinSetCar},
 	{"list", builtinList},
 	{"rest", builtinRest},
 	{"first", builtinFirst},
@@ -5905,6 +5908,7 @@ var builtins = []builtinDef{
 	{"alphanumericp", builtinAlphanumericp},
 	{"alpha-char-p", builtinAlphaCharP},
 	{"graphic-char-p", builtinGraphicCharP},
+	{"standard-char-p", builtinStandardCharP},
 	{"upper-case-p", builtinUpperCaseP},
 	{"lower-case-p", builtinLowerCaseP},
 	{"both-case-p", builtinBothCaseP},
@@ -7310,6 +7314,20 @@ func builtinSetCar(args []*Value) (*Value, error) {
 	return args[1], nil
 }
 
+// builtinSet implements CL's (set symbol value) - sets the dynamic value of a symbol
+func builtinSet(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("set: need symbol and value")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("set: first argument must be a symbol")
+	}
+	val := args[1]
+	globalEnv.Set(sym.str, val)
+	return val, nil
+}
+
 func builtinSetCdr(args []*Value) (*Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("set-cdr!: need pair and value")
@@ -8088,7 +8106,11 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 		vp = vp.cdr
 		if !isNil(vp) && vp.typ == VSym {
 			// Dotted pair: (a b . rest)
-			env.Set(vp.str, vv.cdr)
+			if isNil(vv) {
+				env.Set(vp.str, vnil())
+			} else {
+				env.Set(vp.str, vv.cdr)
+			}
 			return nil
 		}
 		if !isNil(vv) {
@@ -17190,6 +17212,26 @@ func builtinGraphicCharP(args []*Value) (*Value, error) {
 	// Graphic chars are printable characters (including space, excluding control chars)
 	// Per CL spec: characters that print something, includes space (code 32)
 	return vbool(unicode.IsPrint(ch)), nil
+}
+
+// -------- standard-char-p --------
+// Standard chars are: space, newline, tab, page, return, backspace,
+// and all 95 printable ASCII characters (codes 32-126)
+func builtinStandardCharP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("standard-char-p: need a character")
+	}
+	var ch rune
+	if args[0].typ == VChar {
+		ch = args[0].ch
+	} else if args[0].typ == VStr && len(args[0].str) > 0 {
+		ch = []rune(args[0].str)[0]
+	} else {
+		return vbool(false), nil
+	}
+	// Standard chars are space (32), newline (10), tab (9), page (12), return (13),
+	// backspace (8), and all 95 printable ASCII chars (32-126)
+	return vbool((ch >= 32 && ch <= 126) || ch == 10 || ch == 9 || ch == 12 || ch == 13 || ch == 8), nil
 }
 
 // -------- upper-case-p / lower-case-p / both-case-p --------
