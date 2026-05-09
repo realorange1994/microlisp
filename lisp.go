@@ -3986,11 +3986,53 @@ evalLoop:
 					globalEnv.Set(name, ev)
 					return ev, nil
 				}
-				// (setf (accessor args...) newval)
+				// (setf (accessor args...) newval) or (setf (values ...) newval)
 				if target.typ != VPair {
 					return nil, fmt.Errorf("setf: target must be a list or symbol")
 				}
 				if target.car == nil { return nil, fmt.Errorf("setf: empty accessor") }
+				// Handle (setf (values place1 place2 ...) newval)
+				if target.car.typ == VSym && target.car.str == "values" {
+					// Evaluate the newval expression to get all values
+					vals, err := eval(newValExpr, env)
+					if err != nil {
+						return nil, err
+					}
+					// Convert to list of values
+					valList := multiValList(vals)
+					// Collect all places from (values place1 place2 ...)
+					places := target.cdr
+					var result *Value
+					placeIdx := 0
+					for ; !isNil(places); places = places.cdr {
+						val := vnil()
+							// Walk valList to find the Nth element
+							cur := valList
+							for i := 0; cur != nil && cur.typ == VPair && i < placeIdx; i++ {
+								cur = cur.cdr
+							}
+							if cur != nil && cur.typ == VPair && cur.car != nil {
+								val = cur.car
+						}
+						// Build (setf place val) AST and evaluate recursively
+						setfCall := &Value{typ: VPair,
+							car: &Value{typ: VSym, str: "setf"},
+							cdr: &Value{typ: VPair, car: places.car,
+								cdr: &Value{typ: VPair, car: val, cdr: vnil()}}}
+						r, err := eval(setfCall, env)
+						if err != nil {
+							return nil, err
+						}
+						if placeIdx == 0 {
+							result = r
+						}
+						placeIdx++
+					}
+					if result == nil {
+						result = vnil()
+					}
+					return result, nil
+				}
 				accessorName := target.car.str
 				args := target.cdr
 				// Look up <accessor>-setf function
@@ -7577,8 +7619,12 @@ func builtinCharName(args []*Value) (*Value, error) {
 			return vstr(strings.ToUpper(name[:1]) + name[1:]), nil
 		}
 	}
-	// For control characters
+	// For control characters (C0: 0-31)
 	if ch < 32 && ch >= 0 {
+		return vstr("control"), nil
+	}
+	// C1 control characters (128-159)
+	if ch >= 128 && ch < 160 {
 		return vstr("control"), nil
 	}
 	if ch == 127 {
