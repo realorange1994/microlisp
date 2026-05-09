@@ -84,3 +84,5 @@
 44. `unquote`/`unquote-splicing` 在 depth>0 时未递归处理
 45. `loop` 的 `for x = expr` 子句在 expr 中引用其他循环变量时报 undefined
 46. `load` 不支持 `:if-does-not-exist nil` 关键字参数
+47. `stringp`/`numberp` 谓词函数未实现
+48. `loop` 不支持 `being each present-symbol/external-symbol of package` 子句
