@@ -5584,6 +5584,7 @@ var builtins = []builtinDef{
 	{"intern", builtinIntern},
 	{"export", builtinExport},
 	{"find-symbol", builtinFindSymbol},
+	{"find-all-symbols", builtinFindAllSymbols},
 	{"keywordp", builtinKeywordP},
 	{"symbolp", builtinSymP},
 	{"stringp", builtinStringP},
@@ -10706,6 +10707,23 @@ func builtinFindSymbol(args []*Value) (*Value, error) {
 		}
 	}
 	return multiVal(vnil(), vnil()), nil
+}
+
+func builtinFindAllSymbols(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("find-all-symbols: need string name")
+	}
+	name := primaryValue(args[0]).str
+	var result *Value
+	for _, pkg := range packages {
+		if sym, ok := pkg.symbols[name]; ok {
+			result = cons(sym, result)
+		}
+	}
+	if result == nil {
+		return vnil(), nil
+	}
+	return result, nil
 }
 
 func builtinKeywordP(args []*Value) (*Value, error) {
@@ -18065,10 +18083,10 @@ func builtinCoerce(args []*Value) (*Value, error) {
 	resultType := args[1]
 	typeStr := ""
 	if resultType.typ == VSym {
-		typeStr = resultType.str
+		typeStr = strings.ToLower(resultType.str)
 	} else if isPair(resultType) && resultType.car != nil && resultType.car.typ == VSym {
 		// Compound type specifier like (complex float)
-		typeStr = resultType.car.str
+		typeStr = strings.ToLower(resultType.car.str)
 	}
 
 	switch typeStr {
