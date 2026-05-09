@@ -117,3 +117,6 @@
 76. `nstring-upcase/downcase/capitalize` 不支持 VArray 和 fill-pointer
 77. `(setf fill-pointer)` 未实现
 78. `butlast` 对 dotted list 处理错误
+79. `floor`/`ceiling`/`truncate`/`round` 返回 list 而非 VMultiVal（多值应使用 multiVal 而非 list）— 已修复
+80. `=`/`/=` 等数值比较对复数只比较实部（`compareNumeric` 忽略虚部）— 已修复
+81. `coerce` 不支持 `standard-char`/`base-char` 作为结果类型 — 已修复

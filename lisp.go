@@ -6769,20 +6769,19 @@ func toBigInt(v *Value) *big.Int {
 // compareNumeric returns -1 if a < b, 0 if a == b, 1 if a > b.
 // Uses big.Int when any operand is VBigInt for exact comparison.
 func compareNumeric(a, b *Value) int {
-	if a.typ == VBigInt || b.typ == VBigInt {
-		ai := toBigInt(a)
-		bi := toBigInt(b)
-		if ai != nil && bi != nil {
-			return ai.Cmp(bi)
-		}
-		// If one can't be converted to int, fall through to float
-	}
-	af := toNum(a)
-	bf := toNum(b)
-	if af < bf {
+	// Handle complex numbers specially - need to compare both parts
+	aReal, aImag := toComplexParts(a)
+	bReal, bImag := toComplexParts(b)
+	if aReal < bReal {
 		return -1
 	}
-	if af > bf {
+	if aReal > bReal {
+		return 1
+	}
+	if aImag < bImag {
+		return -1
+	}
+	if aImag > bImag {
 		return 1
 	}
 	return 0
@@ -17026,9 +17025,9 @@ func builtinFloor(args []*Value) (*Value, error) {
 		if r != 0 && (r > 0) != (div > 0) {
 			r += div
 		}
-		return list(vnum(q), vnum(r)), nil
+		return multiVal(vnum(q), vnum(r)), nil
 	}
-	return list(vnum(f), vnum(n-f)), nil
+	return multiVal(vnum(f), vnum(n-f)), nil
 }
 
 func builtinCeiling(args []*Value) (*Value, error) {
@@ -17044,9 +17043,9 @@ func builtinCeiling(args []*Value) (*Value, error) {
 		}
 		q := math.Ceil(n / div)
 		r := n - q*div
-		return list(vnum(q), vnum(r)), nil
+		return multiVal(vnum(q), vnum(r)), nil
 	}
-	return list(vnum(c), vnum(n-c)), nil
+	return multiVal(vnum(c), vnum(n-c)), nil
 }
 
 func builtinTruncate(args []*Value) (*Value, error) {
@@ -17062,9 +17061,9 @@ func builtinTruncate(args []*Value) (*Value, error) {
 		}
 		q := math.Trunc(n / div)
 		r := n - q*div
-		return list(vnum(q), vnum(r)), nil
+		return multiVal(vnum(q), vnum(r)), nil
 	}
-	return list(vnum(t), vnum(n-t)), nil
+	return multiVal(vnum(t), vnum(n-t)), nil
 }
 
 func builtinRound(args []*Value) (*Value, error) {
@@ -17090,9 +17089,9 @@ func builtinRound(args []*Value) (*Value, error) {
 		}
 		q := math.Round(n / div)
 		rem := n - q*div
-		return list(vnum(q), vnum(rem)), nil
+		return multiVal(vnum(q), vnum(rem)), nil
 	}
-	return list(vnum(r), vnum(n-r)), nil
+	return multiVal(vnum(r), vnum(n-r)), nil
 }
 
 // -------- signum --------
@@ -17537,6 +17536,11 @@ func builtinGraphicCharP(args []*Value) (*Value, error) {
 // -------- standard-char-p --------
 // Standard chars are: space, newline, tab, page, return, backspace,
 // and all 95 printable ASCII characters (codes 32-126)
+// isStandardChar checks if a character is a standard-char
+func isStandardChar(ch rune) bool {
+	return (ch >= 32 && ch <= 126) || ch == 10 || ch == 9 || ch == 12 || ch == 13 || ch == 8
+}
+
 func builtinStandardCharP(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("standard-char-p: need a character")
@@ -17551,7 +17555,7 @@ func builtinStandardCharP(args []*Value) (*Value, error) {
 	}
 	// Standard chars are space (32), newline (10), tab (9), page (12), return (13),
 	// backspace (8), and all 95 printable ASCII chars (32-126)
-	return vbool((ch >= 32 && ch <= 126) || ch == 10 || ch == 9 || ch == 12 || ch == 13 || ch == 8), nil
+	return vbool(isStandardChar(ch)), nil
 }
 
 // -------- upper-case-p / lower-case-p / both-case-p --------
@@ -18550,6 +18554,27 @@ func builtinCoerce(args []*Value) (*Value, error) {
 			return vchar(rune(int(toNum(obj)))), nil
 		}
 		return nil, fmt.Errorf("coerce: cannot coerce to character")
+	case "standard-char", "base-char", ":standard-char", ":base-char":
+		// Coerce to character, then verify it's a standard-char/base-char
+		var ch rune
+		switch obj.typ {
+		case VChar:
+			ch = obj.ch
+		case VStr:
+			if len(obj.str) == 0 {
+				return nil, fmt.Errorf("coerce: string is empty")
+			}
+			ch = []rune(obj.str)[0]
+		case VNum:
+			ch = rune(int(toNum(obj)))
+		default:
+			return nil, fmt.Errorf("coerce: cannot coerce to %s", typeStr)
+		}
+		// Check if it's a standard-char
+		if !isStandardChar(ch) {
+			return nil, fmt.Errorf("coerce: %c is not of type %s", ch, strings.ToUpper(typeStr))
+		}
+		return vchar(ch), nil
 	case "function", ":function":
 		if obj.typ == VFunc || obj.typ == VPrim {
 			return obj, nil
