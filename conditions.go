@@ -728,6 +728,13 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 					return false
 				}
 				return true
+			case "vector":
+				// (vector) - check if 1D array
+				// (vector element-type) - check if 1D array
+				if val.typ != VArray {
+					return false
+				}
+				return len(val.array.dims) == 1
 			case "cons":
 				// (cons) - check if it's a pair
 				// (cons car-type) - check car matches car-type

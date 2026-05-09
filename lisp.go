@@ -17901,6 +17901,36 @@ func builtinCoerce(args []*Value) (*Value, error) {
 		return vnum(math.Floor(n)), nil
 	case "sequence", ":sequence":
 		return obj, nil
+	case "vector", ":vector":
+		if obj.typ == VArray && len(obj.array.dims) == 1 {
+			return obj, nil
+		}
+		var elems []*Value
+		if obj.typ == VStr {
+			elems = stringToCharList(obj.str)
+		} else {
+			elems = seqToList(obj)
+		}
+		arr := &LispArray{dims: []int{len(elems)}, elements: elems, fillPtr: -1, adjustable: false}
+		v := gcv()
+		v.typ = VArray
+		v.array = arr
+		return v, nil
+	case "array", ":array":
+		if obj.typ == VArray {
+			return obj, nil
+		}
+		var elems []*Value
+		if obj.typ == VStr {
+			elems = stringToCharList(obj.str)
+		} else {
+			elems = seqToList(obj)
+		}
+		arr := &LispArray{dims: []int{len(elems)}, elements: elems, fillPtr: -1, adjustable: false}
+		v := gcv()
+		v.typ = VArray
+		v.array = arr
+		return v, nil
 	default:
 		return nil, fmt.Errorf("coerce: unsupported result-type %s", typeStr)
 	}
