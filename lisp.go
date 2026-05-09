@@ -15624,23 +15624,41 @@ func builtinRandom(args []*Value) (*Value, error) {
 	}
 	v := primaryValue(args[0])
 	if v.typ != VNum && v.typ != VBigInt && v.typ != VRat {
-		return nil, fmt.Errorf("random: argument must be a positive integer")
+		return nil, fmt.Errorf("random: argument must be a positive number")
 	}
 	limit := toNum(v)
-	if limit < 1 {
-		return nil, fmt.Errorf("random: limit must be >= 1")
+	if limit <= 0 {
+		return nil, fmt.Errorf("random: limit must be > 0")
 	}
-	rng := rand.Intn
-	// Check for :random-state keyword arg
+	// Determine which rng to use
+	var randState *rand.Rand
 	for i := 1; i+1 < len(args); i++ {
 		if args[i].typ == VSym && args[i].str == ":random-state" && args[i+1].typ == VRandomState {
 			if args[i+1].randState != nil {
-				rng = args[i+1].randState.Intn
+				randState = args[i+1].randState
 			}
 			break
 		}
 	}
-	return vnum(float64(rng(int(limit)))), nil
+	// Float argument: return random float in [0, limit)
+	if v.typ == VNum && (math.Abs(limit-math.Trunc(limit)) > 1e-12 || limit == 0) {
+		if limit == 0 {
+			return nil, fmt.Errorf("random: limit must be > 0")
+		}
+		if randState != nil {
+			return vnum(randState.Float64() * limit), nil
+		}
+		return vnum(rand.Float64() * limit), nil
+	}
+	// Integer argument: return random integer in [0, limit)
+	intLimit := int(limit)
+	if intLimit < 1 {
+		return nil, fmt.Errorf("random: limit must be >= 1")
+	}
+	if randState != nil {
+		return vnum(float64(randState.Intn(intLimit))), nil
+	}
+	return vnum(float64(rand.Intn(intLimit))), nil
 }
 
 func builtinNStringUpcase(args []*Value) (*Value, error) {
