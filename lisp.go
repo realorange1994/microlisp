@@ -437,6 +437,8 @@ func initGlobalEnv() {
 	syncCLPackage()
 	// Set *readtable* variable (readtable is already initialized above)
 	globalEnv.Set("*readtable*", vrt(standardReadtable))
+	// CL constant: exclusive upper bound on character codes (Unicode has 1114112 code points)
+	globalEnv.Set("char-code-limit", vnum(1114112))
 }
 
 // -------- GC --------
