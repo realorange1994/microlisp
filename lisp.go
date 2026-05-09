@@ -10244,6 +10244,19 @@ func builtinMacroexpand(args []*Value) (*Value, error) {
 	form := args[0]
 	depth := 0
 	const maxMacroExpandDepth = 1000
+
+	// Handle quasiquote specially since it's not a VMacro
+	if form.typ == VPair && form.car != nil && form.car.typ == VSym && form.car.str == "quasiquote" {
+		if len(args) >= 1 && args[0].cdr != nil && args[0].cdr.typ == VPair && args[0].cdr.car != nil {
+			expanded, e := evalQuasiquote(args[0].cdr.car, 0, globalEnv)
+			if e != nil {
+				return nil, fmt.Errorf("macroexpand: %s", e)
+			}
+			return expanded, nil
+		}
+		return form, nil
+	}
+
 	for form.typ == VPair && form.car != nil && form.car.typ == VSym {
 		fn, err := globalEnv.Get(form.car.str)
 		if err != nil || fn.typ != VMacro {
