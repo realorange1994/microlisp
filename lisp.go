@@ -3564,7 +3564,7 @@ evalLoop:
 					}
 					hcSeen[scanClauses] = true
 					clause := scanClauses.car
-					if clause.typ == VPair && clause.car != nil && clause.car.typ == VSym && clause.car.str == ":no-error" {
+					if clause.typ == VPair && clause.car != nil && clause.car.typ == VSym && clause.car.str == ":NO-ERROR" {
 						noErrorClause = clause
 						// Parse variable list
 						varsForm := clause.cdr.car
@@ -3598,7 +3598,7 @@ evalLoop:
 						return nil, fmt.Errorf("handler-case: clause must start with a type symbol")
 					}
 					typeSym := clause.car.str
-					if typeSym == ":no-error" {
+					if typeSym == ":NO-ERROR" {
 						clauses = clauses.cdr
 						continue // skip :no-error in handler setup
 					}
@@ -4068,8 +4068,8 @@ evalLoop:
 					s := situations.car
 					if s.typ == VSym {
 						switch s.str {
-						case ":execute", "EXECUTE", ":eval", "EVAL",
-							":load-toplevel", "LOAD-TOPLEVEL", ":load", "LOAD":
+						case ":EXECUTE", "EXECUTE", ":EVAL", "EVAL",
+							":LOAD-TOPLEVEL", "LOAD-TOPLEVEL", ":LOAD", "LOAD":
 							execute = true
 						}
 					}
@@ -4368,15 +4368,15 @@ evalLoop:
 					options := slotDef.car.cdr // skip slot name
 					for !isNil(options) {
 						opt := options.car
-						if opt != nil && opt.typ == VSym && opt.str == ":accessor" {
+						if opt != nil && opt.typ == VSym && opt.str == ":ACCESSOR" {
 							if options.cdr != nil && options.cdr.typ == VPair {
 								accessorName = options.cdr.car.str
 							}
-						} else if opt != nil && opt.typ == VSym && opt.str == ":reader" {
+						} else if opt != nil && opt.typ == VSym && opt.str == ":READER" {
 							if options.cdr != nil && options.cdr.typ == VPair {
 								readerName = options.cdr.car.str
 							}
-						} else if opt != nil && opt.typ == VSym && opt.str == ":writer" {
+						} else if opt != nil && opt.typ == VSym && opt.str == ":WRITER" {
 							if options.cdr != nil && options.cdr.typ == VPair {
 								writerName = options.cdr.car.str
 							}
@@ -4554,7 +4554,7 @@ evalLoop:
 				for !isNil(rest) {
 					if rest.typ == VPair && rest.car.typ == VSym {
 						sname := rest.car.str
-						if sname == ":if-does-not-exist" || sname == ":IF-DOES-NOT-EXIST" {
+						if sname == ":IF-DOES-NOT-EXIST" || sname == ":IF-DOES-NOT-EXIST" {
 							if rest.cdr.typ == VPair {
 								// Evaluate the keyword argument value
 								val := rest.cdr.car
@@ -4571,7 +4571,7 @@ evalLoop:
 								rest = rest.cdr.cdr
 								continue
 							}
-						} else if sname == ":if-exists" {
+						} else if sname == ":IF-EXISTS" {
 							if rest.cdr.typ == VPair {
 								rest = rest.cdr.cdr
 								continue
@@ -4854,11 +4854,11 @@ func apply(fn *Value, args *Value, env *Env) (result *Value, err error) {
 		var primary, before, after, around []genMethod
 		for _, m := range applicable {
 			switch m.qualifier {
-			case ":before":
+			case ":BEFORE":
 				before = append(before, m)
-			case ":after":
+			case ":AFTER":
 				after = append(after, m)
-			case ":around":
+			case ":AROUND":
 				around = append(around, m)
 			default:
 				primary = append(primary, m)
@@ -6095,7 +6095,7 @@ func pathnameToString(p *LispPathname) string {
 	if p.directory != nil && !isNil(p.directory) {
 		dir := p.directory
 		if !isNil(dir) && dir.car != nil && dir.car.typ == VSym {
-			if dir.car.str == ":absolute" {
+			if dir.car.str == ":ABSOLUTE" {
 				b.WriteString("/")
 			}
 			dir = dir.cdr
@@ -6302,7 +6302,7 @@ func builtinDirectoryNamestring(args []*Value) (*Value, error) {
 	if p.directory != nil && !isNil(p.directory) {
 		dir := p.directory
 		if !isNil(dir) && dir.car != nil && dir.car.typ == VSym {
-			if dir.car.str == ":absolute" {
+			if dir.car.str == ":ABSOLUTE" {
 				b.WriteString("/")
 			}
 			dir = dir.cdr
@@ -6524,7 +6524,7 @@ func builtinWildPathnameP(args []*Value) (*Value, error) {
 	}
 	if p.directory != nil && !isNil(p.directory) {
 		for d := p.directory; !isNil(d) && d.typ == VPair; d = d.cdr {
-			if d.car != nil && d.car.typ == VSym && d.car.str == ":wild" {
+			if d.car != nil && d.car.typ == VSym && d.car.str == ":WILD" {
 				return vbool(true), nil
 			}
 			if d.car != nil && d.car.typ == VStr && d.car.str == "*" {
@@ -8317,7 +8317,7 @@ func builtinStrUpcase(args []*Value) (*Value, error) {
 	for i := 1; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
-			case ":start":
+			case ":START":
 				if i+1 < len(args) {
 					i++
 					n, err := safeToNum(args[i], "string-upcase :start")
@@ -8326,7 +8326,7 @@ func builtinStrUpcase(args []*Value) (*Value, error) {
 					}
 					start = int(n)
 				}
-			case ":end":
+			case ":END":
 				if i+1 < len(args) {
 					i++
 					n, err := safeToNum(args[i], "string-upcase :end")
@@ -8357,7 +8357,7 @@ func builtinStrDowncase(args []*Value) (*Value, error) {
 	for i := 1; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
-			case ":start":
+			case ":START":
 				if i+1 < len(args) {
 					i++
 					n, err := safeToNum(args[i], "string-downcase :start")
@@ -8366,7 +8366,7 @@ func builtinStrDowncase(args []*Value) (*Value, error) {
 					}
 					start = int(n)
 				}
-			case ":end":
+			case ":END":
 				if i+1 < len(args) {
 					i++
 					n, err := safeToNum(args[i], "string-downcase :end")
@@ -8923,13 +8923,13 @@ func builtinReplace(args []*Value) (*Value, error) {
 		key := primaryValue(args[i])
 		if key.typ == VSym {
 			switch key.str {
-			case ":start1":
+			case ":START1":
 				start1 = int(primaryValue(args[i+1]).num)
-			case ":end1":
+			case ":END1":
 				end1 = int(primaryValue(args[i+1]).num)
-			case ":start2":
+			case ":START2":
 				start2 = int(primaryValue(args[i+1]).num)
-			case ":end2":
+			case ":END2":
 				end2 = int(primaryValue(args[i+1]).num)
 			}
 		}
@@ -9051,13 +9051,13 @@ func builtinParseInteger(args []*Value) (*Value, error) {
 		key := primaryValue(args[i])
 		if key.typ == VSym {
 			switch key.str {
-			case ":start":
+			case ":START":
 				start = int(primaryValue(args[i+1]).num)
-			case ":end":
+			case ":END":
 				end = int(primaryValue(args[i+1]).num)
-			case ":radix":
+			case ":RADIX":
 				radix = int(primaryValue(args[i+1]).num)
-			case ":junk-allowed":
+			case ":JUNK-ALLOWED":
 				junkAllowed = !isNil(args[i+1])
 			}
 		}
@@ -9176,9 +9176,9 @@ func builtinReadSequence(args []*Value) (*Value, error) {
 		key := primaryValue(args[i])
 		if key.typ == VSym {
 			switch key.str {
-			case ":start":
+			case ":START":
 				start = int(primaryValue(args[i+1]).num)
-			case ":end":
+			case ":END":
 				end = int(primaryValue(args[i+1]).num)
 			}
 		}
@@ -9269,9 +9269,9 @@ func builtinWriteSequence(args []*Value) (*Value, error) {
 		key := primaryValue(args[i])
 		if key.typ == VSym {
 			switch key.str {
-			case ":start":
+			case ":START":
 				start = int(primaryValue(args[i+1]).num)
-			case ":end":
+			case ":END":
 				end = int(primaryValue(args[i+1]).num)
 			}
 		}
@@ -9934,17 +9934,17 @@ func builtinMakeArray(args []*Value) (*Value, error) {
 	for i := 1; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
-			case ":initial-element":
+			case ":INITIAL-ELEMENT":
 				if i+1 < len(args) {
 					i++
 					initialElement = args[i]
 				}
-			case ":initial-contents":
+			case ":INITIAL-CONTENTS":
 				if i+1 < len(args) {
 					i++
 					initialContents = args[i]
 				}
-			case ":fill-pointer":
+			case ":FILL-POINTER":
 				if i+1 < len(args) {
 					i++
 					if args[i] == globalEnv.bindings["#t"] {
@@ -9953,7 +9953,7 @@ func builtinMakeArray(args []*Value) (*Value, error) {
 						fillPointer = int(args[i].num)
 					}
 				}
-			case ":adjustable":
+			case ":ADJUSTABLE":
 				if i+1 < len(args) {
 					i++
 					adjustable = isTruthy(args[i])
@@ -10265,7 +10265,7 @@ func builtinAdjustArray(args []*Value) (*Value, error) {
 	}
 	initialElement := vnil()
 	for i := 2; i < len(args); i++ {
-		if args[i].typ == VSym && args[i].str == ":initial-element" && i+1 < len(args) {
+		if args[i].typ == VSym && args[i].str == ":INITIAL-ELEMENT" && i+1 < len(args) {
 			i++
 			initialElement = args[i]
 		}
@@ -11445,7 +11445,7 @@ func builtinMakeInstance(args []*Value) (*Value, error) {
 				for !isNil(opts) && !isNil(opts.cdr) {
 					if opts.car != nil && opts.car.typ == VSym {
 						switch opts.car.str {
-						case ":initform":
+						case ":INITFORM":
 								if _, exists := slotInitforms[slotName]; !exists {
 									if opts.cdr == nil || opts.cdr.typ != VPair {
 										opts = opts.cdr.cdr
@@ -11460,7 +11460,7 @@ func builtinMakeInstance(args []*Value) (*Value, error) {
 									opts = opts.cdr.cdr
 									continue
 								}
-						case ":initarg":
+						case ":INITARG":
 							if opts.cdr != nil && opts.cdr.typ == VPair && opts.cdr.car != nil && opts.cdr.car.typ == VSym {
 								if _, exists := slotInitargs[opts.cdr.car.str]; !exists {
 									slotInitargs[opts.cdr.car.str] = slotName
@@ -12098,7 +12098,7 @@ func builtinMakeHashTable(args []*Value) (*Value, error) {
 	for i := 0; i < len(args); i++ {
 		if args[i].typ == VSym && strings.HasPrefix(args[i].str, ":") {
 			switch args[i].str {
-			case ":test":
+			case ":TEST":
 				if i+1 < len(args) {
 					i++
 					tv := args[i]
@@ -12107,12 +12107,12 @@ func builtinMakeHashTable(args []*Value) (*Value, error) {
 					}
 					ht.testFn = args[i]
 				}
-			case ":hash-function":
+			case ":HASH-FUNCTION":
 				if i+1 < len(args) {
 					i++
 					ht.hashFn = args[i]
 				}
-			case ":rehash-size":
+			case ":REHASH-SIZE":
 				if i+1 < len(args) {
 					i++
 					rsz := toNum(primaryValue(args[i]))
@@ -12332,7 +12332,7 @@ func builtinPushnew(args []*Value) (*Value, error) {
 	place := args[1]
 	testFn := vnil()
 	for i := 2; i < len(args); i++ {
-		if args[i].typ == VSym && args[i].str == ":test" && i+1 < len(args) {
+		if args[i].typ == VSym && args[i].str == ":TEST" && i+1 < len(args) {
 			testFn = args[i+1]
 			i++
 		}
@@ -12373,7 +12373,7 @@ func builtinVectorPushExtend(args []*Value) (*Value, error) {
 	vec := args[1]
 	extension := -1
 	for i := 2; i < len(args); i++ {
-		if args[i].typ == VSym && args[i].str == ":extension" && i+1 < len(args) {
+		if args[i].typ == VSym && args[i].str == ":EXTENSION" && i+1 < len(args) {
 			n, err := safeToNum(args[i+1], "vector-push-extend")
 			if err != nil {
 				return nil, err
@@ -12604,19 +12604,19 @@ func seqParseKeys(args []*Value, startIdx int) (keyFn, testFn *Value, fromEnd bo
 	for i := startIdx; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
-			case ":key":
+			case ":KEY":
 				if i+1 < len(args) {
 					i++
 					keyFn = args[i]
 				}
-			case ":test":
+			case ":TEST":
 				if i+1 < len(args) {
 					i++
 					testFn = args[i]
 				}
-			case ":from-end":
+			case ":FROM-END":
 				fromEnd = true
-			case ":count":
+			case ":COUNT":
 				if i+1 < len(args) {
 					i++
 					n, e := safeToNum(args[i], "keyword :count")
@@ -12626,7 +12626,7 @@ func seqParseKeys(args []*Value, startIdx int) (keyFn, testFn *Value, fromEnd bo
 					}
 					count = int(n)
 				}
-			case ":start":
+			case ":START":
 				if i+1 < len(args) {
 					i++
 					n, e := safeToNum(args[i], "keyword :start")
@@ -12636,7 +12636,7 @@ func seqParseKeys(args []*Value, startIdx int) (keyFn, testFn *Value, fromEnd bo
 					}
 					start = int(n)
 				}
-			case ":end":
+			case ":END":
 				if i+1 < len(args) {
 					i++
 					n, e := safeToNum(args[i], "keyword :end")
@@ -12646,7 +12646,7 @@ func seqParseKeys(args []*Value, startIdx int) (keyFn, testFn *Value, fromEnd bo
 					}
 					end = int(n)
 				}
-			case ":initial-value":
+			case ":INITIAL-VALUE":
 				if i+1 < len(args) {
 					i++
 					initialVal = args[i]
@@ -12663,7 +12663,7 @@ func extractKeyFromRest(seqs []*Value) (*Value, []*Value) {
 	keyFn := (*Value)(nil)
 	// Scan from the end looking for :key keyword
 	for i := len(seqs) - 1; i >= 0; i-- {
-		if seqs[i].typ == VSym && seqs[i].str == ":key" && i+1 < len(seqs) {
+		if seqs[i].typ == VSym && seqs[i].str == ":KEY" && i+1 < len(seqs) {
 			keyFn = seqs[i+1]
 			// Build new slice without :key and its value
 			result := make([]*Value, 0, len(seqs)-2)
@@ -13963,7 +13963,7 @@ func builtinStableSort(args []*Value) (*Value, error) {
 	pred := args[1]
 	keyFn := vnil()
 	for i := 2; i < len(args); i++ {
-		if args[i].typ == VSym && args[i].str == ":key" && i+1 < len(args) {
+		if args[i].typ == VSym && args[i].str == ":KEY" && i+1 < len(args) {
 			i++
 			keyFn = args[i]
 		}
@@ -14472,7 +14472,7 @@ func builtinPosition(args []*Value) (*Value, error) {
 	for i := 2; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
-			case ":start":
+			case ":START":
 				if i+1 < len(args) {
 					i++
 					n, e := safeToNum(args[i], "position")
@@ -14481,7 +14481,7 @@ func builtinPosition(args []*Value) (*Value, error) {
 					}
 					start = int(n)
 				}
-			case ":end":
+			case ":END":
 				if i+1 < len(args) {
 					i++
 					n, e := safeToNum(args[i], "position")
@@ -15382,12 +15382,12 @@ func builtinSeqFill(args []*Value) (*Value, error) {
 	for i := 2; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
-			case ":start":
+			case ":START":
 				if i+1 < len(args) {
 					i++
 					start = int(toNum(args[i]))
 				}
-			case ":end":
+			case ":END":
 				if i+1 < len(args) {
 					i++
 					end = int(toNum(args[i]))
@@ -15440,22 +15440,22 @@ func builtinSeqReplace(args []*Value) (*Value, error) {
 	for i := 2; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
-			case ":start1":
+			case ":START1":
 				if i+1 < len(args) {
 					i++
 					start1 = int(toNum(args[i]))
 				}
-			case ":end1":
+			case ":END1":
 				if i+1 < len(args) {
 					i++
 					end1 = int(toNum(args[i]))
 				}
-			case ":start2":
+			case ":START2":
 				if i+1 < len(args) {
 					i++
 					start2 = int(toNum(args[i]))
 				}
-			case ":end2":
+			case ":END2":
 				if i+1 < len(args) {
 					i++
 					end2 = int(toNum(args[i]))
@@ -15485,27 +15485,27 @@ func builtinSeqSearch(args []*Value) (*Value, error) {
 	for i := 2; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
-			case ":test":
+			case ":TEST":
 				if i+1 < len(args) {
 					i++
 					pred = args[i]
 				}
-			case ":start1":
+			case ":START1":
 				if i+1 < len(args) {
 					i++
 					start1 = int(toNum(args[i]))
 				}
-			case ":end1":
+			case ":END1":
 				if i+1 < len(args) {
 					i++
 					end1 = int(toNum(args[i]))
 				}
-			case ":start2":
+			case ":START2":
 				if i+1 < len(args) {
 					i++
 					start2 = int(toNum(args[i]))
 				}
-			case ":end2":
+			case ":END2":
 				if i+1 < len(args) {
 					i++
 					end2 = int(toNum(args[i]))
@@ -15944,7 +15944,7 @@ func builtinMakeString(args []*Value) (*Value, error) {
 	size := int(toNum(args[0]))
 	initChar := ' '
 	for i := 1; i < len(args); i++ {
-		if args[i].typ == VSym && args[i].str == ":initial-element" {
+		if args[i].typ == VSym && args[i].str == ":INITIAL-ELEMENT" {
 			if i+1 < len(args) {
 				i++
 				c := args[i]
@@ -15974,7 +15974,7 @@ func builtinMakeList(args []*Value) (*Value, error) {
 	size := int(toNum(args[0]))
 	initVal := vnil()
 	for i := 1; i < len(args); i++ {
-		if args[i].typ == VSym && args[i].str == ":initial-element" {
+		if args[i].typ == VSym && args[i].str == ":INITIAL-ELEMENT" {
 			if i+1 < len(args) {
 				i++
 				initVal = args[i]
@@ -16004,7 +16004,7 @@ func builtinRandom(args []*Value) (*Value, error) {
 	// Determine which rng to use
 	var randState *rand.Rand
 	for i := 1; i+1 < len(args); i++ {
-		if args[i].typ == VSym && args[i].str == ":random-state" && args[i+1].typ == VRandomState {
+		if args[i].typ == VSym && args[i].str == ":RANDOM-STATE" && args[i+1].typ == VRandomState {
 			if args[i+1].randState != nil {
 				randState = args[i+1].randState
 			}
@@ -16324,7 +16324,7 @@ func builtinRassoc(args []*Value) (*Value, error) {
 	alist := args[1]
 	pred := vnil()
 	for i := 2; i < len(args); i++ {
-		if args[i].typ == VSym && args[i].str == ":test" && i+1 < len(args) {
+		if args[i].typ == VSym && args[i].str == ":TEST" && i+1 < len(args) {
 			i++
 			pred = args[i]
 		}
@@ -17925,22 +17925,22 @@ func builtinMismatch(args []*Value) (*Value, error) {
 	for i := 2; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
-			case ":start1":
+			case ":START1":
 				if i+1 < len(args) {
 					i++
 					start1 = int(toNum(args[i]))
 				}
-			case ":end1":
+			case ":END1":
 				if i+1 < len(args) {
 					i++
 					end1 = int(toNum(args[i]))
 				}
-			case ":start2":
+			case ":START2":
 				if i+1 < len(args) {
 					i++
 					start2 = int(toNum(args[i]))
 				}
-			case ":end2":
+			case ":END2":
 				if i+1 < len(args) {
 					i++
 					end2 = int(toNum(args[i]))
@@ -20079,7 +20079,7 @@ var initLib = `
 ;; SBCL test harness stubs
 (define (enable-test-parallelism) nil)
 (define-macro (checked-compile form . rest)
-  (list 'eval (list 'quote form)))
+  (list 'eval form))
 (define (checked-eval form) (eval form))
 (define (ctu:asm-search pattern source) nil)
 
