@@ -7,11 +7,11 @@
 - [ ] `read-delimited-list` 未实现
 
 ### Destructuring
-- [ ] `destructuring-bind` 不支持 `&key` 参数
+- [x] `destructuring-bind` 不支持 `&key` 参数 — 已修复
 
 ### Setf 扩展
 - [x] `(defun (setf foo) ...)` 不支持复合函数名 — 已修复
-- [ ] `(setf (values ...))` 不支持
+- [x] `(setf (values ...))` 不支持 — 已修复
 - [ ] `(setf (macro-function ...))` 不支持
 - [ ] `defsetf` 不支持 `&environment` 参数
 
@@ -103,3 +103,4 @@
 63. `char-name` 对 C1 控制字符（128-159）返回 nil
 64. `type-of` 返回 `"unknown"` 对于 `pathname`、`random-state`、`array`、`integer`（大整数）类型
 65. `typep`/`subtypep` 类型比较大小写不敏感问题（符号名大写后比较失败）
+66. `destructuring-bind` 的 Go 实现中 lambda-list 关键字大小写不匹配（`&rest` vs `&REST`）
