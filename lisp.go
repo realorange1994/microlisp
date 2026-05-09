@@ -2395,6 +2395,11 @@ evalLoop:
 						return ev, nil
 					}
 				}
+				// Also check globalEnv for already-defined global variables
+				if _, err := globalEnv.Get(name); err == nil {
+					globalEnv.Set(name, ev)
+					return ev, nil
+				}
 				return nil, fmt.Errorf("set!: undefined %s", name)
 			case "DEFVAR":
 				if v.cdr == nil || v.cdr.typ != VPair {
