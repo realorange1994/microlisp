@@ -105,3 +105,4 @@
 65. `typep`/`subtypep` 类型比较大小写不敏感问题（符号名大写后比较失败）
 66. `destructuring-bind` 的 Go 实现中 lambda-list 关键字大小写不匹配（`&rest` vs `&REST`）
 67. `set!`/`setq` 不更新 globalEnv 中已定义的全局变量
+68. `isNil()` 不识别 VSym "NIL"（导致 length/butlast 等函数对 nil 报错）
