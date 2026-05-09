@@ -208,9 +208,22 @@ func NewEnv(parent *Env) *Env {
 }
 
 func (e *Env) Get(s string) (*Value, error) {
+	sUp := strings.ToUpper(s)
+	sLo := strings.ToLower(s)
 	for scope := e; scope != nil; scope = scope.parent {
 		if v, ok := scope.bindings[s]; ok {
 			return v, nil
+		}
+		// Case-insensitive lookup for CL compatibility (:UPCASE readtable)
+		if s != sUp {
+			if v, ok := scope.bindings[sUp]; ok {
+				return v, nil
+			}
+		}
+		if s != sLo {
+			if v, ok := scope.bindings[sLo]; ok {
+				return v, nil
+			}
 		}
 	}
 	return nil, fmt.Errorf("undefined: %s", s)
@@ -1640,6 +1653,17 @@ func (p *Parser) read() (*Value, error) {
 		return nil, fmt.Errorf("lex error: %s", p.tok.lit)
 	case TEOF:
 		return nil, fmt.Errorf("unexpected EOF")
+	case TRParen:
+		// Closing paren encountered — return nil as a signal to caller.
+		// DO NOT advance; caller (e.g. readList) should check p.tok.typ.
+		// Note: readList() now checks for TRParen before calling readExpr(),
+		// so this is only hit when called from feature conditionals (#+/ #-)
+		// or vector parsing where the closing paren terminates the parent list.
+		return nil, nil
+	case TDot:
+		// Dot encountered outside a list context — this is a syntax error.
+		// readList() checks for TDot before calling readExpr().
+		return nil, fmt.Errorf("unexpected token: .")
 	default:
 		return nil, fmt.Errorf("unexpected token: %s", tokName(p.tok.typ))
 	}
@@ -1685,6 +1709,11 @@ func (p *Parser) readList() (*Value, error) {
 		v, err := p.readExpr()
 		if err != nil {
 			return nil, err
+		}
+		if v == nil {
+			// readExpr returned Go nil — this means it hit TRParen or TDot.
+			// These are terminators, not values. Stop reading.
+			break
 		}
 		pair := cons(v, vnil())
 		if head == nil {
@@ -2446,14 +2475,27 @@ evalLoop:
 				return vsym(name), nil
 			case "defun":
 				// (defun name lambda-list . body)
+				// Also supports: (defun (setf name) lambda-list . body)
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("defun: malformed form")
 				}
 				head := v.cdr.car
-				if head.typ != VSym {
+				var name string
+				if head.typ == VSym {
+					name = head.str
+				} else if head.typ == VPair {
+					// (setf foo) syntax
+					if head.car == nil || head.car.typ != VSym || head.car.str != "setf" {
+						return nil, fmt.Errorf("defun: unsupported compound name: %s", toString(head))
+					}
+					if isNil(head.cdr) || head.cdr.car.typ != VSym || !isNil(head.cdr.cdr) {
+						return nil, fmt.Errorf("defun: unsupported compound name: %s", toString(head))
+					}
+					symName := head.cdr.car.str
+					name = fmt.Sprintf("(setf %s)", symName)
+				} else {
 					return nil, fmt.Errorf("defun: name must be a symbol")
 				}
-				name := head.str
 				if v.cdr.cdr == nil || isNil(v.cdr.cdr) {
 					return nil, fmt.Errorf("defun: missing lambda list")
 				}
@@ -5312,6 +5354,7 @@ var builtins = []builtinDef{
 	{"symbol-plist-setf", builtinSymbolPlistSetf},
 	{"boundp", builtinBoundp},
 	{"fboundp", builtinFboundp},
+	{"functionp", builtinFunctionP},
 	{"makunbound", builtinMakunbound},
 	{"fmakunbound", builtinFmakunbound},
 	{"string->symbol", builtinStrSym},
@@ -7786,6 +7829,8 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 				return fmt.Errorf("destructuring-bind: malformed var pattern")
 			}
 			env.Set(head.str, vnil())
+		} else if vv.typ != VPair {
+			return fmt.Errorf("destructuring-bind: expected a list, got %s", typeStr(vv))
 		} else {
 			if err := bindPatternRec(head, vv.car, env, seen); err != nil {
 				return err
@@ -8246,6 +8291,13 @@ func builtinFboundp(args []*Value) (*Value, error) {
 		return vbool(false), nil
 	}
 	return vbool(val.typ == VPrim || val.typ == VFunc || val.typ == VGeneric || val.typ == VMacro), nil
+}
+
+func builtinFunctionP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("functionp: need an argument")
+	}
+	return vbool(args[0].typ == VPrim || args[0].typ == VFunc || args[0].typ == VGeneric), nil
 }
 
 func builtinMakunbound(args []*Value) (*Value, error) {
@@ -20548,15 +20600,23 @@ var initLib = `
            (in-lets '())
            ;; Expand = clauses without then: (x = expr) -> param with nil init + body set!
            (eq-lets '())
-           (expanded '()))
+           (expanded '())
+           ;; Collect destructuring specs for for...in with pattern vars
+           (destr-specs '()))
       (for-each
         (lambda (f)
           (if (equal? (cadr f) 'in)
             (let* ((user-var (car f))
                    (list-expr (car (cddr f)))
                    (tail (gensym "in-")))
-              (set! in-lets (cons (list user-var tail list-expr) in-lets))
-              (set! expanded (cons (list tail 'in list-expr) expanded)))
+              ;; Check if user-var is a destructuring pattern (a list, not a symbol)
+              (if (symbol? user-var)
+                (begin
+                  (set! in-lets (cons (list user-var tail list-expr #f) in-lets))
+                  (set! expanded (cons (list tail 'in list-expr) expanded)))
+                (let ((hidden-var (gensym "destr-")))
+                  (set! in-lets (cons (list user-var hidden-var list-expr #t) in-lets))
+                  (set! expanded (cons (list hidden-var 'in list-expr) expanded)))))
             (if (equal? (cadr f) 'being)
               ;; Handle: for sym being each present-symbol of package
               ;;   args = (each present-symbol of <pkg-expr>)
@@ -20811,18 +20871,26 @@ var initLib = `
           eq-lets)
 
         ;; Add in-clause element extraction as pre-body bindings (after eq-lets so in-lets come first)
+        ;; For destructuring patterns: we use tail-var as the lambda param, and add
+        ;; (let ((hidden-var (car tail-var))) ...) to the body. No set! needed.
         (for-each
           (lambda (p)
             (let ((user-var (car p))
                   (tail-var (cadr p))
-                  (list-expr (caddr p)))
-              ;; Add initial binding: (user-var (car list-expr))
-              (set! acc-inits
-                (cons (list user-var (list 'car list-expr)) acc-inits))
-              ;; Add set! at start of each iteration
-              (set! body-exprs
-                (cons (list 'set! user-var (list 'car tail-var))
-                      body-exprs))))
+                  (list-expr (caddr p))
+                  (is-destr (car (cdddr p))))
+              (if is-destr
+                (begin
+                  ;; Store (pattern tail-var) for wrapping
+                  (set! destr-specs (cons (list user-var tail-var) destr-specs)))
+                (begin
+                  ;; Add initial binding: (user-var (car list-expr))
+                  (set! acc-inits
+                    (cons (list user-var (list 'car list-expr)) acc-inits))
+                  ;; Add set! at start of each iteration
+                  (set! body-exprs
+                    (cons (list 'set! user-var (list 'car tail-var))
+                          body-exprs))))))
           in-lets)
 
         ;; Build the loop function
@@ -20873,13 +20941,23 @@ var initLib = `
                    (if (null? (cdr finally))
                      (car finally)
                      (cons 'begin finally))))
-               (loop-fn-body full-body))
+               (loop-fn-body full-body)
+               ;; Wrap full-body with destructuring-bind for any destructuring for-clauses
+               (wrapped-body
+                 (let ((result full-body))
+                   (for-each
+                     (lambda (d)
+                       (let ((pattern (car d))
+                             (tail-var (cadr d)))
+                         (set! result (list 'destructuring-bind pattern (list 'car tail-var) result))))
+                     destr-specs)
+                   result)))
 
           ;; Wrap with finally
           (let* ((no-fin (cons 'letrec
                           (cons (list (list loop-name
                                      (cons 'lambda (cons params
-                                       (list full-body)))))
+                                       (list wrapped-body)))))
                                 (list (cons loop-name
                                   (mapcar (lambda (f) (cadr (for-init f)))
                                        for-vars))))))
