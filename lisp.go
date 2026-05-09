@@ -17285,6 +17285,29 @@ func builtinComplex(args []*Value) (*Value, error) {
 }
 
 // -------- type predicates --------
+func isIntegerValue(v *Value) bool {
+	if v.typ == VBigInt {
+		return true
+	}
+	if v.typ == VRat {
+		return v.iden == 1
+	}
+	if v.typ == VNum {
+		// In microlisp, all numbers are float64 internally.
+		// We can't distinguish CL floats from CL integers at the value level.
+		// Accept whole-number VNum values as integers for bitwise ops.
+		return v.num == math.Trunc(v.num) && !math.IsInf(v.num, 0) && !math.IsNaN(v.num)
+	}
+	return false
+}
+
+func signalTypeError(arg *Value) (*Value, error) {
+	cond := &Value{typ: VInstance, instClass: findClass("type-error"), instSlots: map[string]*Value{
+		"message": vstr(fmt.Sprintf("type error: expected integer, got %s", toString(arg))),
+	}}
+	return builtinError([]*Value{cond})
+}
+
 func builtinIntegerp(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return vbool(false), nil
@@ -17416,6 +17439,11 @@ func builtinLogand(args []*Value) (*Value, error) {
 	if len(args) == 0 {
 		return vnum(-1), nil // all ones
 	}
+	for _, a := range args {
+		if !isIntegerValue(a) {
+			return signalTypeError(a)
+		}
+	}
 	if isBigIntInt(args) {
 		result := toBigInt(args[0])
 		if result == nil {
@@ -17441,6 +17469,11 @@ func builtinLogior(args []*Value) (*Value, error) {
 	if len(args) == 0 {
 		return vnum(0), nil
 	}
+	for _, a := range args {
+		if !isIntegerValue(a) {
+			return signalTypeError(a)
+		}
+	}
 	if isBigIntInt(args) {
 		result := toBigInt(args[0])
 		if result == nil {
@@ -17465,6 +17498,11 @@ func builtinLogior(args []*Value) (*Value, error) {
 func builtinLogxor(args []*Value) (*Value, error) {
 	if len(args) == 0 {
 		return vnum(0), nil
+	}
+	for _, a := range args {
+		if !isIntegerValue(a) {
+			return signalTypeError(a)
+		}
 	}
 	if isBigIntInt(args) {
 		result := toBigInt(args[0])
@@ -19732,7 +19770,8 @@ var initLib = `
 
 ;; SBCL test harness stubs
 (define (enable-test-parallelism) nil)
-(define-macro (checked-compile form . rest) form)
+(define-macro (checked-compile form . rest)
+  (list 'eval (list 'quote form)))
 (define (checked-eval form) (eval form))
 (define (ctu:asm-search pattern source) nil)
 
@@ -19754,17 +19793,36 @@ var initLib = `
           (set! is-nested (pair? (car cases)))
           (set! is-nested #f))
       (cons 'let
-        (list (list (list fn-sym form))
+        (list (list (list fn-sym (list 'eval form)))
               (cons 'begin
                 (let ((case-list (if is-nested (car cases) (list cases))))
                   (let ((gen-case (lambda (c)
                                     (if (pair? c)
                                         (let ((inputs (car c))
                                               (expected (if (pair? (cdr c)) (car (cdr c)) nil)))
-                                          (list 'assert
-                                                (list 'equal
-                                                      (list 'apply fn-sym (list 'quote inputs))
-                                                      (list 'quote expected))))
+                                          (if (and (pair? expected) (eq? (car expected) (quote condition)))
+                                              (let ((raw-t (if (pair? (cdr expected)) (car (cdr expected)) (quote error))))
+                                                (let ((cond-type (if (and (pair? raw-t) (eq? (car raw-t) (quote quote)) (pair? (cdr raw-t)))
+                                                                       (car (cdr raw-t))
+                                                                       raw-t)))
+                                                  (list 'assert
+                                                        (list 'handler-case
+                                                              (list 'progn
+                                                                    (list 'apply fn-sym (list 'quote inputs))
+                                                                    (quote nil))
+                                                              (list cond-type (list (quote c)) (quote t))
+                                                              (list (quote error) (list (quote c)) (quote nil))))))
+                                              (if (and (pair? expected) (eq? (car expected) (quote values)))
+                                                  (list 'assert
+                                                        (list 'equal
+                                                              (list 'multiple-value-list
+                                                                    (list 'apply fn-sym (list 'quote inputs)))
+                                                              (list 'multiple-value-list
+                                                                    (list 'quote (cdr expected)))))
+                                                  (list 'assert
+                                                        (list 'equal
+                                                              (list 'apply fn-sym (list 'quote inputs))
+                                                              (list 'quote expected))))))
                                         (list 'begin)))))
                     (mapcar gen-case case-list)))))))))
 
