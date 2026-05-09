@@ -106,3 +106,5 @@
 66. `destructuring-bind` 的 Go 实现中 lambda-list 关键字大小写不匹配（`&rest` vs `&REST`）
 67. `set!`/`setq` 不更新 globalEnv 中已定义的全局变量
 68. `isNil()` 不识别 VSym "NIL"（导致 length/butlast 等函数对 nil 报错）
+69. `find-all-symbols` 函数未实现
+70. `coerce` 类型说明符大小写敏感（`'STRING` vs `'string`）
