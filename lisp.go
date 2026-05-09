@@ -5593,6 +5593,7 @@ var builtins = []builtinDef{
 	{"array-rank", builtinArrayRank},
 	{"array-element-type", builtinArrayElementType},
 	{"fill-pointer", builtinFillPointer},
+	{"fill-pointer-setf", builtinFillPointerSetf},
 	{"set-fill-pointer", builtinSetFillPointer},
 	{"vector-push", builtinVectorPush},
 	{"vector-pop", builtinVectorPop},
@@ -8329,11 +8330,31 @@ func builtinNumStr(args []*Value) (*Value, error) {
 	return vstr(s), nil
 }
 
-func builtinStrUpcase(args []*Value) (*Value, error) {
-	if len(args) < 1 || args[0].typ != VStr {
-		return nil, fmt.Errorf("string-upcase: expected string")
+// coerceStringDesignator converts a string designator (string, symbol, character, or array)
+// to a Go string, per the CL spec.
+func coerceStringDesignator(v *Value) (string, error) {
+	switch v.typ {
+	case VStr:
+		return v.str, nil
+	case VSym:
+		return v.str, nil
+	case VChar:
+		return string(v.ch), nil
+	case VArray:
+		return vecToString(v), nil
+	default:
+		return "", fmt.Errorf("expected a string designator (string, symbol, or character)")
 	}
-	s := args[0].str
+}
+
+func builtinStrUpcase(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("string-upcase: expected a string designator")
+	}
+	s, err := coerceStringDesignator(args[0])
+	if err != nil {
+		return nil, fmt.Errorf("string-upcase: %v", err)
+	}
 	runes := []rune(s)
 	start, end := 0, len(runes)
 	for i := 1; i < len(args); i++ {
@@ -8370,10 +8391,13 @@ func builtinStrUpcase(args []*Value) (*Value, error) {
 }
 
 func builtinStrDowncase(args []*Value) (*Value, error) {
-	if len(args) < 1 || args[0].typ != VStr {
-		return nil, fmt.Errorf("string-downcase: expected string")
+	if len(args) < 1 {
+		return nil, fmt.Errorf("string-downcase: expected a string designator")
 	}
-	s := args[0].str
+	s, err := coerceStringDesignator(args[0])
+	if err != nil {
+		return nil, fmt.Errorf("string-downcase: %v", err)
+	}
 	runes := []rune(s)
 	start, end := 0, len(runes)
 	for i := 1; i < len(args); i++ {
@@ -10223,6 +10247,26 @@ func builtinSetFillPointer(args []*Value) (*Value, error) {
 	}
 	arr.array.fillPtr = newVal
 	return args[1], nil
+}
+
+// fill-pointer-setf: for (setf (fill-pointer arr) val) -> (fill-pointer-setf val arr)
+func builtinFillPointerSetf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("(setf fill-pointer): need array and value")
+	}
+	newVal := int(args[0].num)
+	arr := args[1]
+	if arr.typ != VArray || arr.array == nil {
+		return nil, fmt.Errorf("(setf fill-pointer): first arg must be an array")
+	}
+	if arr.array.fillPtr < 0 {
+		return nil, fmt.Errorf("(setf fill-pointer): array has no fill-pointer")
+	}
+	if newVal < 0 || newVal > len(arr.array.elements) {
+		return nil, fmt.Errorf("(setf fill-pointer): value %d out of range [0..%d]", newVal, len(arr.array.elements))
+	}
+	arr.array.fillPtr = newVal
+	return args[0], nil
 }
 
 func builtinVectorPush(args []*Value) (*Value, error) {
@@ -14284,7 +14328,26 @@ func builtinButlast(args []*Value) (*Value, error) {
 	if len(args) > 1 {
 		n = int(toNum(args[1]))
 	}
-	elems := seqToList(args[0])
+	list := args[0]
+	if n <= 0 {
+		// butlast with n=0 returns a copy of the list (including dotted tail)
+		var result *Value = vnil()
+		var tail *Value
+		c := list
+		for !isNil(c) && c.typ == VPair {
+			newCell := cons(c.car, vnil())
+			if result == nil || result.typ != VPair {
+				result = newCell
+				tail = newCell
+			} else {
+				tail.cdr = newCell
+				tail = newCell
+			}
+			c = c.cdr
+		}
+		return result, nil
+	}
+	elems := seqToList(list)
 	if n >= len(elems) {
 		return vnil(), nil
 	}
@@ -15744,35 +15807,73 @@ func builtinStringRightTrim(args []*Value) (*Value, error) {
 }
 
 func builtinStrCapitalize(args []*Value) (*Value, error) {
-	if len(args) < 1 || args[0].typ != VStr {
-		return nil, fmt.Errorf("string-capitalize: expected string")
+	if len(args) < 1 {
+		return nil, fmt.Errorf("string-capitalize: expected a string designator")
 	}
-	s := args[0].str
+	s, err := coerceStringDesignator(args[0])
+	if err != nil {
+		return nil, fmt.Errorf("string-capitalize: %v", err)
+	}
+	runes := []rune(s)
+	start, end := 0, len(runes)
+	for i := 1; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":START":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "string-capitalize :start")
+					if err != nil {
+						return nil, err
+					}
+					start = int(n)
+				}
+			case ":END":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "string-capitalize :end")
+					if err != nil {
+						return nil, err
+					}
+					end = int(n)
+				}
+			}
+		}
+	}
+	if end > len(runes) {
+		end = len(runes)
+	}
 	var result strings.Builder
 	prevAlpha := false
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-			if !prevAlpha {
-				result.WriteRune(unicode.ToUpper(r))
+	for i, r := range runes {
+		if i >= start && i < end {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				if !prevAlpha {
+					result.WriteRune(unicode.ToUpper(r))
+				} else {
+					result.WriteRune(unicode.ToLower(r))
+				}
+				prevAlpha = true
 			} else {
-				result.WriteRune(unicode.ToLower(r))
+				result.WriteRune(r)
+				prevAlpha = false
 			}
-			prevAlpha = true
 		} else {
 			result.WriteRune(r)
-			prevAlpha = false
 		}
 	}
 	return vstr(result.String()), nil
 }
 
 // checkStringArg returns the string value or an error for string comparison builtins.
+// Accepts string designators (string, symbol, or character).
 func checkStringArg(v *Value, funcName string) (string, error) {
 	v = primaryValue(v)
-	if v.typ != VStr {
-		return "", fmt.Errorf("%s: expected a string", funcName)
+	s, err := coerceStringDesignator(v)
+	if err != nil {
+		return "", fmt.Errorf("%s: %v", funcName, err)
 	}
-	return v.str, nil
+	return s, nil
 }
 
 func builtinStrEqual(args []*Value) (*Value, error) {
@@ -16054,25 +16155,238 @@ func builtinRandom(args []*Value) (*Value, error) {
 	return vnum(float64(rand.Intn(intLimit))), nil
 }
 
+// vecToString converts a VArray of characters to a Go string.
+// Uses fill-pointer if present.
+func vecToString(v *Value) string {
+	arr := v.array
+	end := len(arr.elements)
+	if arr.fillPtr >= 0 && arr.fillPtr <= len(arr.elements) {
+		end = arr.fillPtr
+	}
+	var sb strings.Builder
+	for i := 0; i < end; i++ {
+		elem := arr.elements[i]
+		if elem != nil {
+			if elem.typ == VChar {
+				sb.WriteRune(elem.ch)
+			} else if elem.typ == VStr && len(elem.str) == 1 {
+				sb.WriteRune(rune(elem.str[0]))
+			}
+		}
+	}
+	return sb.String()
+}
+
 func builtinNStringUpcase(args []*Value) (*Value, error) {
-	if len(args) < 1 || args[0].typ != VStr {
+	if len(args) < 1 {
 		return nil, fmt.Errorf("nstring-upcase: need a string")
 	}
-	return vstr(strings.ToUpper(args[0].str)), nil
+	v := primaryValue(args[0])
+	start, end := 0, -1
+	for i := 1; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":START":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "nstring-upcase :start")
+					if err != nil {
+						return nil, err
+					}
+					start = int(n)
+				}
+			case ":END":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "nstring-upcase :end")
+					if err != nil {
+						return nil, err
+					}
+					end = int(n)
+				}
+			}
+		}
+	}
+	switch v.typ {
+	case VStr:
+		runes := []rune(v.str)
+		e := len(runes)
+		if end >= 0 && end < e {
+			e = end
+		}
+		for i := start; i < e; i++ {
+			runes[i] = unicode.ToUpper(runes[i])
+		}
+		v.str = string(runes)
+		return v, nil
+	case VArray:
+		arr := v.array
+		e := len(arr.elements)
+		if arr.fillPtr >= 0 && arr.fillPtr < e {
+			e = arr.fillPtr
+		}
+		if end >= 0 && end < e {
+			e = end
+		}
+		for i := start; i < e; i++ {
+			elem := arr.elements[i]
+			if elem != nil && elem.typ == VChar {
+				arr.elements[i] = vchar(unicode.ToUpper(elem.ch))
+			}
+		}
+		return vstr(vecToString(v)), nil
+	default:
+		return nil, fmt.Errorf("nstring-upcase: need a string")
+	}
 }
 
 func builtinNStringDowncase(args []*Value) (*Value, error) {
-	if len(args) < 1 || args[0].typ != VStr {
+	if len(args) < 1 {
 		return nil, fmt.Errorf("nstring-downcase: need a string")
 	}
-	return vstr(strings.ToLower(args[0].str)), nil
+	v := primaryValue(args[0])
+	start, end := 0, -1
+	for i := 1; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":START":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "nstring-downcase :start")
+					if err != nil {
+						return nil, err
+					}
+					start = int(n)
+				}
+			case ":END":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "nstring-downcase :end")
+					if err != nil {
+						return nil, err
+					}
+					end = int(n)
+				}
+			}
+		}
+	}
+	switch v.typ {
+	case VStr:
+		runes := []rune(v.str)
+		e := len(runes)
+		if end >= 0 && end < e {
+			e = end
+		}
+		for i := start; i < e; i++ {
+			runes[i] = unicode.ToLower(runes[i])
+		}
+		v.str = string(runes)
+		return v, nil
+	case VArray:
+		arr := v.array
+		e := len(arr.elements)
+		if arr.fillPtr >= 0 && arr.fillPtr < e {
+			e = arr.fillPtr
+		}
+		if end >= 0 && end < e {
+			e = end
+		}
+		for i := start; i < e; i++ {
+			elem := arr.elements[i]
+			if elem != nil && elem.typ == VChar {
+				arr.elements[i] = vchar(unicode.ToLower(elem.ch))
+			}
+		}
+		return vstr(vecToString(v)), nil
+	default:
+		return nil, fmt.Errorf("nstring-downcase: need a string")
+	}
 }
 
 func builtinNStringCapitalize(args []*Value) (*Value, error) {
-	if len(args) < 1 || args[0].typ != VStr {
+	if len(args) < 1 {
 		return nil, fmt.Errorf("nstring-capitalize: need a string")
 	}
-	return vstr(titleCaseString(args[0].str)), nil
+	v := primaryValue(args[0])
+	start, end := 0, -1
+	for i := 1; i < len(args); i++ {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":START":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "nstring-capitalize :start")
+					if err != nil {
+						return nil, err
+					}
+					start = int(n)
+				}
+			case ":END":
+				if i+1 < len(args) {
+					i++
+					n, err := safeToNum(args[i], "nstring-capitalize :end")
+					if err != nil {
+						return nil, err
+					}
+					end = int(n)
+				}
+			}
+		}
+	}
+	switch v.typ {
+	case VStr:
+		runes := []rune(v.str)
+		e := len(runes)
+		if end >= 0 && end < e {
+			e = end
+		}
+		prevAlpha := false
+		for i := start; i < e; i++ {
+			if (runes[i] >= 'a' && runes[i] <= 'z') || (runes[i] >= 'A' && runes[i] <= 'Z') {
+				if !prevAlpha {
+					runes[i] = unicode.ToUpper(runes[i])
+				} else {
+					runes[i] = unicode.ToLower(runes[i])
+				}
+				prevAlpha = true
+			} else {
+				prevAlpha = false
+			}
+		}
+		v.str = string(runes)
+		return v, nil
+	case VArray:
+		arr := v.array
+		e := len(arr.elements)
+		if arr.fillPtr >= 0 && arr.fillPtr < e {
+			e = arr.fillPtr
+		}
+		if end >= 0 && end < e {
+			e = end
+		}
+		prevAlpha := false
+		for i := start; i < e; i++ {
+			elem := arr.elements[i]
+			if elem != nil && elem.typ == VChar {
+				r := elem.ch
+				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+					if !prevAlpha {
+						arr.elements[i] = vchar(unicode.ToUpper(r))
+					} else {
+						arr.elements[i] = vchar(unicode.ToLower(r))
+					}
+					prevAlpha = true
+				} else {
+					prevAlpha = false
+				}
+			} else {
+				prevAlpha = false
+			}
+		}
+		return vstr(vecToString(v)), nil
+	default:
+		return nil, fmt.Errorf("nstring-capitalize: need a string")
+	}
 }
 
 func titleCaseString(s string) string {
