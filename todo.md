@@ -101,3 +101,4 @@
 61. `logand`/`logior`/`logxor` 对非整数参数静默转为0而非报type-error
 62. `(setf (values ...) ...)` 未实现
 63. `char-name` 对 C1 控制字符（128-159）返回 nil
+64. `type-of` 返回 `"unknown"` 对于 `pathname`、`random-state`、`array`、`integer`（大整数）类型

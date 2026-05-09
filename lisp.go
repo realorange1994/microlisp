@@ -5232,12 +5232,20 @@ func typeStr(v *Value) string {
 		return "character"
 	case VStream:
 		return "stream"
+	case VArray:
+		return "array"
 	case VMultiVal:
 		return "multi-value"
+	case VBigInt:
+		return "integer"
 	case VPackage:
 		return "package"
 	case VReadtable:
 		return "readtable"
+	case VPathname:
+		return "pathname"
+	case VRandomState:
+		return "random-state"
 	default:
 		return "unknown"
 	}
