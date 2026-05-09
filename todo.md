@@ -104,3 +104,4 @@
 64. `type-of` 返回 `"unknown"` 对于 `pathname`、`random-state`、`array`、`integer`（大整数）类型
 65. `typep`/`subtypep` 类型比较大小写不敏感问题（符号名大写后比较失败）
 66. `destructuring-bind` 的 Go 实现中 lambda-list 关键字大小写不匹配（`&rest` vs `&REST`）
+67. `set!`/`setq` 不更新 globalEnv 中已定义的全局变量
