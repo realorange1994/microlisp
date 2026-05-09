@@ -111,3 +111,4 @@
 70. `coerce` 类型说明符大小写敏感（`'STRING` vs `'string`）
 71. 关键字参数大小写不匹配（reader 大写化后 Go 侧用小写匹配）
 72. `checked-compile` 宏引用 bug（`eval` 未正确展开变量）
+73. `destructuring-bind` 点对模式匹配 nil 值时 Go nil 指针崩溃
