@@ -91,3 +91,8 @@
 51. `loop` 不支持解构模式如 `(for (a b) in list)`
 52. `functionp` 谓词函数未实现
 53. ✅ `defun` 接受 `(setf name)` 作为函数名 — 已修复
+54. `ignore-errors` 错误时未返回 `(values nil condition)`
+55. `nth-value` 无法从 VMultiVal 正确提取第 n 个值
+56. `delete-if`/`nsubstitute-if` 谓词函数调用方式错误（eval 而非 callFnOnSeq）
+57. `delete-duplicates` 使用指针相等而非值相等判断重复
+58. `*random-state*` 未初始化
