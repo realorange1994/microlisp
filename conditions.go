@@ -840,6 +840,21 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 	if typeName == "CHARACTER" {
 		return val.typ == VChar
 	}
+	if typeName == "BASE-CHAR" {
+		return val.typ == VChar
+	}
+	if typeName == "STANDARD-CHAR" {
+		if val.typ != VChar {
+			return false
+		}
+		ch := val.ch
+		// Standard chars: graphic chars in range 32-126 plus #\Newline
+		return (ch >= 32 && ch <= 126) || ch == '\n'
+	}
+	if typeName == "EXTENDED-CHAR" {
+		// In non-Unicode implementations, there are no extended chars
+		return false
+	}
 	if typeName == "STREAM" {
 		return val.typ == VStream
 	}
