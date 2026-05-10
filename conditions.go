@@ -1013,6 +1013,44 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 				return val.typ == VPair || val.typ == VNil
 			case "FUNCTION":
 				return val.typ == VPrim || val.typ == VFunc || val.typ == VGeneric
+			case "PATHNAME":
+				return val.typ == VPathname
+			case "RANDOM-STATE":
+				return val.typ == VRandomState
+			case "PACKAGE":
+				return val.typ == VPackage
+			case "READTABLE":
+				return val.typ == VReadtable
+			case "METHOD":
+				return val.typ == VMethod
+			case "RESTART":
+				return val.typ == VRestart
+			case "GENERIC", "GENERIC-FUNCTION", "STANDARD-GENERIC-FUNCTION":
+				return val.typ == VGeneric
+			case "INSTANCE", "STANDARD-OBJECT", "STRUCTURE-OBJECT":
+				return val.typ == VInstance
+			case "HASH-TABLE":
+				return val.typ == VVHash
+			case "CHARACTER":
+				return val.typ == VChar
+			case "BASE-CHAR", "STANDARD-CHAR":
+				return val.typ == VChar
+			case "STREAM":
+				return val.typ == VStream
+			case "CLASS":
+				return val.typ == VClass
+			case "MACRO":
+				return val.typ == VMacro
+			case "BOOLEAN":
+				return val.typ == VBool || isNil(val)
+			case "SEQUENCE":
+				return val.typ == VStr || val.typ == VPair || val.typ == VNil || val.typ == VArray
+			case "ATOM":
+				return val.typ != VPair
+			case "RATIONAL":
+				return val.typ == VRat || val.typ == VNum || val.typ == VBigInt
+			case "COMPLEX":
+				return val.typ == VComplex
 			default:
 				// Try as a class name
 				if cls := findClass(typeSpec.car.str); cls != nil && cls.typ == VClass {
@@ -1116,6 +1154,43 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 	}
 	if typeName == "ATOM" {
 		return val.typ != VPair
+	}
+	if typeName == "PATHNAME" {
+		return val.typ == VPathname
+	}
+	if typeName == "RANDOM-STATE" {
+		return val.typ == VRandomState
+	}
+	if typeName == "PACKAGE" {
+		return val.typ == VPackage
+	}
+	if typeName == "READTABLE" {
+		return val.typ == VReadtable
+	}
+	if typeName == "METHOD" {
+		return val.typ == VMethod
+	}
+	if typeName == "RESTART" {
+		return val.typ == VRestart
+	}
+	if typeName == "GENERIC" || typeName == "GENERIC-FUNCTION" || typeName == "STANDARD-GENERIC-FUNCTION" {
+		return val.typ == VGeneric
+	}
+	if typeName == "INSTANCE" || typeName == "STANDARD-OBJECT" || typeName == "STRUCTURE-OBJECT" {
+		return val.typ == VInstance
+	}
+	if typeName == "THREAD" {
+		return val.typ == VThread
+	}
+	if typeName == "LOCK" || typeName == "MUTEX" {
+		return val.typ == VLock
+	}
+	if typeName == "BIT-VECTOR" || typeName == "SIMPLE-BIT-VECTOR" {
+		// Bit vector: a 1D array of bits
+		if val.typ == VArray && len(val.array.dims) == 1 {
+			return true // could be a bit vector
+		}
+		return false
 	}
 	// Try as a class name
 	if val.typ == VInstance && val.instClass != nil {

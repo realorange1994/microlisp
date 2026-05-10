@@ -937,6 +937,14 @@ func vrat(n, d int64) *Value {
 	v.iden = d
 	return v
 }
+
+// varray creates a 1-D VArray from a slice of values.
+func varray(elems []*Value) *Value {
+	v := gcv()
+	v.typ = VArray
+	v.array = &LispArray{dims: []int{len(elems)}, elements: elems, fillPtr: -1}
+	return v
+}
 func vcomplex(r, i float64) *Value {
 	if i == 0 {
 		return vnum(r)
@@ -2045,21 +2053,21 @@ func (p *Parser) readExpr() (*Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		return list(vsym("quasiquote"), v), nil
+		return list(vsym("QUASIQUOTE"), v), nil
 	case TUnq:
 		p.advance()
 		v, err := p.readExpr()
 		if err != nil {
 			return nil, err
 		}
-		return list(vsym("unquote"), v), nil
+		return list(vsym("UNQUOTE"), v), nil
 	case TUnqS:
 		p.advance()
 		v, err := p.readExpr()
 		if err != nil {
 			return nil, err
 		}
-		return list(vsym("unquote-splicing"), v), nil
+		return list(vsym("UNQUOTE-SPLICING"), v), nil
 	case TComplex:
 		// #C(real imag) - parse complex number literal
 		inner := p.tok.lit
@@ -5518,14 +5526,14 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 			if e != nil {
 				return nil, e
 			}
-			return list(vsym("unquote-splicing"), inner), nil
+			return list(vsym("UNQUOTE-SPLICING"), inner), nil
 		}
 		// depth > 1: preserve the comma but process recursively
 		inner, e := evalQuasiquote(v.cdr.car, depth-1, env)
 		if e != nil {
 			return nil, e
 		}
-		return list(vsym("unquote-splicing"), inner), nil
+		return list(vsym("UNQUOTE-SPLICING"), inner), nil
 	}
 	// (unquote-splicing expr) at depth 0 - not valid here
 	if strings.EqualFold(symName, "UNQUOTE-SPLICING") && depth == 0 {
@@ -5540,54 +5548,18 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 		if e != nil {
 			return nil, e
 		}
-		return list(vsym("quasiquote"), inner), nil
+		return list(vsym("QUASIQUOTE"), inner), nil
 	}
 	if strings.EqualFold(symName, "UNQUOTE") && depth > 0 {
 		if v.cdr == nil || v.cdr.typ != VPair {
 			return nil, fmt.Errorf("unquote: malformed form")
 		}
-		if depth == 1 {
-			// The unquote belongs to the nearest quasiquote: comma is consumed.
-			// Evaluate the argument, but if it's quasiquote-related, process with
-			// evalQuasiquote and preserve the inner wrapper structure.
-			arg := v.cdr.car
-			if isPair(arg) && arg.car != nil && arg.car.typ == VSym {
-				aname := arg.car.str
-				if strings.EqualFold(aname, "QUASIQUOTE") {
-					// Process nested quasiquote form at depth 1, wrap result with (quasiquote ...)
-					inner, e := evalQuasiquote(arg.cdr.car, 1, env)
-					if e != nil {
-						return nil, e
-					}
-					return list(vsym("quasiquote"), inner), nil
-				}
-				if strings.EqualFold(aname, "UNQUOTE") {
-					// ,,x: the inner unquote belongs to the inner quasiquote,
-					// the outer comma consumes the unquote wrapper.
-					// Evaluate the innermost argument directly.
-					if isPair(arg.cdr) {
-						return eval(arg.cdr.car, env)
-					}
-					return nil, fmt.Errorf("unquote: malformed form")
-				}
-				if strings.EqualFold(aname, "UNQUOTE-SPLICING") {
-					// Process inner unquote-splicing at depth 0, wrap with (unquote-splicing ...)
-					inner, e := evalQuasiquote(arg, 0, env)
-					if e != nil {
-						return nil, e
-					}
-					return list(vsym("unquote-splicing"), inner), nil
-				}
-			}
-			// Simple argument: evaluate directly (comma consumed)
-			return eval(arg, env)
-		}
-		// depth > 1: process argument at depth-1 and preserve the unquote wrapper
+		// depth > 0: process argument at depth-1 and preserve the unquote wrapper
 		inner, e := evalQuasiquote(v.cdr.car, depth-1, env)
 		if e != nil {
 			return nil, e
 		}
-		return list(vsym("unquote"), inner), nil
+		return list(vsym("UNQUOTE"), inner), nil
 	}
 	// Build list
 	var result *Value = vnil()
@@ -7779,6 +7751,38 @@ func builtinDiv(args []*Value) (*Value, error) {
 		}
 		return vrat(n0, d0), nil
 	}
+	// If all args are integers (not floats), use rational division
+	allInt := true
+	for _, a := range args {
+		if a.typ == VNum && a.isFloat {
+			allInt = false
+			break
+		}
+	}
+	if allInt {
+		n0, d0 := int64(toNum(args[0])), int64(1)
+		for _, a := range args[1:] {
+			an := int64(toNum(a))
+			if an == 0 {
+				return nil, signalDivisionByZero()
+			}
+			n0 *= an
+			d0 *= 1
+		}
+		// Simplify: n0/d0 where d0 is the product of all denominators
+		// Actually we need n0 / (product of all args[1:])
+		// Redo: numerator = args[0], denominator = product of args[1:]
+		num := int64(toNum(args[0]))
+		den := int64(1)
+		for _, a := range args[1:] {
+			den *= int64(toNum(a))
+		}
+		if den == 0 {
+			return nil, signalDivisionByZero()
+		}
+		return vrat(num, den), nil
+	}
+
 	r := toNum(args[0])
 	for _, a := range args[1:] {
 		if toNum(a) == 0 {
@@ -14249,6 +14253,10 @@ func builtinSeqRemoveIf(args []*Value) (*Value, error) {
 		}
 		return vstr(sb.String()), nil
 	}
+	// If input was a VArray, return a VArray
+	if seq.typ == VArray {
+		return varray(result), nil
+	}
 	return listFromSlice(result), nil
 }
 
@@ -14413,6 +14421,10 @@ func builtinSeqSubstitute(args []*Value) (*Value, error) {
 			}
 		}
 		return vstr(sb.String()), nil
+	}
+	// If input was a VArray, return a VArray
+	if seq.typ == VArray {
+		return varray(result), nil
 	}
 	return listFromSlice(result), nil
 }
@@ -16045,6 +16057,10 @@ func builtinSeqRemove(args []*Value) (*Value, error) {
 		}
 		return vstr(sb.String()), nil
 	}
+	// If input was a VArray, return a VArray
+	if seq.typ == VArray {
+		return varray(result), nil
+	}
 	return listFromSlice(result), nil
 }
 
@@ -16301,10 +16317,60 @@ func builtinNsubstituteIf(args []*Value) (*Value, error) {
 	newVal := args[0]
 	pred := args[1]
 	seq := args[2]
-		keyFn, _, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+	keyFn, _, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
 	if err != nil {
 		return nil, err
 	}
+
+	// Handle VArray: modify elements in-place
+	if seq.typ == VArray {
+		elems := seq.array.elements
+		seqLen := len(elems)
+		if end < 0 || end > seqLen {
+			end = seqLen
+		}
+		if start < 0 {
+			start = 0
+		}
+		replaced := 0
+		if fromEnd {
+			for i := end - 1; i >= start; i-- {
+				if count >= 0 && replaced >= count { break }
+				v := elems[i]
+				if !isNil(keyFn) {
+					v, err2 := callFnOnSeq(keyFn, []*Value{elems[i]}, globalEnv)
+					if err2 != nil {
+						return nil, err2
+					}
+					_ = v
+				}
+				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
+				if perr == nil && isTruthy(predVal) {
+					elems[i] = newVal
+					replaced++
+				}
+			}
+		} else {
+			for i := start; i < end; i++ {
+				if count >= 0 && replaced >= count { break }
+				v := elems[i]
+				if !isNil(keyFn) {
+					v2, err2 := callFnOnSeq(keyFn, []*Value{elems[i]}, globalEnv)
+					if err2 != nil {
+						return nil, err2
+					}
+					v = v2
+				}
+				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
+				if perr == nil && isTruthy(predVal) {
+					elems[i] = newVal
+					replaced++
+				}
+			}
+		}
+		return seq, nil
+	}
+
 	if end < 0 {
 		seen := make(map[*Value]bool)
 		length := 0
@@ -16666,6 +16732,10 @@ func builtinSeqSubstituteIf(args []*Value) (*Value, error) {
 		}
 		return vstr(sb.String()), nil
 	}
+	// If input was a VArray, return a VArray
+	if seq.typ == VArray {
+		return varray(result), nil
+	}
 	return listFromSlice(result), nil
 }
 
@@ -16680,6 +16750,37 @@ func builtinNsubstitute(args []*Value) (*Value, error) {
 	keyFn, testFn, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
 	if err != nil {
 		return nil, err
+	}
+
+	// Handle VArray: modify elements in-place
+	if seq.typ == VArray {
+		elems := seq.array.elements
+		seqLen := len(elems)
+		if end < 0 || end > seqLen {
+			end = seqLen
+		}
+		if start < 0 {
+			start = 0
+		}
+		replaced := 0
+		if fromEnd {
+			for i := end - 1; i >= start; i-- {
+				if count >= 0 && replaced >= count { break }
+				if testItemMatch(oldVal, elems[i], testFn, keyFn) {
+					elems[i] = newVal
+					replaced++
+				}
+			}
+		} else {
+			for i := start; i < end; i++ {
+				if count >= 0 && replaced >= count { break }
+				if testItemMatch(oldVal, elems[i], testFn, keyFn) {
+					elems[i] = newVal
+					replaced++
+				}
+			}
+		}
+		return seq, nil
 	}
 
 	// Normalize end
