@@ -83,19 +83,19 @@
 37. Go 词法分析器对超出 float64 尾数精度的大整数（>2^53）丢失精度 — 已修复（`compareNumeric` 添加 `toBigIntExact` 和 `toBigRat` 辅助函数，使用 `big.Int.Cmp` 和 `big.Rat.Cmp` 进行精确比较）
 38. setf 对未绑定变量报错而非创建全局绑定（ANSI CL 语义）
 39. `destructuring-bind` 的 `&key` 使用位置绑定而非关键字匹配
-40. `butlast` 对 n<=0 返回原列表而非副本
-41. `block`/`return-from` 不接受 nil 作为块名
+40. `butlast` 对 n<=0 返回原列表而非副本 — 已修复（Go 实现已正确返回副本；移除覆盖的 Lisp 定义）
+41. `block`/`return-from` 不接受 nil 作为块名 — 已修复（block 和 return-from 均处理 VNil 作为块名，转换为 "NIL"）
 42. `eq`/`equal` 不将 nil 符号和 VNil（空列表）视为相等
 43. 双反引号嵌套求值错误（`(quasiquote (quasiquote X))` 未正确解包）— 已修复（evalQuasiquote 重写：QUASIQUOTE 递归 depth+1 并包装结果；UNQUOTE/UNQUOTE-SPLICING 在 depth>0 时递归 depth-1 并包装为 (UNQUOTE ...)；修复 depth==1 时错误求值 UNQUOTE 参数的问题；所有 vsym 使用大写符号名与 reader 一致）
 44. `unquote`/`unquote-splicing` 在 depth>0 时未递归处理 — 已修复（与 Bug #43 同修复，统一 depth>0 路径，移除了错误的 depth==1 特殊分支）
 45. `loop` 的 `for x = expr` 子句在 expr 中引用其他循环变量时报 undefined
 46. `load` 不支持 `:if-does-not-exist nil` 关键字参数 — 已确认已实现（builtinLoad 已处理 :if-does-not-exist 和 :if-exists 关键字参数）
 47. `stringp`/`numberp` 谓词函数未实现
-48. `loop` 不支持 `being each present-symbol/external-symbol of package` 子句
+48. `loop` 不支持 `being each present-symbol/external-symbol of package` 子句 — 已确认已实现（loop 宏支持 being 子句和 present-symbol/external-symbol）
 49. `random` 函数接受浮点数参数时总是返回 0（截断为整数导致 rand.Intn(0/1)）
 50. `macroexpand` 不展开 quasiquote 形式（返回原始形式不变）
 51. `loop` 不支持解构模式如 `(for (a b) in list)` — 已确认已实现（loop 宏已支持 destr-specs/destructuring-bind 包装解构模式）
-52. `functionp` 谓词函数未实现
+52. `functionp` 谓词函数未实现 — 已确认已实现（builtinFunctionP 正确判断 VPrim/VFunc/VGeneric）
 53. `defun` 接受 `(setf name)` 作为函数名 — 已修复
 54. `ignore-errors` 错误时未返回 `(values nil condition)` — 已修复（成功时返回 multiVal(result, vnil())，错误时返回 multiVal(vnil(), condition)）
 55. `nth-value` 无法从 VMultiVal 正确提取第 n 个值
@@ -105,7 +105,7 @@
 59. `coerce` 不支持 `'vector` 和 `'array` 结果类型
 60. `typep` 不处理复合 `vector` 类型说明符如 `(vector *)` 且不识别字符串为 vector/array — 已修复（字符串是 CL 中的 vector 和 array 子类型）
 61. `logand`/`logior`/`logxor` 对非整数参数静默转为0而非报type-error — 已修复（已有 `isIntegerValue` 检查和 `signalTypeError` 返回）
-62. `(setf (values ...) ...)` 未实现
+62. `(setf (values ...) ...)` 未实现 — 已修复（setf 展开器处理 values 子形式）
 63. `char-name` 对 C1 控制字符（128-159）返回 nil — 已修复（返回 "C128"、"C129" 等实现定义名称，C0 未命名控制字符也返回 "C0"、"C1" 等）
 64. `type-of` 返回 `"unknown"` 对于 `pathname`、`random-state`、`array`、`integer`（大整数）类型 — 已修复（typeStr 返回正确类型名称；typepCheckRec 符号分支添加 PATHNAME、RANDOM-STATE、PACKAGE、READTABLE、METHOD、RESTART、GENERIC、INSTANCE、HASH-TABLE、CHARACTER、STREAM、CLASS、MACRO、BOOLEAN、SEQUENCE、ATOM、RATIONAL、COMPLEX 类型检查；复合类型说明符分支添加相同类型检查并修复缩进）
 65. `typep`/`subtypep` 类型比较大小写不敏感问题（符号名大写后比较失败）— 已修复（subtypepChecks 使用 strings.ToUpper 标准化类型名后比较，simpleSubtype 也使用大写比较）
@@ -121,7 +121,7 @@
 75. `string-capitalize` 不支持 `:start`/`:end` 关键字参数
 76. `nstring-upcase/downcase/capitalize` 不支持 VArray 和 fill-pointer
 77. `(setf fill-pointer)` 未实现 — 已修复（fill-pointer-setf 已注册在 builtin table）
-78. `butlast` 对 dotted list 处理错误
+78. `butlast` 对 dotted list 处理错误 — 已修复（重写 n>0 路径：收集 elems/cdrs，使用 cdrs[len-1] 作为 dottedTail；移除覆盖 Go 内置的 Lisp 定义）
 79. `floor`/`ceiling`/`truncate`/`round` 返回 list 而非 VMultiVal（多值应使用 multiVal 而非 list）— 已修复
 80. `=`/`/=` 等数值比较对复数只比较实部（`compareNumeric` 忽略虚部）— 已修复
 81. `coerce` 不支持 `standard-char`/`base-char` 作为结果类型 — 已修复

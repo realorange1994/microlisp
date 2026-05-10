@@ -16125,23 +16125,32 @@ func builtinButlast(args []*Value) (*Value, error) {
 		return vnil(), nil
 	}
 	keep := len(elems) - n
-	// The final cdr comes from the 'keep' element's cdr
-	finalCdr := cdrs[keep-1]
-	// Rebuild with only first 'keep' elements
-	if keep == 0 {
-		return finalCdr, nil
+	// Find the original non-pair tail of the dotted list
+	dottedTail := vnil()
+	if len(cdrs) > 0 {
+		lastCdr := cdrs[len(cdrs)-1]
+		if lastCdr.typ != VPair {
+			dottedTail = lastCdr
+		}
 	}
+	if keep == 0 {
+		if dottedTail.typ == VPair {
+			return dottedTail, nil
+		}
+		return vnil(), nil
+	}
+	// Rebuild with first 'keep' elements
 	result := vnil()
 	for i := keep - 1; i >= 0; i-- {
 		result = cons(elems[i], result)
 	}
 	// Set the final cdr (dotted tail or nil)
-	if !isNil(finalCdr) {
+	if !isNil(dottedTail) {
 		last := result
 		for last.cdr.typ == VPair {
 			last = last.cdr
 		}
-		last.cdr = finalCdr
+		last.cdr = dottedTail
 	}
 	return result, nil
 }
@@ -20101,7 +20110,7 @@ func builtinRationalp(args []*Value) (*Value, error) {
 		return vbool(false), nil
 	}
 	v := args[0]
-	return vbool(v.typ == VRat || v.typ == VNum || v.typ == VBigInt), nil
+	return vbool(v.typ == VRat || v.typ == VBigInt || (v.typ == VNum && !v.isFloat)), nil
 }
 
 func builtinRealp(args []*Value) (*Value, error) {
@@ -20772,6 +20781,40 @@ func builtinCoerce(args []*Value) (*Value, error) {
 			elems = stringToCharList(obj.str)
 		} else {
 			elems = seqToList(obj)
+		}
+		arr := &LispArray{dims: []int{len(elems)}, elements: elems, fillPtr: -1, adjustable: false}
+		v := gcv()
+		v.typ = VArray
+		v.array = arr
+		return v, nil
+	case "bit-vector", "simple-bit-vector", ":bit-vector", ":simple-bit-vector":
+		// Bit vector: 1D array containing only 0s and 1s
+		var elems []*Value
+		if obj.typ == VArray && len(obj.array.dims) == 1 {
+			elems = obj.array.elements
+		} else if obj.typ == VStr {
+			// String of 0/1 characters
+			for _, ch := range obj.str {
+				if ch == '0' {
+					elems = append(elems, vnum(0))
+				} else if ch == '1' {
+					elems = append(elems, vnum(1))
+				} else {
+					return nil, fmt.Errorf("coerce: string contains non-bit character %c", ch)
+				}
+			}
+		} else {
+			elems = seqToList(obj)
+		}
+		// Verify all elements are 0 or 1
+		for i, e := range elems {
+			if e.typ != VNum {
+				return nil, fmt.Errorf("coerce: element %d is not a number", i)
+			}
+			n := toNum(e)
+			if n != 0 && n != 1 {
+				return nil, fmt.Errorf("coerce: element %d is not a bit (%d)", i, int(n))
+			}
 		}
 		arr := &LispArray{dims: []int{len(elems)}, elements: elems, fillPtr: -1, adjustable: false}
 		v := gcv()
@@ -22906,17 +22949,8 @@ var initLib = `
 (define (modulo n d) (- n (* d (ffi "math/floor" (/ n d)))))
 (define (atom x) (not (pair? x)))
 (define (list? x) (or (null? x) (pair? x)))
-(define (butlast lst . n)
-  (let ((n (if (null? n) 1 (car n))))
-    (if (<= n 0) (copy-list lst)
-      (let ((len (length lst)))
-        (if (>= n len) '()
-          (take (- len n) lst))))))
-(define (nbutlast lst . n)
-  (let ((n (if (null? n) 1 (car n))))
-    (cond
-      ((<= n 0) (copy-list lst))
-      (#t (butlast lst n)))))
+; butlast and nbutlast are implemented as Go builtins (builtinButlast, builtinNbutlast)
+; which properly handle both proper and dotted lists.
 (define (last lst . n)
   (let ((n (if (null? n) 1 (car n))))
     (drop (max 0 (- (length lst) n)) lst)))

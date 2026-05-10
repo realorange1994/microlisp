@@ -1048,7 +1048,7 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 			case "ATOM":
 				return val.typ != VPair
 			case "RATIONAL":
-				return val.typ == VRat || val.typ == VNum || val.typ == VBigInt
+				return val.typ == VRat || val.typ == VBigInt || (val.typ == VNum && !val.isFloat)
 			case "COMPLEX":
 				return val.typ == VComplex
 			default:
@@ -1087,7 +1087,7 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 		return val.typ == VNum || val.typ == VRat || val.typ == VBigInt
 	}
 	if typeName == "RATIONAL" {
-		return val.typ == VRat || val.typ == VNum || val.typ == VBigInt
+		return val.typ == VRat || val.typ == VBigInt || (val.typ == VNum && !val.isFloat)
 	}
 	if typeName == "COMPLEX" {
 		return val.typ == VComplex
@@ -1184,6 +1184,15 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 	}
 	if typeName == "LOCK" || typeName == "MUTEX" {
 		return val.typ == VLock
+	}
+	if typeName == "SIMPLE-ARRAY" {
+		return val.typ == VArray || val.typ == VStr
+	}
+	if typeName == "SIMPLE-STRING" {
+		return val.typ == VStr
+	}
+	if typeName == "SIMPLE-VECTOR" {
+		return val.typ == VArray
 	}
 	if typeName == "BIT-VECTOR" || typeName == "SIMPLE-BIT-VECTOR" {
 		// Bit vector: a 1D array of bits
