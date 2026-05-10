@@ -3099,7 +3099,7 @@ evalLoop:
 					}
 					body = body.cdr
 				}
-				return result, nil
+				return multiVal(result, vnil()), nil
 			case "UNWIND-PROTECT":
 				// (unwind-protect protected-form cleanup-form...)
 				if v.cdr == nil || v.cdr.typ != VPair {
@@ -6153,6 +6153,9 @@ var builtins = []builtinDef{
 	{"vector-push", builtinVectorPush},
 	{"vector-pop", builtinVectorPop},
 	{"adjust-array", builtinAdjustArray},
+	{"array-has-fill-pointer-p", builtinArrayHasFillPointerP},
+	{"adjustable-array-p", builtinAdjustableArrayP},
+	{"array-displacement", builtinArrayDisplacement},
 	{"null", builtinNull},
 	{"apply", builtinApply},
 	{"defined?", builtinDefinedP},
@@ -11182,6 +11185,28 @@ func builtinAdjustArray(args []*Value) (*Value, error) {
 	return arr, nil
 }
 
+func builtinArrayHasFillPointerP(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VArray || args[0].array == nil {
+		return vbool(false), nil
+	}
+	return vbool(args[0].array.fillPtr >= 0), nil
+}
+
+func builtinAdjustableArrayP(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VArray || args[0].array == nil {
+		return vbool(false), nil
+	}
+	return vbool(args[0].array.adjustable), nil
+}
+
+func builtinArrayDisplacement(args []*Value) (*Value, error) {
+	if len(args) < 1 || args[0].typ != VArray || args[0].array == nil {
+		return multiVal(vnil(), vbool(false)), nil
+	}
+	// microlisp does not support displaced arrays
+	return multiVal(vnil(), vbool(false)), nil
+}
+
 func builtinNull(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return vbool(true), nil
@@ -13360,16 +13385,16 @@ func builtinGethash(args []*Value) (*Value, error) {
 		defaultVal = args[2]
 	}
 	if ht.typ != VVHash || ht.hashTab == nil {
-		return defaultVal, nil
+		return multiVal(defaultVal, vnil()), nil
 	}
 	h := sxhashVal(key)
 	bucket := ht.hashTab.table[h]
 	for _, entry := range bucket {
 		if hashTableKeyEqual(ht.hashTab, entry.key, key) {
-			return entry.value, nil
+			return multiVal(entry.value, vbool(true)), nil
 		}
 	}
-	return defaultVal, nil
+	return multiVal(defaultVal, vnil()), nil
 }
 
 func builtinSetGethash(args []*Value) (*Value, error) {
@@ -16225,8 +16250,8 @@ func builtinDeleteIf(args []*Value) (*Value, error) {
 	if seq.typ == VNil {
 		return seq, nil
 	}
-	// For strings, delegate to remove-if (strings are immutable in CL)
-	if seq.typ == VStr {
+	// For strings and vectors, delegate to remove-if (non-destructive for vectors)
+	if seq.typ == VStr || seq.typ == VArray {
 		return builtinSeqRemoveIf(args)
 	}
 	if seq.typ != VPair {
@@ -16296,6 +16321,10 @@ func builtinDeleteIfNot(args []*Value) (*Value, error) {
 	if seq.typ == VNil {
 		return seq, nil
 	}
+	// For strings and vectors, delegate to remove-if-not (non-destructive)
+	if seq.typ == VStr || seq.typ == VArray {
+		return builtinSeqRemoveIfNot(args)
+	}
 	if seq.typ != VPair {
 		return nil, fmt.Errorf("delete-if-not: expected a list, got %s", typeStr(seq))
 	}
@@ -16313,6 +16342,10 @@ func builtinDeleteDuplicates(args []*Value) (*Value, error) {
 	seq := args[0]
 	if seq.typ == VNil {
 		return seq, nil
+	}
+	// For vectors and strings, delegate to remove-duplicates (non-destructive)
+	if seq.typ == VArray || seq.typ == VStr {
+		return builtinSeqRemoveDuplicates(args)
 	}
 	if seq.typ != VPair {
 		return nil, fmt.Errorf("delete-duplicates: expected a list, got %s", typeStr(seq))
@@ -17833,7 +17866,7 @@ func builtinNStringUpcase(args []*Value) (*Value, error) {
 				arr.elements[i] = vchar(unicode.ToUpper(elem.ch))
 			}
 		}
-		return vstr(vecToString(v)), nil
+		return v, nil
 	default:
 		return nil, fmt.Errorf("nstring-upcase: need a string")
 	}
@@ -17896,7 +17929,7 @@ func builtinNStringDowncase(args []*Value) (*Value, error) {
 				arr.elements[i] = vchar(unicode.ToLower(elem.ch))
 			}
 		}
-		return vstr(vecToString(v)), nil
+		return v, nil
 	default:
 		return nil, fmt.Errorf("nstring-downcase: need a string")
 	}
@@ -17982,7 +18015,7 @@ func builtinNStringCapitalize(args []*Value) (*Value, error) {
 				prevAlpha = false
 			}
 		}
-		return vstr(vecToString(v)), nil
+		return v, nil
 	default:
 		return nil, fmt.Errorf("nstring-capitalize: need a string")
 	}

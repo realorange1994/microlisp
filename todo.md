@@ -95,10 +95,10 @@
 51. `loop` 不支持解构模式如 `(for (a b) in list)` — 已确认已实现（loop 宏已支持 destr-specs/destructuring-bind 包装解构模式）
 52. `functionp` 谓词函数未实现
 53. `defun` 接受 `(setf name)` 作为函数名 — 已修复
-54. `ignore-errors` 错误时未返回 `(values nil condition)`
+54. `ignore-errors` 错误时未返回 `(values nil condition)` — 已修复（成功时返回 multiVal(result, vnil())，错误时返回 multiVal(vnil(), condition)）
 55. `nth-value` 无法从 VMultiVal 正确提取第 n 个值
 56. `delete-if`/`nsubstitute-if` 谓词函数调用方式错误（eval 而非 callFnOnSeq）
-57. `delete-duplicates` 使用指针相等而非值相等判断重复
+57. `delete-duplicates` 使用指针相等而非值相等判断重复 — 已修复（使用 toString 进行值比较；添加 VArray 和 VStr 委托给 remove-duplicates）
 58. `*random-state*` 未初始化 — 已修复
 59. `coerce` 不支持 `'vector` 和 `'array` 结果类型
 60. `typep` 不处理复合 `vector` 类型说明符如 `(vector *)` 且不识别字符串为 vector/array — 已修复（字符串是 CL 中的 vector 和 array 子类型）
@@ -118,7 +118,7 @@
 74. `string-upcase/downcase/capitalize` 不接受 string designators（符号/字符）
 75. `string-capitalize` 不支持 `:start`/`:end` 关键字参数
 76. `nstring-upcase/downcase/capitalize` 不支持 VArray 和 fill-pointer
-77. `(setf fill-pointer)` 未实现
+77. `(setf fill-pointer)` 未实现 — 已修复（fill-pointer-setf 已注册在 builtin table）
 78. `butlast` 对 dotted list 处理错误
 79. `floor`/`ceiling`/`truncate`/`round` 返回 list 而非 VMultiVal（多值应使用 multiVal 而非 list）— 已修复
 80. `=`/`/=` 等数值比较对复数只比较实部（`compareNumeric` 忽略虚部）— 已修复
@@ -256,3 +256,15 @@
 144. `prog`/`prog*` 宏未实现 — 已修复（添加 defmacro 定义，展开为 `(block nil (let/let* bindings (tagbody body)))`，变量无初始化时默认为 nil）
 
 145. `set-dispatch-macro-character` 注册的 dispatch 函数未被 parser 调用 — 已修复（添加 TSharpMacro token 类型，lexer 检查 currentReadtable.dispFns 并匹配用户注册的字符，parser 的 invokeDispatchMacro 调用 (function stream sub-char)）
+
+## 新修复的 Bug（本次会话 — 第四轮）
+
+146. `ignore-errors` 成功时未返回 `(values result nil)` — 已修复（成功路径返回 multiVal(result, vnil())，错误路径返回 multiVal(vnil(), condition)）
+
+147. `nstring-upcase/downcase/capitalize` 对 VArray 输入返回字符串而非修改后的数组 — 已修复（VArray 分支返回 v 而非 vstr(vecToString(v))）
+
+148. `delete-duplicates`/`delete-if`/`delete-if-not` 不支持向量输入 — 已修复（对 VArray/VStr 输入委托给 remove-duplicates/remove-if/remove-if-not）
+
+149. `gethash` 未返回 `(values value present-p)` 双值 — 已修复（找到时返回 multiVal(value, vbool(true))，未找到时返回 multiVal(default, vnil())）
+
+150. `array-has-fill-pointer-p`/`adjustable-array-p`/`array-displacement` 未实现 — 已修复（添加 builtinArrayHasFillPointerP、builtinAdjustableArrayP、builtinArrayDisplacement）
