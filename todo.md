@@ -62,7 +62,7 @@
 19. `nil` 类型说明符被错误当作 `null`（ANSI CL 中 nil 是空类型，null 才匹配 nil）
 20. `subtypep` 不支持复合 CONS 类型说明符（如 `(cons integer *)`）
 21. `compile` 返回值被包装成 VPair 而非 VMultiVal
-22. `make-sequence` 不接受 `:initial-element` 关键字
+22. `make-sequence` 不接受 `:initial-element` 关键字 — 已修复（实现 `builtinMakeSequence`，支持 list/vector/string/bit-vector 类型及 `:initial-element` 关键字）
 23. `subseq` 对字符串返回 nil 而非子字符串
 24. `nreverse` 对列表原地修改但返回错误结果
 25. `defmacro` 的 `&optional`/`&key`/`&aux` 参数默认值未求值（参数名被提取，但无参数时使用 nil 而非默认值）
@@ -78,7 +78,7 @@
 35. `ignore-errors` 出错时返回 `(nil . condition)` 而非 `nil`
 36. `destructuring-bind` 不支持 `&rest`/`&body`/`&optional`/`&key`（`&rest` 被当作普通变量绑定到错误值）
 
-37. Go 词法分析器对超出 float64 尾数精度的大整数（>2^53）丢失精度
+37. Go 词法分析器对超出 float64 尾数精度的大整数（>2^53）丢失精度 — 已修复（`compareNumeric` 添加 `toBigIntExact` 和 `toBigRat` 辅助函数，使用 `big.Int.Cmp` 和 `big.Rat.Cmp` 进行精确比较）
 38. setf 对未绑定变量报错而非创建全局绑定（ANSI CL 语义）
 39. `destructuring-bind` 的 `&key` 使用位置绑定而非关键字匹配
 40. `butlast` 对 n<=0 返回原列表而非副本
@@ -104,7 +104,7 @@
 60. `typep` 不处理复合 `vector` 类型说明符如 `(vector *)` 且不识别字符串为 vector/array — 已修复（字符串是 CL 中的 vector 和 array 子类型）
 61. `logand`/`logior`/`logxor` 对非整数参数静默转为0而非报type-error — 已修复（已有 `isIntegerValue` 检查和 `signalTypeError` 返回）
 62. `(setf (values ...) ...)` 未实现
-63. `char-name` 对 C1 控制字符（128-159）返回 nil
+63. `char-name` 对 C1 控制字符（128-159）返回 nil — 已修复（返回 "C128"、"C129" 等实现定义名称，C0 未命名控制字符也返回 "C0"、"C1" 等）
 64. `type-of` 返回 `"unknown"` 对于 `pathname`、`random-state`、`array`、`integer`（大整数）类型
 65. `typep`/`subtypep` 类型比较大小写不敏感问题（符号名大写后比较失败）
 66. `destructuring-bind` 的 Go 实现中 lambda-list 关键字大小写不匹配（`&rest` vs `&REST`）

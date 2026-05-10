@@ -6342,6 +6342,7 @@ var builtins = []builtinDef{
 	{"get-properties", builtinGetProperties},
 	{"make-string", builtinMakeString},
 	{"make-list", builtinMakeList},
+	{"make-sequence", builtinMakeSequence},
 	{"random", builtinRandom},
 	{"nstring-upcase", builtinNStringUpcase},
 	{"nstring-downcase", builtinNStringDowncase},
@@ -7261,22 +7262,77 @@ func toBigInt(v *Value) *big.Int {
 	return nil
 }
 
+// toBigIntExact converts a Value to *big.Int if it is an exact integer.
+// Returns nil for non-integer types (float, rational, complex).
+func toBigIntExact(v *Value) *big.Int {
+	switch v.typ {
+	case VNum:
+		if !v.isFloat && v.num == math.Trunc(v.num) && !math.IsInf(v.num, 0) {
+			return big.NewInt(int64(v.num))
+		}
+	case VRat:
+		if v.iden == 1 {
+			return big.NewInt(v.irat)
+		}
+	case VBigInt:
+		return new(big.Int).Set(v.bigInt)
+	}
+	return nil
+}
+
+// toBigRat converts a Value to big.Rat for exact rational comparison.
+func toBigRat(v *Value) big.Rat {
+	switch v.typ {
+	case VNum:
+		return *big.NewRat(int64(v.num), 1)
+	case VRat:
+		return *big.NewRat(v.irat, v.iden)
+	case VBigInt:
+		r := new(big.Rat).SetInt(v.bigInt)
+		return *r
+	}
+	return *big.NewRat(0, 1)
+}
+
 // compareNumeric returns -1 if a < b, 0 if a == b, 1 if a > b.
-// Uses big.Int when any operand is VBigInt for exact comparison.
 func compareNumeric(a, b *Value) int {
 	// Handle complex numbers specially - need to compare both parts
-	aReal, aImag := toComplexParts(a)
-	bReal, bImag := toComplexParts(b)
+	if a.typ == VComplex || b.typ == VComplex {
+		aReal, aImag := toComplexParts(a)
+		bReal, bImag := toComplexParts(b)
+		if aReal < bReal {
+			return -1
+		}
+		if aReal > bReal {
+			return 1
+		}
+		if aImag < bImag {
+			return -1
+		}
+		if aImag > bImag {
+			return 1
+		}
+		return 0
+	}
+	// Use big.Int for exact comparison when either operand is VBigInt
+	aBi := toBigIntExact(a)
+	bBi := toBigIntExact(b)
+	if aBi != nil && bBi != nil {
+		return aBi.Cmp(bBi)
+	}
+	// Use big.Rat for exact comparison when either operand is VRat
+	if a.typ == VRat || b.typ == VRat {
+		aRat := toBigRat(a)
+		bRat := toBigRat(b)
+		return aRat.Cmp(&bRat)
+	}
+	// Fall back to float64 comparison
+	aReal, _ := toComplexParts(a)
+	bReal, _ := toComplexParts(b)
 	if aReal < bReal {
 		return -1
 	}
 	if aReal > bReal {
-		return 1
-	}
-	if aImag < bImag {
-		return -1
-	}
-	if aImag > bImag {
 		return 1
 	}
 	return 0
@@ -8305,12 +8361,12 @@ func builtinCharName(args []*Value) (*Value, error) {
 		if _, ok := charNameMapRev[ch]; ok {
 			// handled above
 		} else {
-			return vstr("control"), nil
+			return vstr(fmt.Sprintf("C%d", ch)), nil
 		}
 	}
-	// C1 control characters (128-159)
+	// C1 control characters (128-159): return "C128", "C129", etc.
 	if ch >= 128 && ch < 160 {
-		return vstr("control"), nil
+		return vstr(fmt.Sprintf("C%d", ch)), nil
 	}
 	// Other non-printing characters (e.g. NBSP, soft hyphen)
 	if !unicode.IsPrint(ch) {
@@ -17337,6 +17393,89 @@ func builtinMakeList(args []*Value) (*Value, error) {
 		result[i] = initVal
 	}
 	return listFromSlice(result), nil
+}
+
+// -------- make-sequence --------
+func builtinMakeSequence(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("make-sequence: need type and size")
+	}
+	typeVal := args[0]
+	size := int(toNum(args[1]))
+	initVal := vnil()
+	for i := 2; i < len(args); i++ {
+		if args[i].typ == VSym && strings.EqualFold(args[i].str, ":INITIAL-ELEMENT") {
+			if i+1 < len(args) {
+				i++
+				initVal = args[i]
+			}
+		}
+	}
+
+	typeName := ""
+	switch typeVal.typ {
+	case VSym:
+		typeName = typeVal.str
+	case VStr:
+		typeName = typeVal.str
+	default:
+		typeName = toString(typeVal)
+	}
+	typeName = strings.ToUpper(typeName)
+
+	switch typeName {
+	case "LIST", "CONS", "NULL":
+		result := make([]*Value, size)
+		for i := range result {
+			result[i] = initVal
+		}
+		return listFromSlice(result), nil
+	case "VECTOR", "SIMPLE-VECTOR", "ARRAY", "SIMPLE-ARRAY":
+		return makeArrayWithInit(size, initVal), nil
+	case "STRING", "SIMPLE-STRING", "BASE-STRING":
+		var ch rune = ' '
+		if initVal.typ == VChar {
+			ch = initVal.ch
+		} else if initVal.typ == VStr && len(initVal.str) > 0 {
+			ch = []rune(initVal.str)[0]
+		} else if initVal.typ == VSym && len(initVal.str) > 0 {
+			ch = []rune(initVal.str)[0]
+		} else if !isNil(initVal) {
+			return nil, fmt.Errorf("make-sequence: :initial-element is not a character designator: %s", toString(initVal))
+		}
+		return vstr(strings.Repeat(string(ch), size)), nil
+	case "BIT-VECTOR", "SIMPLE-BIT-VECTOR":
+		var bitVal int
+		if initVal.typ == VNum {
+			bitVal = int(initVal.num)
+			if bitVal != 0 && bitVal != 1 {
+				return nil, fmt.Errorf("make-sequence: bit must be 0 or 1")
+			}
+		}
+		elems := make([]*Value, size)
+		for i := range elems {
+			elems[i] = vnum(float64(bitVal))
+		}
+		arr := &LispArray{dims: []int{size}, elements: elems, adjustable: false}
+		v := gcv()
+		v.typ = VArray
+		v.array = arr
+		return v, nil
+	default:
+		return nil, fmt.Errorf("make-sequence: unsupported type: %s", typeName)
+	}
+}
+
+func makeArrayWithInit(size int, initVal *Value) *Value {
+	elems := make([]*Value, size)
+	for i := range elems {
+		elems[i] = initVal
+	}
+	arr := &LispArray{dims: []int{size}, elements: elems, adjustable: false}
+	v := gcv()
+	v.typ = VArray
+	v.array = arr
+	return v
 }
 
 // -------- random --------
