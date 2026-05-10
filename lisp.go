@@ -2071,13 +2071,12 @@ func (p *Parser) readExpr() (*Value, error) {
 			imagVal, err2 := parseFloatStr(imagStr)
 			if err1 == nil && err2 == nil {
 				p.advance()
+				hasFloat := strings.ContainsAny(realStr, ".eEdDfFsSlL") || strings.ContainsAny(imagStr, ".eEdDfFsSlL")
 				v := vcomplex(realVal, imagVal)
 				// Mark as float if either part was written as a float literal
-				if v.typ == VComplex {
-					hasFloat := strings.ContainsAny(realStr, ".eEdDfFsSlL") || strings.ContainsAny(imagStr, ".eEdDfFsSlL")
-					if hasFloat {
-						v.isFloat = true
-					}
+				// (covers both VComplex and simplified VNum results)
+				if hasFloat {
+					v.isFloat = true
 				}
 				return v, nil
 			}
@@ -6321,6 +6320,8 @@ var builtins = []builtinDef{
 	{"warn", builtinWarn},
 	{"signal", builtinSignal},
 	{"invoke-restart", builtinInvokeRestart},
+	{"%associate-restarts-with-condition", builtinAssociateRestarts},
+	{"%dissociate-restarts-with-condition", builtinDissociateRestarts},
 	{"abort", builtinAbort},
 	{"continue", builtinContinue},
 	{"muffle-warning", builtinMuffleWarning},
@@ -21134,8 +21135,26 @@ func princToString(v *Value) string {
 			return "#t"
 		}
 		return "#f"
-	case VPair, VArray, VInstance:
+	case VPair, VArray:
 		// Use writeToString for circular reference detection
+		return writeToString(v)
+	case VInstance:
+		// Check if this is a condition instance with format-control/format-arguments
+		if v.instClass != nil && classHasAncestor(v.instClass, "condition") {
+			fc := instanceSlotWithInheritance(v, "format-control")
+			fa := instanceSlotWithInheritance(v, "format-arguments")
+			if fc != nil && fc.typ == VStr && len(fc.str) > 0 {
+				var args []*Value
+				if fa != nil && fa.typ != VNil {
+					cur := fa
+					for cur.typ == VPair {
+						args = append(args, cur.car)
+						cur = cur.cdr
+					}
+				}
+				return formatMessage(fc.str, args)
+			}
+		}
 		return writeToString(v)
 	default:
 		return toString(v)
@@ -23473,8 +23492,11 @@ var initLib = `
      (list '() '() (list (gensym "store-")) (quote (progn))))))
 
 ;; -------- Standard Condition Classes --------
-;; ANSI CL condition hierarchy with appropriate slots
-(defclass condition () (message format-arguments format-control))
+;; ANSI CL condition hierarchy with appropriate slots and initargs
+(defclass condition ()
+  ((message :initform nil :initarg :message)
+   (format-arguments :initform () :initarg :format-arguments)
+   (format-control :initform nil :initarg :format-control)))
 
 (defclass serious-condition (condition) ())
 
@@ -23484,29 +23506,41 @@ var initLib = `
 (defclass warning (condition) ())
 (defclass simple-warning (warning) ())
 
-(defclass type-error (error) (datum expected-type))
+(defclass type-error (error)
+  ((datum :initform nil :initarg :datum)
+   (expected-type :initform nil :initarg :expected-type)))
 (defclass simple-type-error (type-error) ())
 
 (defclass program-error (error) ())
 (defclass division-by-zero (error) ())
-(defclass arithmetic-error (error) (operation))
+(defclass arithmetic-error (error)
+  ((operation :initform nil :initarg :operation)
+   (operands :initform () :initarg :operands)))
 (defclass control-error (error) ())
-(defclass stream-error (error) (stream))
+(defclass stream-error (error)
+  ((stream :initform nil :initarg :stream)))
 (defclass end-of-file (stream-error) ())
-(defclass file-error (error) (file-pathname))
-(defclass package-error (condition) (package))
+(defclass file-error (error)
+  ((pathname :initform nil :initarg :pathname)))
+(defclass package-error (condition)
+  ((package :initform nil :initarg :package)))
 (defclass reader-error (stream-error) ())
 
 (defclass break (serious-condition) ())
 (defclass style-warning (warning) ())
 (defclass storage-condition (serious-condition) ())
-(defclass cell-error (error) (name))
+(defclass cell-error (error)
+  ((name :initform nil :initarg :name)))
 (defclass unbound-variable (cell-error) ())
-(defclass unbound-slot (cell-error) (instance))
+(defclass unbound-slot (cell-error)
+  ((instance :initform nil :initarg :instance)))
 (defclass undefined-function (cell-error) ())
 (defclass parse-error (error) ())
-(defclass print-not-readable (error) (object))
-(defclass simple-condition (condition) (format-control format-arguments))
+(defclass print-not-readable (error)
+  ((object :initform nil :initarg :object)))
+(defclass simple-condition (condition)
+  ((format-control :initform nil :initarg :format-control)
+   (format-arguments :initform () :initarg :format-arguments)))
 
 ;; -------- Condition Accessor Functions --------
 (define (condition-message c) (slot-value c 'message))
@@ -23527,6 +23561,28 @@ var initLib = `
 ;; program-error, division-by-zero, arithmetic-error
 ;; control-error, stream-error, end-of-file
 ;; file-error, package-error, reader-error
+
+;; -------- with-condition-restarts macro --------
+(defmacro with-condition-restarts (cond-form restarts-form &body body)
+  (let ((cond-var (gensym "cond"))
+        (restarts-var (gensym "restarts")))
+    (list 'let
+          (list (list cond-var cond-form)
+                (list restarts-var restarts-form))
+          (list 'unwind-protect
+                (list 'progn
+                      (list '%associate-restarts-with-condition cond-var restarts-var)
+                      (cons 'progn body))
+                (list '%dissociate-restarts-with-condition cond-var restarts-var)))))
+
+;; -------- Standard Condition Accessor Functions --------
+(defun type-error-datum (c) (slot-value c 'datum))
+(defun type-error-expected-type (c) (slot-value c 'expected-type))
+(defun stream-error-stream (c) (slot-value c 'stream))
+(defun file-error-pathname (c) (slot-value c 'pathname))
+(defun arithmetic-error-operation (c) (slot-value c 'operation))
+(defun arithmetic-error-operands (c) (slot-value c 'operands))
+(defun package-error-package (c) (slot-value c 'package))
 
 `
 

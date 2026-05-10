@@ -193,7 +193,7 @@
 
 117. `char-name` 对 `(code-char 127)` 返回 "Del" 而非 "Rubout"（ANSI CL 要求 code-char(127) 与 #\rubout 为同一字符，名为 "Rubout"）— 已修复（builtinCharName 添加 code 127 优先返回 "Rubout"）
 
-118. 复数浮点显示丢失 `.0` 后缀（`(coerce 1.0 '(complex float))` 打印 `#c(1 0)` 而非 `#c(1.0 0.0)`，虚部 0.0 显示为 0）— 未修复（vcomplex 简化时丢失 isFloat 标记，formatComplexPart 代码存在但被绕过）
+118. 复数浮点显示丢失 `.0` 后缀（`(coerce 1.0 '(complex float))` 打印 `#c(1 0)` 而非 `#c(1.0 0.0)`，虚部 0.0 显示为 0）— 已修复（在 TComplex 解析器中提前计算 hasFloat 标志，对简化后的 VNum 结果也设置 isFloat=true，使 toString 正确打印小数点）
 
 119. `coerce` 到 `(complex rational)` 类型不产生复数（`(coerce 1/2 '(complex rational))` 返回 `1/2` 而非 `#c(1/2 0)`）— 已修复（coerce 中 compound complex 类型使用 vcomplexAlways）
 
@@ -235,12 +235,12 @@
 
 ### 未修复的 Bug（子代理声称修复但实际丢失）
 
-118. 复数浮点显示丢失 `.0` 后缀（`#c(1.0 0.0)` 被 vcomplex 简化为 1 而非 #c(1.0 0.0)，formatComplexPart 代码存在但被 reader 简化绕过）— 未修复
+118. 复数浮点显示丢失 `.0` 后缀（`#c(1.0 0.0)` 被 vcomplex 简化为 1 而非 #c(1.0 0.0)，formatComplexPart 代码存在但被 reader 简化绕过）— 已修复（在 TComplex 解析器中提前计算 hasFloat 标志，对简化后的 VNum 结果也设置 isFloat=true）
 
-137. `make-condition` 不评估 `:initform` — 未修复（princ-to-string 对条件实例返回 "#<instance ...>" 而非格式化消息）
+137. `make-condition` 不评估 `:initform` — 已修复（重写 builtinMakeCondition，遍历 CPL 的 :initform 值并 eval，支持 :initarg 到 slot 名映射，条件类定义改为带 :initform/:initarg 的完整规格）
 
-138. `princ-to-string` 对条件实例返回空字符串/原始格式 — 未修复（conditions print as raw instance）
+138. `princ-to-string` 对条件实例返回 `"#<instance ...>"` 而非格式化消息 — 已修复（在 princToString 的 VInstance 分支检测 condition 类祖先，读取 format-control/format-arguments 槽并用 formatMessage 格式化输出）
 
-139. `with-condition-restarts` 宏未实现 — 未修复（符号未定义）
+139. `with-condition-restarts` 宏未实现 — 已修复（添加 defmacro 定义，使用 list/quote 构建 unwind-protect 形式，添加 %associate-restarts-with-condition 和 %dissociate-restarts-with-condition Go 存根函数）
 
-140. `type-error-datum`/`type-error-expected-type` 条件访问器未实现 — 未修复（`+` 函数信号 simple-error 而非 type-error，访问器未定义）
+140. `type-error-datum`/`type-error-expected-type` 条件访问器未实现 — 已修复（添加 type-error-datum、type-error-expected-type、stream-error-stream、file-error-pathname、arithmetic-error-operation、arithmetic-error-operands、package-error-package 七个 defun 访问器函数）

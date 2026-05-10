@@ -106,6 +106,66 @@ func findClass(name string) *Value {
 	return globalEnv.bindings[name]
 }
 
+// instanceSlotWithInheritance looks up a slot value on an instance,
+// walking up the class hierarchy to find inherited slot values.
+func instanceSlotWithInheritance(inst *Value, slotName string) *Value {
+	if inst.typ != VInstance || inst.instClass == nil {
+		return nil
+	}
+	upperName := strings.ToUpper(slotName)
+	// Check instance's own slots first
+	if inst.instSlots != nil {
+		if v, ok := inst.instSlots[upperName]; ok {
+			return v
+		}
+	}
+	// Check inherited slots by walking class CPL
+	if inst.instClass.cpl != nil {
+		for _, cls := range inst.instClass.cpl {
+			if cls.typ == VClass && cls.body != nil && cls.body.typ == VPair {
+				if v := findSlotInitformRec(cls.body, upperName); v != nil {
+					return v
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// findSlotInitformRec walks a slot definition list looking for a slot with the given name
+// and returns its :initform value if found.
+func findSlotInitformRec(slotDefs *Value, slotName string) *Value {
+	for !isNil(slotDefs) {
+		slot := slotDefs.car
+		var specName string
+		var options *Value
+		if slot.typ == VSym {
+			specName = slot.str
+			options = nil
+		} else if slot.typ == VPair && slot.car != nil {
+			if slot.car.typ == VSym {
+				specName = slot.car.str
+			}
+			options = slot.cdr
+		}
+		if specName == slotName {
+			// Parse options for :initform
+			for !isNil(options) {
+				opt := options.car
+				if opt.typ == VSym && strings.EqualFold(opt.str, ":INITFORM") {
+					if options.cdr != nil && options.cdr.typ == VPair {
+						return options.cdr.car
+					}
+				}
+				options = options.cdr
+			}
+			return nil // slot found but no :initform
+		}
+		slotDefs = slotDefs.cdr
+	}
+	return nil
+}
+
 // signalDivisionByZero creates a division-by-zero condition and checks handlers.
 // If a handler catches it, panics with handledError. Otherwise returns a fallback error.
 func signalDivisionByZero() error {
@@ -523,22 +583,158 @@ func builtinMakeCondition(args []*Value) (*Value, error) {
 	} else if typeVal.typ == VInstance && typeVal.instClass != nil {
 		typeName = typeVal.instClass.str
 	}
-	cond := gcv()
-	cond.typ = VInstance
-	cond.instClass = findClass(typeName)
-	if cond.instClass == nil {
-		cond.instClass = findClass("condition")
-	}
-	cond.instSlots = map[string]*Value{}
-	for i := 1; i+1 < len(args); i += 2 {
-		key := primaryValue(args[i])
-		if key.typ == VSym && len(key.str) > 0 && key.str[0] == ':' {
-			cond.instSlots[key.str[1:]] = primaryValue(args[i+1])
-		} else if key.typ == VSym {
-			cond.instSlots[key.str] = primaryValue(args[i+1])
+	cls := findClass(typeName)
+	if cls == nil || cls.typ != VClass {
+		cls = findClass("condition")
+		if cls == nil {
+			return nil, fmt.Errorf("make-condition: unknown class %s", typeName)
 		}
 	}
+
+	cond := gcv()
+	cond.typ = VInstance
+	cond.instClass = cls
+	cond.instSlots = map[string]*Value{}
+
+	// Apply :initform values from class slots (walk CPL in reverse for proper precedence)
+	if cls.cpl != nil {
+		for i := len(cls.cpl) - 1; i >= 0; i-- {
+			c := cls.cpl[i]
+			if c.typ == VClass && c.body != nil {
+				applySlotInitforms(cond, c.body)
+			}
+		}
+	}
+	// Also apply this class's own slot initforms
+	if cls.body != nil {
+		applySlotInitforms(cond, cls.body)
+	}
+
+	// Apply keyword initargs (these override initforms)
+	for i := 1; i+1 < len(args); i += 2 {
+		key := primaryValue(args[i])
+		val := primaryValue(args[i+1])
+		if key.typ == VSym {
+			slotName := key.str
+			if len(slotName) > 0 && slotName[0] == ':' {
+				slotName = slotName[1:]
+			}
+			// Resolve initarg to slot name (in case initarg differs from slot name)
+			resolved := resolveInitargToSlot(cls, slotName)
+			if resolved != "" {
+				slotName = resolved
+			}
+			cond.instSlots[strings.ToUpper(slotName)] = val
+		} else if key.typ == VSym {
+			cond.instSlots[key.str] = val
+		}
+	}
+
 	return cond, nil
+}
+
+// applySlotInitforms evaluates and applies :initform values from a class's slot definitions
+func applySlotInitforms(inst *Value, slotDefs *Value) {
+	for !isNil(slotDefs) {
+		slot := slotDefs.car
+		var slotName string
+		var options *Value
+		if slot.typ == VSym {
+			slotName = slot.str
+			options = nil
+		} else if slot.typ == VPair && slot.car != nil {
+			if slot.car.typ == VSym {
+				slotName = slot.car.str
+			}
+			options = slot.cdr
+		} else {
+			slotDefs = slotDefs.cdr
+			continue
+		}
+
+		// Parse slot options for :initform
+		if options != nil {
+			optCur := options
+			for !isNil(optCur) {
+				opt := optCur.car
+				if opt.typ == VSym && strings.EqualFold(opt.str, ":INITFORM") {
+					if optCur.cdr != nil && optCur.cdr.typ == VPair {
+						initVal := optCur.cdr.car
+						// Evaluate the initform if it's a form
+						if initVal.typ == VPair || (initVal.typ == VSym && initVal.str != "NIL" && initVal.str != "T") {
+							evaled, err := eval(initVal, globalEnv)
+							if err == nil {
+								initVal = evaled
+							}
+						}
+						inst.instSlots[strings.ToUpper(slotName)] = initVal
+					}
+					break
+				}
+				optCur = optCur.cdr
+			}
+		}
+
+		slotDefs = slotDefs.cdr
+	}
+}
+
+// resolveInitargToSlot maps an initarg keyword to its slot name in the class hierarchy
+func resolveInitargToSlot(cls *Value, initarg string) string {
+	classes := []*Value{cls}
+	if cls.cpl != nil {
+		classes = append(classes, cls.cpl...)
+	}
+	for _, c := range classes {
+		if c.typ == VClass && c.body != nil {
+			if name := findSlotNameForInitarg(c.body, initarg); name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// findSlotNameForInitarg searches slot definitions for an :initarg matching the given keyword
+func findSlotNameForInitarg(slotDefs *Value, initarg string) string {
+	for !isNil(slotDefs) {
+		slot := slotDefs.car
+		var slotName string
+		var options *Value
+		if slot.typ == VSym {
+			slotName = slot.str
+			options = nil
+		} else if slot.typ == VPair && slot.car != nil {
+			if slot.car.typ == VSym {
+				slotName = slot.car.str
+			}
+			options = slot.cdr
+		} else {
+			slotDefs = slotDefs.cdr
+			continue
+		}
+
+		// Check if any :initarg matches
+		if options != nil {
+			optCur := options
+			for !isNil(optCur) {
+				opt := optCur.car
+				if opt.typ == VSym {
+					optStr := opt.str
+					if strings.HasPrefix(optStr, ":") {
+						optStr = optStr[1:]
+					}
+					if strings.EqualFold(optStr, initarg) && !strings.EqualFold(optStr, "INITFORM") {
+						return slotName
+					}
+				}
+				optCur = optCur.cdr
+			}
+		}
+
+		slotDefs = slotDefs.cdr
+	}
+	return ""
 }
 
 // -------- typep --------
@@ -1092,4 +1288,21 @@ func goErrorToCondition(err error) *Value {
 		"format-arguments": vnil(),
 	}
 	return cond
+}
+// -------- with-condition-restarts support builtins --------
+
+// builtinAssociateRestarts associates restart objects with a condition.
+// Called by the with-condition-restarts macro.
+func builtinAssociateRestarts(args []*Value) (*Value, error) {
+	// Stub: in a full implementation, this would link restartEntry.condition
+	// in the restartStack to the given condition. For now, the restart-case
+	// mechanism already auto-associates restarts via conditionError wrapping.
+	return vnil(), nil
+}
+
+// builtinDissociateRestarts removes condition associations from restart objects.
+// Called by the with-condition-restarts macro's cleanup form.
+func builtinDissociateRestarts(args []*Value) (*Value, error) {
+	// Stub: cleanup is handled by unwind-protect naturally.
+	return vnil(), nil
 }
