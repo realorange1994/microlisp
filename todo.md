@@ -149,3 +149,13 @@
 98. `destructuring-bind` 不支持 `&key` 的 supplied-p 变量（如 `(destructuring-bind (&key (x (funcall x) x-supplied)) () ...)` 报 "undefined: X-SUPPLIED"）— 未修复（需要修改 `destructuringBind` 参数解析逻辑）
 
 99. `destructuring-bind` 的 `&key` 默认值不生效（如 `(destructuring-bind (&key (a 99)) () a)` 返回 `nil` 而非 `99`）— 未修复
+
+100. `character` 函数未实现（ANSI CL 标准函数，接受字符设计符返回字符）— 已修复（添加 `builtinCharacter`）
+
+101. `constantp` 函数未实现（ANSI CL 标准函数，检查形式是否为常量）— 已修复（添加 `builtinConstantp` 和 `isConstant` 辅助函数）
+
+102. `coerce` 的 `character` 类型不支持符号设计符（如 `(coerce 'a 'character)` 应返回 `#\A`）— 已修复（添加 VSym 单字符符号支持）
+
+103. `coerce` 的 `character` 类型对多字符字符串应报错而非静默取首字符 — 已修复（添加长度>1的错误检查）
+
+104. `coerce` 不支持 `simple-vector` 结果类型 — 已修复（添加到 `vector` case 的同组处理）

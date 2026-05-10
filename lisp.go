@@ -6245,6 +6245,8 @@ var builtins = []builtinDef{
 	{"file-length", builtinFileLength},
 	{"file-position", builtinFilePosition},
 	{"truename", builtinTruename},
+	{"character", builtinCharacter},
+	{"constantp", builtinConstantp},
 }
 
 // -------- Pathname helpers --------
@@ -19261,11 +19263,18 @@ func builtinCoerce(args []*Value) (*Value, error) {
 		if obj.typ == VChar {
 			return obj, nil
 		}
-		if obj.typ == VStr && len(obj.str) > 0 {
+		if obj.typ == VStr && len(obj.str) == 1 {
 			return vchar([]rune(obj.str)[0]), nil
+		}
+		if obj.typ == VStr && len(obj.str) > 1 {
+			return nil, fmt.Errorf("coerce: string has more than one character")
 		}
 		if obj.typ == VNum {
 			return vchar(rune(int(toNum(obj)))), nil
+		}
+		// Symbol designator: (coerce 'a 'character) => #\a
+		if obj.typ == VSym && len(obj.str) == 1 {
+			return vchar(rune(obj.str[0])), nil
 		}
 		return nil, fmt.Errorf("coerce: cannot coerce to character")
 	case "standard-char", "base-char", ":standard-char", ":base-char":
@@ -19306,7 +19315,7 @@ func builtinCoerce(args []*Value) (*Value, error) {
 		return vnum(math.Floor(n)), nil
 	case "sequence", ":sequence":
 		return obj, nil
-	case "vector", ":vector":
+	case "vector", ":vector", "simple-vector", ":simple-vector":
 		if obj.typ == VArray && len(obj.array.dims) == 1 {
 			return obj, nil
 		}
@@ -19348,6 +19357,60 @@ func stringToCharList(s string) []*Value {
 		result[i] = vchar(r)
 	}
 	return result
+}
+
+// character takes a character designator and returns the character.
+// Designators: character, string of length 1, symbol of length 1, integer (code point).
+func builtinCharacter(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("character: need a character designator")
+	}
+	designator := args[0]
+	if designator.typ == VChar {
+		return designator, nil
+	}
+	if designator.typ == VStr && len(designator.str) == 1 {
+		return vchar([]rune(designator.str)[0]), nil
+	}
+	if designator.typ == VNum {
+		return vchar(rune(int(toNum(designator)))), nil
+	}
+	if designator.typ == VSym && len(designator.str) == 1 {
+		return vchar(rune(designator.str[0])), nil
+	}
+	return nil, fmt.Errorf("character: %v is not a character designator", designator)
+}
+
+// constantp returns true if the form is a constant at compile time.
+// Constants are: numbers, characters, strings, symbols with constant values,
+// and lists whose car is a special operator like quote.
+func builtinConstantp(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("constantp: need a form")
+	}
+	form := args[0]
+	if isConstant(form) {
+		return vbool(true), nil
+	}
+	return vbool(false), nil
+}
+
+func isConstant(v *Value) bool {
+	if v == nil {
+		return false
+	}
+	// Numbers, characters, strings are self-evaluating constants
+	if v.typ == VNum || v.typ == VChar || v.typ == VStr {
+		return true
+	}
+	// Quoted forms: (quote x)
+	if isPair(v) && v.car != nil && v.car.typ == VSym {
+		symName := v.car.str
+		if symName == "QUOTE" || symName == "FUNCTION" {
+			return true
+		}
+	}
+	return false
 }
 
 func builtinIsqrt(args []*Value) (*Value, error) {
