@@ -1153,7 +1153,9 @@ type Lexer struct {
 	src []rune
 	pos int
 	tok Tok
-	err error
+	err   error
+	parser *Parser
+	bitVec *Value
 }
 
 func lex(s string) *Lexer { return &Lexer{src: []rune(s)} }
@@ -1276,6 +1278,30 @@ func (l *Lexer) next() Tok {
 			}
 			// Not followed by string, treat #P as symbol
 			return l.lexSym()
+		}
+		if l.pos < len(l.src) && l.src[l.pos] == '*' {
+			// #*1010 is bit-vector literal
+			l.pos++
+			start := l.pos
+			for l.pos < len(l.src) && (l.src[l.pos] == '0' || l.src[l.pos] == '1') {
+				l.pos++
+			}
+			bits := string(l.src[start:l.pos])
+			elements := make([]*Value, len(bits))
+			for i := 0; i < len(bits); i++ {
+				if bits[i] == '1' {
+					elements[i] = vnum(1)
+				} else {
+					elements[i] = vnum(0)
+				}
+			}
+			arr := &LispArray{dims: []int{len(elements)}, elements: elements, fillPtr: -1}
+			v := gcv()
+			v.typ = VArray
+			v.array = arr
+			l.tok = Tok{typ: TVector, lit: "/*bitvec*/", pos: p}
+			l.bitVec = v
+			return l.tok
 		}
 		if l.pos < len(l.src) && l.src[l.pos] == '(' {
 			// #(...) is vector literal
@@ -2011,6 +2037,12 @@ func (p *Parser) readExpr() (*Value, error) {
 	case TVector:
 		// #(elem1 elem2 ...) - parse vector literal
 		inner := p.tok.lit
+		// Check for bit-vector sentinel (#*1010 produces this)
+		if inner == "/*bitvec*/" && p.l.bitVec != nil {
+			bv := p.l.bitVec
+			p.advance()
+			return bv, nil
+		}
 		p.advance()
 		// Parse inner contents as a list of expressions
 		innerParser := &Parser{l: lex(inner), ptoks: make([]Tok, 0, 64), readtable: currentReadtable, env: globalEnv}
@@ -11178,7 +11210,7 @@ func builtinMacroexpand(args []*Value) (*Value, error) {
 			if e != nil {
 				return nil, fmt.Errorf("macroexpand: %s", e)
 			}
-			return expanded, nil
+			return list(vsym("quote"), expanded), nil
 		}
 		return form, nil
 	}
@@ -12640,7 +12672,22 @@ func sxhashSeen(v *Value, seen map[*Value]bool) uint64 {
 		}
 		return h
 	case VPair:
-		return sxhashSeen(v.car, seen)*31 + sxhashSeen(v.cdr, seen)
+		h := uint64(0x9e3779b97f4a7c15) // golden ratio constant for mixing
+		h ^= sxhashSeen(v.car, seen)
+		h *= 31
+		h += sxhashSeen(v.cdr, seen)
+		h ^= (h >> 33)
+		return h
+	case VArray:
+		if v.array == nil {
+			return 0
+		}
+		h := uint64(0x517cc1b727220a95) // different seed for arrays
+		for _, elem := range v.array.elements {
+			h = h*31 + sxhashSeen(elem, seen)
+		}
+		h ^= (h >> 33)
+		return h
 	case VVHash:
 		return 3 // pointer-based
 	default:

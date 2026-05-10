@@ -200,3 +200,23 @@
 121. `format ~s` 打印符号大写（`foo` 打印为 `FOO`，CL 默认应保持读取时的大小写）— 非Bug（CL reader 默认大写化符号名，~s 打印大写是正确行为）
 
 122. `map` 不支持 `'list` 结果类型（`(map 'list #'1+ '(1 2 3))` 报错 "unsupported result-type: LIST"）— 已修复（builtinMap switch 使用大写符号名匹配 "LIST"/"CONS"/"VECTOR"/"STRING"）
+
+## 新发现并修复的 Bug（第三轮 SBCL 测试 — backq/hash/random/setf/list）
+
+123. `macroexpand` 对 backquote 形式返回求值结果而非代码形式（`(macroexpand '`#(() a #(#() nil x) #()))` 返回 `#(...)` 而非 `'(quote #(...))`）— 已修复（builtinMacroexpand 的 quasiquote 分支返回 `(list (vsym "quote") expanded)` 而非直接返回 expanded）
+
+124. `sxhash` 对列表返回相同哈希值（`(sxhash '(1 2 3))` 和 `(sxhash '(3 2 1))` 返回相同值，违反哈希质量不变性）— 已修复（sxhashSeen VPair 分支改用 `h = golden ^ car_hash; h *= 31; h += cdr_hash; h ^= h >> 33` 混合公式，确保元素位置影响哈希）
+
+## 新发现但未修复的 Bug（第三轮 SBCL 测试）
+
+125. `read-from-string` 返回 `(value . position)` cons 对，但 `eval` 双重求值时 `((quasiquote ...))` 被当作函数调用导致 "not a procedure: pair" 错误（双重反引号 `(eval (eval (read-from-string expr)))` 测试失败）
+
+126. `eval` 对 `(quasiquote ...)` 列表求值时，当 `quasiquote` 符号出现在嵌套列表首元素时被当作函数调用（`(eval '((quasiquote (unquote (*RR* *SS*)))))` 报错 "not a procedure: pair" 而非识别为 backquote 形式）
+
+127. `random` 对某些值报错 "limit must be >= 1"（SBCL random.pure.lisp 测试文件加载时触发，可能由 `(if x high 10)` 中 `checked-compile` 展开或 `funcall` 调用中的值传递问题导致）
+
+128. `handler-case` 无法捕获 Go 层返回的错误（如 `length: #t is not a sequence` 等 `fmt.Errorf` 错误不经过条件系统，无法被 `handler-case` 或 `assert-error` 捕获）
+
+129. `#*` 位向量字面量语法未实现 — 已修复（lexer 添加 `#*` 解析，生成 TVector token 并通过 `l.bitVec` 传递，readExpr TVector 分支检查 sentinel 值返回 bitVec，sxhashSeen 添加 VArray 分支使用 `h = seed*31 + elem_hash` 混合公式）
+
+130. `#.` (sharp-dot) 读者宏未实现（SBCL backq 测试中 `#.(write-to-string ...)` 无法读取）
