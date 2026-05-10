@@ -25,6 +25,7 @@
 - [x] `loop ... from ... downto ... by ...` 语法不支持 — 已验证实现（downto/by/above/below 均已支持）
 - [ ] `loop` hash-key 迭代挂起
 - [ ] `loop` destructuring 不完整
+- [x] `loop for-across` 未实现（遍历数组）— 已修复（转换为 idx from 0 below length + body set var to aref）
 
 ### 其他
 - [x] `#p""` pathname 字面量语法未支持 — 已修复（lexer 和 parser 均已实现）
