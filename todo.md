@@ -9,6 +9,8 @@
 
 ### Destructuring
 - [x] `destructuring-bind` 不支持 `&key` 参数 — 已修复
+- [x] `destructuring-bind` 不支持 `&key` supplied-p 变量 — 已修复（Bug #98）
+- [x] `destructuring-bind` `&key` 默认值不生效 — 已修复（Bug #99）
 
 ### Setf 扩展
 - [x] `(defun (setf foo) ...)` 不支持复合函数名 — 已修复
@@ -18,8 +20,8 @@
 
 ### CLOS / 对象系统
 - [ ] CLOS method combinations 未实现
-- [ ] `find-method` / `remove-method` 未实现
-- [ ] `call-next-method` 未实现
+- [x] `find-method` / `remove-method` 未实现 — 已修复（添加 VMethod 类型，实现 builtinFindMethod 和 builtinRemoveMethod，支持 qualifier/specializer-list/errorp 参数，特化器匹配处理大小写和 t="" 等价）
+- [ ] `call-next-method` 未实现 — 已确认可用（defmethod + CLOS dispatch 中已有 call-next-method/next-method-p 绑定实现，支持方法链调用）
 
 ### Loop
 - [x] `loop ... from ... downto ... by ...` 语法不支持 — 已验证实现（downto/by/above/below 均已支持）
@@ -147,9 +149,9 @@
 
 97. `assoc` 函数为 Lisp 简易实现（仅使用 `equal?` 比较），不支持 `:test`、`:test-not`、`:key` 关键字参数（`assoc-if` 的 Go 版本已实现但不完整）— 已修复（添加 `builtinAssoc` Go 实现，支持完整的 `:test`、`:test-not`、`:key` 参数，移除 Lisp 定义）
 
-98. `destructuring-bind` 不支持 `&key` 的 supplied-p 变量（如 `(destructuring-bind (&key (x (funcall x) x-supplied)) () ...)` 报 "undefined: X-SUPPLIED"）— 未修复（需要修改 `destructuringBind` 参数解析逻辑）
+98. `destructuring-bind` 不支持 `&key` 的 supplied-p 变量（如 `(destructuring-bind (&key (x (funcall x) x-supplied)) () ...)` 报 "undefined: X-SUPPLIED"）— 已修复（bindPatternRec 中 &key 参数解析已正确处理 (var default supplied-p) 三元素形式的 supplied-p 符号绑定和默认值求值）
 
-99. `destructuring-bind` 的 `&key` 默认值不生效（如 `(destructuring-bind (&key (a 99)) () a)` 返回 `nil` 而非 `99`）— 未修复
+99. `destructuring-bind` 的 `&key` 默认值不生效（如 `(destructuring-bind (&key (a 99)) () a)` 返回 `nil` 而非 `99`）— 已修复（bindPatternRec 中 &key 分支在 keyValMap 未找到匹配时正确 eval 默认值并设置 supplied-p 为 false）
 
 100. `character` 函数未实现（ANSI CL 标准函数，接受字符设计符返回字符）— 已修复（添加 `builtinCharacter`）
 
@@ -223,7 +225,7 @@
 
 ## 新发现但未修复的 Bug
 
-127. `random` 对某些值报错 "limit must be >= 1"（SBCL random.pure.lisp 测试文件加载时触发，可能由 `(if x high 10)` 中 `checked-compile` 展开或 `funcall` 调用中的值传递问题导致）
+127. `random` 对某些值报错 "limit must be >= 1"（SBCL random.pure.lisp 测试文件加载时触发，可能由 `(if x high 10)` 中 `checked-compile` 展开或 `funcall` 调用中的值传递问题导致）— 已修复（重构 builtinRandom：VBigInt 使用 big.Int.Rand 避免浮点精度溢出；VRat 截断为整数；VNum 区分浮点和整数路径；添加 vbigInt 辅助函数）
 
 128. `handler-case` 无法捕获 Go 层返回的错误（如 `length: #t is not a sequence` 等 `fmt.Errorf` 错误不经过条件系统，无法被 `handler-case` 或 `assert-error` 捕获）— 已修复（在 handler-case 评估 valForm 后，若存在 Go 错误，将其转换为 simple-error 条件，并通过 classMatchesCondition 遍历子句查找匹配的处理程序）
 

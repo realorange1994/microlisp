@@ -54,6 +54,7 @@ const (
 	VPackage
 	VReadtable
 	VRandomState
+	VMethod
 )
 
 // LispStream represents an I/O stream
@@ -144,6 +145,8 @@ type Value struct {
 	pkg          *Package      // for VPackage type
 	readtable    *Readtable    // for VReadtable type
 	randState   *rand.Rand   // for VRandomState type
+	methodGF    *Value       // generic function for VMethod type
+	methodIdx   int          // method index in genMethods for VMethod type
 }
 
 type genMethod struct {
@@ -986,6 +989,18 @@ func parseFloatStr(s string) (float64, error) {
 func vbigint(i *big.Int) *Value {
 	// Only auto-downgrade to float64 if value fits in float64 mantissa exactly.
 	// float64 has 53 bits of mantissa precision, so only ±2^53 are exact.
+	if i.IsInt64() {
+		n := i.Int64()
+		if n >= -9007199254740992 && n <= 9007199254740992 {
+			return vnum(float64(n))
+		}
+	}
+	v := gcv()
+	v.typ = VBigInt
+	v.bigInt = new(big.Int).Set(i)
+	return v
+}
+func vbigInt(i *big.Int) *Value {
 	if i.IsInt64() {
 		n := i.Int64()
 		if n >= -9007199254740992 && n <= 9007199254740992 {
@@ -5789,6 +5804,8 @@ func typeStr(v *Value) string {
 		return "PATHNAME"
 	case VRandomState:
 		return "RANDOM-STATE"
+	case VMethod:
+		return "METHOD"
 	default:
 		return "UNKNOWN"
 	}
@@ -6073,6 +6090,8 @@ var builtins = []builtinDef{
 	{"class-slots", builtinClassSlots},
 	{"class-slot-defs", builtinClassSlotDefs},
 	{"instance?", builtinInstanceP},
+	{"find-method", builtinFindMethod},
+	{"remove-method", builtinRemoveMethod},
 	{"make-hash-table", builtinMakeHashTable},
 	{"hash-table-p", builtinHashTableP},
 	{"gethash", builtinGethash},
@@ -9987,7 +10006,7 @@ func subtypepChecks(v1, v2 *Value) (bool, bool) {
 		if t1 == t2 {
 			return true
 		}
-		types := map[string][]string{"INTEGER": {"RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "FLOAT": {"REAL", "NUMBER", "ATOM", "T"}, "RATIONAL": {"REAL", "NUMBER", "ATOM", "T"}, "COMPLEX": {"NUMBER", "ATOM", "T"}, "REAL": {"NUMBER", "ATOM", "T"}, "RATIO": {"RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "FIXNUM": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "BIGNUM": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "BIT": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "SHORT-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "SINGLE-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "DOUBLE-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "LONG-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "STRING": {"ARRAY", "VECTOR", "SEQUENCE", "ATOM", "T"}, "SIMPLE-STRING": {"STRING", "ARRAY", "VECTOR", "SEQUENCE", "ATOM", "T"}, "CHARACTER": {"ATOM", "T"}, "BASE-CHAR": {"STANDARD-CHAR", "CHARACTER", "ATOM", "T"}, "STANDARD-CHAR": {"CHARACTER", "ATOM", "T"}, "EXTENDED-CHAR": {"CHARACTER", "ATOM", "T"}, "SYMBOL": {"ATOM", "T"}, "KEYWORD": {"SYMBOL", "ATOM", "T"}, "NULL": {"SYMBOL", "LIST", "SEQUENCE", "ATOM", "T"}, "CONS": {"LIST", "SEQUENCE", "T"}, "PAIR": {"CONS", "LIST", "SEQUENCE", "T"}, "LIST": {"SEQUENCE", "T"}, "SEQUENCE": {"T"}, "VECTOR": {"ARRAY", "SEQUENCE", "T"}, "SIMPLE-VECTOR": {"VECTOR", "ARRAY", "SEQUENCE", "T"}, "ARRAY": {"T"}, "FUNCTION": {"T"}, "COMPILED-FUNCTION": {"FUNCTION", "T"}, "HASH-TABLE": {"T"}, "STREAM": {"T"}, "PACKAGE": {"T"}, "PATHNAME": {"T"}, "RANDOM-STATE": {"T"}, "READTABLE": {"T"}, "INSTANCE": {"T"}, "STRUCTURE": {"INSTANCE", "T"}, "BOOLEAN": {"ATOM", "T"}}
+		types := map[string][]string{"INTEGER": {"RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "FLOAT": {"REAL", "NUMBER", "ATOM", "T"}, "RATIONAL": {"REAL", "NUMBER", "ATOM", "T"}, "COMPLEX": {"NUMBER", "ATOM", "T"}, "REAL": {"NUMBER", "ATOM", "T"}, "RATIO": {"RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "FIXNUM": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "BIGNUM": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "BIT": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "SHORT-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "SINGLE-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "DOUBLE-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "LONG-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "STRING": {"ARRAY", "VECTOR", "SEQUENCE", "ATOM", "T"}, "SIMPLE-STRING": {"STRING", "ARRAY", "VECTOR", "SEQUENCE", "ATOM", "T"}, "CHARACTER": {"ATOM", "T"}, "BASE-CHAR": {"STANDARD-CHAR", "CHARACTER", "ATOM", "T"}, "STANDARD-CHAR": {"CHARACTER", "ATOM", "T"}, "EXTENDED-CHAR": {"CHARACTER", "ATOM", "T"}, "SYMBOL": {"ATOM", "T"}, "KEYWORD": {"SYMBOL", "ATOM", "T"}, "NULL": {"SYMBOL", "LIST", "SEQUENCE", "ATOM", "T"}, "CONS": {"LIST", "SEQUENCE", "T"}, "PAIR": {"CONS", "LIST", "SEQUENCE", "T"}, "LIST": {"SEQUENCE", "T"}, "SEQUENCE": {"T"}, "VECTOR": {"ARRAY", "SEQUENCE", "T"}, "SIMPLE-VECTOR": {"VECTOR", "ARRAY", "SEQUENCE", "T"}, "ARRAY": {"T"}, "FUNCTION": {"T"}, "COMPILED-FUNCTION": {"FUNCTION", "T"}, "HASH-TABLE": {"T"}, "STREAM": {"T"}, "PACKAGE": {"T"}, "PATHNAME": {"T"}, "RANDOM-STATE": {"T"}, "READTABLE": {"T"}, "INSTANCE": {"T"}, "STRUCTURE": {"INSTANCE", "T"}, "METHOD": {"T"}, "BOOLEAN": {"ATOM", "T"}}
 		if subtypes, ok := types[t1]; ok {
 			for _, s := range subtypes {
 				if s == t2 {
@@ -12727,6 +12746,161 @@ func builtinInstanceP(args []*Value) (*Value, error) {
 		return vbool(false), nil
 	}
 	return vbool(args[0].typ == VInstance), nil
+}
+
+// builtinFindMethod implements CL: FIND-METHOD
+// (find-method generic-function qualifier specializer-list &optional errorp)
+func builtinFindMethod(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("find-method: need generic-function, qualifier, and specializer-list")
+	}
+	gf := primaryValue(args[0])
+	if gf.typ != VGeneric {
+		return nil, fmt.Errorf("find-method: first argument must be a generic function")
+	}
+	qualifier := ""
+	qv := primaryValue(args[1])
+	if qv.typ == VSym && isKeyword(qv.str) {
+		qualifier = qv.str
+	} else if qv.typ == VNil || isNil(qv) {
+		qualifier = ""
+	} else if qv.typ == VStr || qv.typ == VSym {
+		qualifier = strings.ToUpper(qv.str)
+	} else {
+		return nil, fmt.Errorf("find-method: qualifier must be a keyword, string, symbol, or nil")
+	}
+	specList := primaryValue(args[2])
+	errorp := true
+	if len(args) >= 4 {
+		ep := primaryValue(args[3])
+		if isNil(ep) || !isTruthy(ep) {
+			errorp = false
+		}
+	}
+	// Convert specializer-list to string slice
+	var specStrings []string
+	for !isNil(specList) && specList.typ == VPair {
+		sp := specList.car
+		if sp == nil || isNil(sp) {
+			specStrings = append(specStrings, "")
+		} else if sp.typ == VSym {
+			if sp.str == "T" {
+				specStrings = append(specStrings, "")
+			} else {
+				specStrings = append(specStrings, strings.ToUpper(sp.str))
+			}
+		} else if sp.typ == VPair && sp.car != nil && sp.car.typ == VSym && sp.car.str == "EQL" {
+			// (eql value) specializer
+			eqlVal := sp.cdr
+			if eqlVal != nil && eqlVal.typ == VPair && eqlVal.car != nil {
+				key := eqlVal.car
+				if key.typ == VSym && len(key.str) > 0 && key.str[0] == ':' {
+					specStrings = append(specStrings, "#EQL:"+key.str)
+				} else {
+					specStrings = append(specStrings, "#EQL:"+toString(key))
+				}
+			} else {
+				specStrings = append(specStrings, "#EQL:")
+			}
+		} else if sp.typ == VClass {
+			classStr := strings.ToUpper(sp.str)
+			if classStr == "T" {
+				specStrings = append(specStrings, "") // t = unspecialized
+			} else {
+				specStrings = append(specStrings, classStr)
+			}
+		} else {
+			specStrings = append(specStrings, "")
+		}
+		specList = specList.cdr
+	}
+	// Search for matching method
+	for i, m := range gf.genMethods {
+		if m.qualifier != qualifier {
+			continue
+		}
+		if len(m.specializers) != len(specStrings) {
+			continue
+		}
+		match := true
+		for j, ms := range m.specializers {
+			req := specStrings[j]
+			if ms == req {
+				continue
+			}
+			// Check if both are class names that match up to case
+			if strings.EqualFold(ms, req) {
+				continue
+			}
+			// t/T/"" all mean "unspecified" type
+			if (ms == "" || strings.EqualFold(ms, "T")) && (req == "" || strings.EqualFold(req, "T")) {
+				continue
+			}
+			match = false
+			break
+		}
+		if match {
+			mv := gcv()
+			mv.typ = VMethod
+			mv.str = gf.str
+			mv.methodGF = gf
+			mv.methodIdx = i
+			return mv, nil
+		}
+	}
+	if errorp {
+		return nil, fmt.Errorf("find-method: no method matches qualifier %s and specializer-list", qualifier)
+	}
+	return vnil(), nil
+}
+
+// builtinRemoveMethod implements CL: REMOVE-METHOD
+// (remove-method generic-function method)
+func builtinRemoveMethod(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("remove-method: need generic-function and method")
+	}
+	gf := primaryValue(args[0])
+	if gf.typ != VGeneric {
+		return nil, fmt.Errorf("remove-method: first argument must be a generic function")
+	}
+	method := primaryValue(args[1])
+	if method.typ == VMethod && method.methodGF == gf {
+		idx := method.methodIdx
+		if idx >= 0 && idx < len(gf.genMethods) {
+			gf.genMethods = append(gf.genMethods[:idx], gf.genMethods[idx+1:]...)
+		}
+		return gf, nil
+	}
+	// Also allow passing a method found by find-method on a different GF reference
+	// (same generic function but different Value pointer)
+	if method.typ == VMethod {
+		// Search by matching qualifier+specializers
+		mQual := ""
+		mSpecs := []string{}
+		if method.methodGF != nil && method.methodIdx >= 0 && method.methodIdx < len(method.methodGF.genMethods) {
+			srcM := method.methodGF.genMethods[method.methodIdx]
+			mQual = srcM.qualifier
+			mSpecs = srcM.specializers
+		}
+		for i, m := range gf.genMethods {
+			if m.qualifier != mQual || len(m.specializers) != len(mSpecs) {
+				continue
+			}
+			match := true
+			for j, ms := range m.specializers {
+				if ms != mSpecs[j] && !strings.EqualFold(ms, mSpecs[j]) {
+					match = false
+					break
+				}
+			}
+			if match {
+				gf.genMethods = append(gf.genMethods[:i], gf.genMethods[i+1:]...)
+				return gf, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("remove-method: method not found in generic function")
 }
 
 // -------- Hash Table support --------
@@ -17122,10 +17296,6 @@ func builtinRandom(args []*Value) (*Value, error) {
 	if v.typ != VNum && v.typ != VBigInt && v.typ != VRat {
 		return nil, fmt.Errorf("random: argument must be a positive number")
 	}
-	limit := toNum(v)
-	if limit <= 0 {
-		return nil, fmt.Errorf("random: limit must be > 0")
-	}
 	// Determine which rng to use
 	var randState *rand.Rand
 	for i := 1; i+1 < len(args); i++ {
@@ -17142,17 +17312,47 @@ func builtinRandom(args []*Value) (*Value, error) {
 			randState = rv.randState
 		}
 	}
-	// Float argument: return random float in [0, limit)
-	if v.typ == VNum && (math.Abs(limit-math.Trunc(limit)) > 1e-12 || limit == 0) {
-		if limit == 0 {
+	// Big integer: use big.Int for proper arbitrary-precision random
+	if v.typ == VBigInt {
+		if v.bigInt.Sign() <= 0 {
 			return nil, fmt.Errorf("random: limit must be > 0")
 		}
+		var rnd *rand.Rand
+		if randState != nil {
+			rnd = randState
+		} else {
+			rnd = rand.New(rand.NewSource(time.Now().UnixNano()))
+		}
+		result := new(big.Int).Rand(rnd, v.bigInt)
+		return vbigInt(result), nil
+	}
+	// Rational: truncate to integer
+	if v.typ == VRat {
+		if v.irat <= 0 {
+			return nil, fmt.Errorf("random: limit must be > 0")
+		}
+		intLimit := int(v.irat / v.iden)
+		if intLimit < 1 {
+			return nil, fmt.Errorf("random: limit must be >= 1")
+		}
+		if randState != nil {
+			return vnum(float64(randState.Intn(intLimit))), nil
+		}
+		return vnum(float64(rand.Intn(intLimit))), nil
+	}
+	// VNum: float returns random float in [0, limit); integer returns random int in [0, limit)
+	limit := v.num
+	if limit <= 0 {
+		return nil, fmt.Errorf("random: limit must be > 0")
+	}
+	if math.Abs(limit-math.Trunc(limit)) > 1e-12 {
+		// Float limit: return random float
 		if randState != nil {
 			return vnum(randState.Float64() * limit), nil
 		}
 		return vnum(rand.Float64() * limit), nil
 	}
-	// Integer argument: return random integer in [0, limit)
+	// Integer limit
 	intLimit := int(limit)
 	if intLimit < 1 {
 		return nil, fmt.Errorf("random: limit must be >= 1")
@@ -21145,6 +21345,10 @@ func toString(v *Value) string {
 		return arrayToString(v)
 	case VMultiVal:
 		return listToString(cons(v.car, v.cdr))
+	case VRandomState:
+		return "#<random-state>"
+	case VMethod:
+		return "#<method " + v.str + ">"
 	default:
 		return "#<unknown>"
 	}
