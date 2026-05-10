@@ -21773,7 +21773,7 @@ var initLib = `
            '#f
            (list 'define
                  (list (string->symbol
-                       (string-append (symbol->string (accessor-name slot)) "-setf"))
+                       (string-append (symbol->string (accessor-name slot)) "-SETF"))
                        'val 'obj)
                  (list 'slot-set! 'obj (list 'quote (slot-name slot)) 'val)))))
      (accessor-name
@@ -22764,17 +22764,28 @@ var initLib = `
     ((and (pair? (car opts)) (equal? (caar opts) key)) (cdar opts))
     (else (defpackage-find-opt (cdr opts) key))))
 
-;; defsetf: (defsetf accessor (vars newval) body...)
-;; Registers a setter function <accessor>-setf in the global environment
-(define-macro (defsetf name vars-and-newval . body)
-  (let* ((vars-newval (if (pair? vars-and-newval) vars-and-newval (list vars-and-newval)))
-          (orig-vars (butlast vars-newval))
-          (newval-sym (car (last vars-newval)))
-          (setter-fn (string->symbol (string-append (symbol->string name) "-setf"))))
-    ;; Use eval to define the setter function in global env
-    (eval (list (quote define)
+;; remove-env: remove &environment and its following symbol from a lambda list
+(define (remove-env ll)
+  (cond
+    ((null ll) nil)
+    ((eq (car ll) '&environment) (cdr (cdr ll)))
+    ((eq (car ll) '&ENVIRONMENT) (cdr (cdr ll)))
+    (t (cons (car ll) (remove-env (cdr ll))))))
+
+;; defsetf: (defsetf accessor (var* &environment env newval) body...)
+;; or:      (defsetf accessor (var* newval) body...)
+;; Supports optional &environment parameter. Filters it out from setter params.
+(define-macro (defsetf name params . body)
+  (let* ((params-list (if (and (pair? params) (pair? (car params)))
+                          (car params)
+                          params))
+          (cleaned (remove-env params-list))
+          (orig-vars (butlast cleaned))
+          (newval-sym (car (last cleaned)))
+          (setter-fn (string->symbol (string-append (symbol->string name) "-SETF"))))
+    (eval (list 'define
                 (cons setter-fn (cons newval-sym orig-vars))
-                (cons (quote begin) body)))
+                (cons 'begin body)))
     setter-fn))
 
 ;; get-setf-expansion: returns (vars vals store-vars setter-form) for a place form
@@ -22788,7 +22799,7 @@ var initLib = `
          (list vars
                args
                (list store-var)
-               (list (string->symbol (string-append (symbol->string accessor) "-setf"))
+               (list (string->symbol (string-append (symbol->string accessor) "-SETF"))
                      store-var
                      (cons (quote list) vars))))))
     (else

@@ -14,7 +14,7 @@
 - [x] `(defun (setf foo) ...)` 不支持复合函数名 — 已修复
 - [x] `(setf (values ...))` 不支持 — 已修复
 - [x] `(setf (macro-function ...))` 不支持 — 已修复（实现 `builtinMacroFunction` 和 `builtinMacroFunctionSetf`，`expandMacro` 增加 VFunc/VPrim 直接调用分支，`&whole` 机制传递完整宏调用表单）
-- [ ] `defsetf` 不支持 `&environment` 参数
+- [x] `defsetf` 不支持 `&environment` 参数 — 已修复（添加 `remove-env` 辅助函数过滤 `&environment`，修复 `-SETF` 后缀大小写匹配问题）
 
 ### CLOS / 对象系统
 - [ ] CLOS method combinations 未实现
