@@ -5924,6 +5924,8 @@ var builtins = []builtinDef{
 	{"hash-table-size", builtinHashTableSize},
 	{"hash-table-rehash-size", builtinHashTableRehashSize},
 	{"hash-table-test", builtinHashTableTest},
+	{"hash-table-keys", builtinHashTableKeys},
+	{"hash-table-values", builtinHashTableValues},
 	{"sxhash", builtinSxhash},
 	{"hash-table-exists?", builtinHashTableExists},
 	// CL standard aliases for seq-* functions
@@ -12885,6 +12887,40 @@ func builtinHashTableTest(args []*Value) (*Value, error) {
 		return ht.hashTab.testFn, nil
 	}
 	return vsym("eql"), nil
+}
+
+func builtinHashTableKeys(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("hash-table-keys: need hash-table")
+	}
+	ht := args[0]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return nil, fmt.Errorf("hash-table-keys: not a hash table")
+	}
+	var result *Value
+	for _, bucket := range ht.hashTab.table {
+		for _, entry := range bucket {
+			result = cons(entry.key, result)
+		}
+	}
+	return result, nil
+}
+
+func builtinHashTableValues(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("hash-table-values: need hash-table")
+	}
+	ht := args[0]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return nil, fmt.Errorf("hash-table-values: not a hash table")
+	}
+	var result *Value
+	for _, bucket := range ht.hashTab.table {
+		for _, entry := range bucket {
+			result = cons(entry.value, result)
+		}
+	}
+	return result, nil
 }
 
 func builtinHashTableRehashSize(args []*Value) (*Value, error) {
@@ -22257,21 +22293,49 @@ var initLib = `
                   (set! expanded (cons (list hidden-var 'in list-expr) expanded)))))
             (if (equal? (cadr f) 'being)
               ;; Handle: for sym being each present-symbol of package
-              ;;   args = (each present-symbol of <pkg-expr>)
+              ;; Handle: for k being the hash-keys of ht
+              ;; Handle: for v being the hash-values of ht
+              ;; Handle: for k being the hash-keys of ht using (hash-value v)
+              ;;   args = (each/the present-symbol/hash-keys/hash-values of <expr> [using (hash-value/hash-key var)])
               (let* ((user-var (car f))
                      (args (cddr f))
-                     (skip-each (if (and (pair? args) (equal? (car args) 'each)) (cdr args) args))
-                     (sym-kind (if (pair? skip-each) (car skip-each) #f))
-                     (after-kind (if (pair? skip-each) (cdr skip-each) '()))
-                     (pkg-expr (if (and (pair? after-kind) (equal? (car after-kind) 'of) (pair? (cdr after-kind)))
-                                   (cadr after-kind) #f)))
-                (if (and sym-kind pkg-expr)
-                  (let* ((list-expr (if (equal? sym-kind 'present-symbol)
-                                       (list 'package-symbols pkg-expr)
-                                       (list 'package-external-symbols pkg-expr)))
+                     (skip-article (if (and (pair? args) (or (equal? (car args) 'each) (equal? (car args) 'the))) (cdr args) args))
+                     (sym-kind (if (pair? skip-article) (car skip-article) #f))
+                     (after-kind (if (pair? skip-article) (cdr skip-article) '()))
+                     (of-expr (if (and (pair? after-kind) (equal? (car after-kind) 'of) (pair? (cdr after-kind)))
+                                   (cadr after-kind) #f))
+                     ;; Check for using clause: (using (hash-value var)) or (using (hash-key var))
+                     (rest-after-of (if (and (pair? after-kind) (equal? (car after-kind) 'of) (pair? (cdr after-kind)))
+                                        (cddr after-kind) '()))
+                     (using-clause (if (and (pair? rest-after-of) (equal? (car rest-after-of) 'using) (pair? (cdr rest-after-of)))
+                                       (cadr rest-after-of) #f))
+                     (using-kind (if (and using-clause (pair? using-clause)) (car using-clause) #f))
+                     (using-var (if (and using-clause (pair? using-clause) (pair? (cdr using-clause))) (cadr using-clause) #f)))
+                (if (and sym-kind of-expr
+                         (or (equal? sym-kind 'present-symbol) (equal? sym-kind 'external-symbol)
+                             (equal? sym-kind 'hash-keys) (equal? sym-kind 'hash-key)
+                             (equal? sym-kind 'hash-values) (equal? sym-kind 'hash-value)))
+                  (let* ((list-expr (cond
+                                      ((equal? sym-kind 'present-symbol) (list 'package-symbols of-expr))
+                                      ((equal? sym-kind 'external-symbol) (list 'package-external-symbols of-expr))
+                                      ((or (equal? sym-kind 'hash-keys) (equal? sym-kind 'hash-key))
+                                       (list 'hash-table-keys of-expr))
+                                      ((or (equal? sym-kind 'hash-values) (equal? sym-kind 'hash-value))
+                                       (list 'hash-table-values of-expr))
+                                      (else (list 'package-symbols of-expr))))
                          (tail (gensym "in-")))
                     (set! in-lets (cons (list user-var tail list-expr) in-lets))
-                    (set! expanded (cons (list tail 'in list-expr) expanded)))
+                    (set! expanded (cons (list tail 'in list-expr) expanded))
+                    ;; Handle using clause: add parallel binding for hash-value or hash-key
+                    (if (and using-var using-kind
+                             (or (equal? using-kind 'hash-value) (equal? using-kind 'hash-values)
+                                 (equal? using-kind 'hash-key) (equal? using-kind 'hash-keys)))
+                      (let* ((using-list-expr (if (or (equal? using-kind 'hash-value) (equal? using-kind 'hash-values))
+                                                   (list 'hash-table-values of-expr)
+                                                   (list 'hash-table-keys of-expr)))
+                             (using-tail (gensym "in-")))
+                        (set! in-lets (cons (list using-var using-tail using-list-expr) in-lets))
+                        (set! expanded (cons (list using-tail 'in using-list-expr) expanded)))))
                   (set! expanded (cons f expanded))))
             (if (equal? (cadr f) 'across)
               (let* ((var (car f))

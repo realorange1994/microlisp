@@ -23,7 +23,7 @@
 
 ### Loop
 - [x] `loop ... from ... downto ... by ...` 语法不支持 — 已验证实现（downto/by/above/below 均已支持）
-- [ ] `loop` hash-key 迭代挂起
+- [x] `loop` hash-key 迭代挂起 — 已修复（实现 `hash-table-keys`/`hash-table-values` 函数，loop 宏的 `being` 子句支持 `hash-keys`/`hash-key`/`hash-values`/`hash-value`，支持 `using (hash-value v)` 并行绑定）
 - [ ] `loop` destructuring 不完整
 - [x] `loop for-across` 未实现（遍历数组）— 已修复（转换为 idx from 0 below length + body set var to aref）
 
