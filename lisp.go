@@ -5389,6 +5389,11 @@ func parseParams(v *Value) ([]string, string, []*Value, []*Value, error) {
 	inOptional := false
 	inKey := false
 	for !isNil(v) {
+			// Handle dotted tail: when v becomes a VSym (e.g. (a b . rest)),
+			// treat it as &rest parameter
+			if v.typ == VSym {
+				return params, v.str, optDefaults, keySpecs, nil
+			}
 		if seen[v] {
 			return nil, "", nil, nil, fmt.Errorf("bad lambda parameter list: circular")
 		}
