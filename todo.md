@@ -133,3 +133,9 @@
 89. `delete-if` 不支持字符串输入（只接受 VPair）— 已修复（对字符串委托给 remove-if）
 90. `round` 的 two-argument 形式（`round x d`）未使用 round-half-to-even 规则 — 已修复
 91. `lambda`/`defun` 中 `&optional` 和 `&key` 参数的默认值不生效（parseParams 中 elem 变量作用域问题）— 已修复（重构 parseParams 和 apply 函数，正确处理可选/关键字参数的默认值和绑定）
+
+92. `evalQuasiquote` 对 `UNQUOTE`/`UNQUOTE-SPLICING`/`QUASIQUOTE` 符号名大小写敏感匹配（reader 产生小写符号，Go 代码用大写字符串比较导致逗号/splice 在 backquote 内不被识别）— 已修复（使用 strings.EqualFold 进行大小写不敏感比较）
+
+93. `expt` 对复数基底的整数指数幂返回错误结果（`(expt #c(0 1) 2)` 返回 0 而非 -1）— 已修复（新增 VComplex 分支，使用二进制幂法计算复数整数幂）
+
+94. `arrayToString` 对 nil 数组元素崩溃（未初始化数组的 nil 元素导致 elem.typ 访问 Go nil 指针）— 已修复（添加 nil/VNil 元素检查）

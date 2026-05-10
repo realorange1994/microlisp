@@ -5271,12 +5271,23 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 	if !isPair(v) {
 		return v, nil
 	}
+	// Determine symbol name for comparison (reader may produce lowercase)
+	symName := ""
+	if v.car != nil && v.car.typ == VSym {
+		symName = v.car.str
+	}
 	// (unquote expr) at depth 0
-	if v.car != nil && v.car.typ == VSym && v.car.str == "UNQUOTE" && depth == 0 {
+	if strings.EqualFold(symName, "UNQUOTE") && depth == 0 {
+		if v.cdr == nil || v.cdr.typ != VPair {
+			return nil, fmt.Errorf("unquote: malformed form")
+		}
 		return eval(v.cdr.car, env)
 	}
 	// (unquote-splicing expr) at depth > 0 - recursively process
-	if v.car != nil && v.car.typ == VSym && v.car.str == "UNQUOTE-SPLICING" && depth > 0 {
+	if strings.EqualFold(symName, "UNQUOTE-SPLICING") && depth > 0 {
+		if v.cdr == nil || v.cdr.typ != VPair {
+			return nil, fmt.Errorf("unquote-splicing: malformed form")
+		}
 		inner, e := evalQuasiquote(v.cdr.car, depth-1, env)
 		if e != nil {
 			return nil, e
@@ -5284,14 +5295,20 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 		return list(vsym("quasiquote"), list(vsym("unquote-splicing"), inner)), nil
 	}
 	// (unquote-splicing expr) at depth 0 - not valid here
-	if v.car != nil && v.car.typ == VSym && v.car.str == "UNQUOTE-SPLICING" && depth == 0 {
+	if strings.EqualFold(symName, "UNQUOTE-SPLICING") && depth == 0 {
 		return nil, fmt.Errorf("unquote-splicing outside list")
 	}
 	// (quasiquote expr)
-	if v.car != nil && v.car.typ == VSym && v.car.str == "QUASIQUOTE" {
+	if strings.EqualFold(symName, "QUASIQUOTE") {
+		if v.cdr == nil || v.cdr.typ != VPair {
+			return nil, fmt.Errorf("quasiquote: malformed form")
+		}
 		return evalQuasiquote(v.cdr.car, depth+1, env)
 	}
-	if v.car != nil && v.car.typ == VSym && v.car.str == "UNQUOTE" && depth > 0 {
+	if strings.EqualFold(symName, "UNQUOTE") && depth > 0 {
+		if v.cdr == nil || v.cdr.typ != VPair {
+			return nil, fmt.Errorf("unquote: malformed form")
+		}
 		inner, e := evalQuasiquote(v.cdr.car, depth-1, env)
 		if e != nil {
 			return nil, e
@@ -5309,7 +5326,7 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 		}
 		seen[iter] = true
 		elem := iter.car
-		if isPair(elem) && elem.car != nil && elem.car.typ == VSym && elem.car.str == "UNQUOTE-SPLICING" && depth == 0 {
+		if isPair(elem) && elem.car != nil && elem.car.typ == VSym && strings.EqualFold(elem.car.str, "UNQUOTE-SPLICING") && depth == 0 {
 			if elem.cdr == nil || elem.cdr.typ != VPair {
 				return nil, fmt.Errorf("unquote-splicing: malformed form")
 			}
@@ -10174,7 +10191,9 @@ func arrayToString(v *Value) string {
 			if i > 0 {
 				parts = append(parts, " ")
 			}
-			if elem.typ == VStr {
+			if elem == nil || elem.typ == VNil {
+				parts = append(parts, "NIL")
+			} else if elem.typ == VStr {
 				parts = append(parts, "\""+elem.str+"\"")
 			} else {
 				parts = append(parts, toString(elem))
@@ -10998,7 +11017,7 @@ func builtinMacroexpand(args []*Value) (*Value, error) {
 	const maxMacroExpandDepth = 1000
 
 	// Handle quasiquote specially since it's not a VMacro
-	if form.typ == VPair && form.car != nil && form.car.typ == VSym && form.car.str == "QUASIQUOTE" {
+	if form.typ == VPair && form.car != nil && form.car.typ == VSym && strings.EqualFold(form.car.str, "QUASIQUOTE") {
 		if len(args) >= 1 && args[0].cdr != nil && args[0].cdr.typ == VPair && args[0].cdr.car != nil {
 			expanded, e := evalQuasiquote(args[0].cdr.car, 0, globalEnv)
 			if e != nil {
@@ -17863,6 +17882,43 @@ func builtinExpt(args []*Value) (*Value, error) {
 		e = exp.bigInt.Int64()
 	} else {
 		e = int64(exp.num)
+	}
+	// Handle complex base with integer exponent
+	if base.typ == VComplex {
+		if e == 0 {
+			return vcomplexAlways(1, 0), nil
+		}
+		negExp := e < 0
+		if negExp {
+			e = -e
+		}
+		// Binary exponentiation for complex numbers
+		rReal := 1.0
+		rImag := 0.0
+		bReal := base.num
+		bImag := base.imag
+		for e > 0 {
+			if e&1 == 1 {
+				newR := rReal*bReal - rImag*bImag
+				newI := rReal*bImag + rImag*bReal
+				rReal = newR
+				rImag = newI
+			}
+			newB := bReal*bReal - bImag*bImag
+			bImag = 2 * bReal * bImag
+			bReal = newB
+			e >>= 1
+		}
+		result := vcomplexAlways(rReal, rImag)
+		if negExp {
+			// 1 / result
+			mag := rReal*rReal + rImag*rImag
+			if mag == 0 {
+				return nil, fmt.Errorf("expt: division by zero")
+			}
+			result = vcomplexAlways(rReal/mag, -rImag/mag)
+		}
+		return result, nil
 	}
 	if e < 0 {
 		// 1 / base^|e| — return float
