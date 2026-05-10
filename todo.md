@@ -193,7 +193,7 @@
 
 117. `char-name` 对 `(code-char 127)` 返回 "Del" 而非 "Rubout"（ANSI CL 要求 code-char(127) 与 #\rubout 为同一字符，名为 "Rubout"）— 已修复（builtinCharName 添加 code 127 优先返回 "Rubout"）
 
-118. 复数浮点显示丢失 `.0` 后缀（`(coerce 1.0 '(complex float))` 打印 `#c(1 0)` 而非 `#c(1.0 0.0)`，虚部 0.0 显示为 0）— 已修复（添加 formatComplexPart 辅助函数，vcomplexAlways 设置 isFloat=true，VComplex.toString 使用 formatComplexPart）
+118. 复数浮点显示丢失 `.0` 后缀（`(coerce 1.0 '(complex float))` 打印 `#c(1 0)` 而非 `#c(1.0 0.0)`，虚部 0.0 显示为 0）— 未修复（vcomplex 简化时丢失 isFloat 标记，formatComplexPart 代码存在但被绕过）
 
 119. `coerce` 到 `(complex rational)` 类型不产生复数（`(coerce 1/2 '(complex rational))` 返回 `1/2` 而非 `#c(1/2 0)`）— 已修复（coerce 中 compound complex 类型使用 vcomplexAlways）
 
@@ -225,22 +225,22 @@
 
 ## 新发现但未修复的 Bug
 
-127. `random` 对某些值报错 "limit must be >= 1"（SBCL random.pure.lisp 测试文件加载时触发，可能由 `(if x high 10)` 中 `checked-compile` 展开或 `funcall` 调用中的值传递问题导致）— 已修复（重构 builtinRandom：VBigInt 使用 big.Int.Rand 避免浮点精度溢出；VRat 截断为整数；VNum 区分浮点和整数路径；添加 vbigInt 辅助函数）
+127. `random` 对某些值报错 "limit must be >= 1" — 已修复（重构 builtinRandom：VBigInt 使用 big.Int.Rand 避免浮点精度溢出；VRat 截断为整数；VNum 区分浮点和整数路径；添加 vbigInt 辅助函数）
 
-128. `handler-case` 无法捕获 Go 层返回的错误（如 `length: #t is not a sequence` 等 `fmt.Errorf` 错误不经过条件系统，无法被 `handler-case` 或 `assert-error` 捕获）— 已修复（在 handler-case 评估 valForm 后，若存在 Go 错误，将其转换为 simple-error 条件，并通过 classMatchesCondition 遍历子句查找匹配的处理程序）
+128. `handler-case` 无法捕获 Go 层返回的错误 — 已修复（在 handler-case 评估 valForm 后，若存在 Go 错误，将其转换为 simple-error 条件）
 
-129. `#*` 位向量字面量语法未实现 — 已修复（lexer 添加 `#*` 解析，生成 TVector token 并通过 `l.bitVec` 传递，readExpr TVector 分支检查 sentinel 值返回 bitVec，sxhashSeen 添加 VArray 分支使用 `h = seed*31 + elem_hash` 混合公式）
+129. `#*` 位向量字面量语法未实现 — 已修复（lexer 添加 `#*` 解析，生成 TVector token，parser 返回 bitVec，sxhashSeen 添加 VArray 分支）
 
-130. `#.` (sharp-dot) 读者宏未实现（SBCL backq 测试中 `#.(write-to-string ...)` 无法读取）— 已修复（lexer 添加 TSharpDot token 类型，Parser.readExpr 中读取下一个表达式并立即 eval；delimitedParser.readDispatch 中添加 `.` 分支实现读取时求值）
+130. `#.` (sharp-dot) 读者宏未实现 — 已修复（lexer 添加 TSharpDot token 类型，Parser.readExpr 中读取下一个表达式并立即 eval）
 
-131. `make-condition` 不评估 `:initform`（`builtinMakeCondition` 是简化实现，直接将 keyword 参数放入 slot，不读取 defclass 中定义的 :initform 值，也不继承 CPL 的 slot 定义）— 已修复（`builtinMakeCondition` 委托给 `builtinMakeInstance`，后者完整支持 :initform 求值、:initarg 映射、CPL 继承）
+### 未修复的 Bug（子代理声称修复但实际丢失）
 
-132. `error` 函数不接受条件类符号作为 datum（`builtinError` 只处理 VStr 和 VInstance，不处理 VSym 条件类名，导致 `(error 'simple-error :message "test")` 报错 "unsupported datum type"）— 已修复（添加 VSym 分支：查找类名，调用 `builtinMakeInstance` 创建条件实例，完整支持 handler-case 捕获和 break-on-signals）
+118. 复数浮点显示丢失 `.0` 后缀（`#c(1.0 0.0)` 被 vcomplex 简化为 1 而非 #c(1.0 0.0)，formatComplexPart 代码存在但被 reader 简化绕过）— 未修复
 
-133. `princ-to-string` 对条件实例返回空字符串（条件对象无格式控制，无法输出错误描述信息，SBCL 测试断言 `(princ-to-string condition)` 包含特定文本）— 已修复（添加 `conditionReportString` 函数，支持 format-control/format-arguments、type-error、cell-error、message 槽、report 函数等多种格式）
+137. `make-condition` 不评估 `:initform` — 未修复（princ-to-string 对条件实例返回 "#<instance ...>" 而非格式化消息）
 
-134. `with-condition-restarts` 宏未实现（SBCL 条件系统核心功能，`with-condition-restarts cond-form restarts-form body` 关联临时 restarts 与条件，handler-bind 中 compute-restarts 可过滤条件相关 restarts）— 已修复（添加 Lisp 宏定义 + `%associate-restarts-with-condition` 和 `%dissociate-restarts-with-condition` Go 内置函数，`builtinComputeRestarts` 支持可选条件过滤参数）
+138. `princ-to-string` 对条件实例返回空字符串/原始格式 — 未修复（conditions print as raw instance）
 
-135. `handler-bind` 的 handler 函数调用中 `tailCall` 和 `restartInvoke` 异常被吞没（handler-bind 的 recover 将 tailCall panic 转为错误，导致 TCO 和 restart 调用链中断）— 已修复（handler-bind recover 增加对 tailCall/restartInvoke/handledError 的 re-panic；handler 函数调用改用 `applyAndResolveTailCall` 而非 `apply`）
+139. `with-condition-restarts` 宏未实现 — 未修复（符号未定义）
 
-136. `type-error-datum`/`type-error-expected-type` 条件访问器未实现（ANSI CL 标准函数，访问 type-error 条件的 datum 和 expected-type 槽，SBCL condition.pure.lisp 测试依赖）— 已修复（添加 Lisp 定义调用 slot-value；同时添加 stream-error-stream/file-error-pathname/arithmetic-error-operation/operands/package-error-package 标准访问器）
+140. `type-error-datum`/`type-error-expected-type` 条件访问器未实现 — 未修复（`+` 函数信号 simple-error 而非 type-error，访问器未定义）
