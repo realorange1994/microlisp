@@ -186,3 +186,17 @@
 115. `type-of` 对所有 VNum 返回 "number" 而非区分整数和浮点数 — 已修复（typeStr 对 `isFloat` VNum 返回 "single-float"，对非浮点整数返回 "integer"）
 
 116. `reverse`/`nreverse` 对点状列表（dotted list）丢失尾部（`(nreverse '(1 2 3 . 4))` 返回 `(3 2 1)` 而非 `(3 2 1 . 4)`）— 已修复（改用 `for i := 0; i < len(elems); i++ { tail = cons(elems[i], tail) }` 方式重建反转列表，保留原始尾部值）
+
+## 新发现并修复的 Bug（第三轮 SBCL 测试）
+
+117. `char-name` 对 `(code-char 127)` 返回 "Del" 而非 "Rubout"（ANSI CL 要求 code-char(127) 与 #\rubout 为同一字符，名为 "Rubout"）— 已修复（builtinCharName 添加 code 127 优先返回 "Rubout"）
+
+118. 复数浮点显示丢失 `.0` 后缀（`(coerce 1.0 '(complex float))` 打印 `#c(1 0)` 而非 `#c(1.0 0.0)`，虚部 0.0 显示为 0）— 已修复（添加 formatComplexPart 辅助函数，vcomplexAlways 设置 isFloat=true，VComplex.toString 使用 formatComplexPart）
+
+119. `coerce` 到 `(complex rational)` 类型不产生复数（`(coerce 1/2 '(complex rational))` 返回 `1/2` 而非 `#c(1/2 0)`）— 已修复（coerce 中 compound complex 类型使用 vcomplexAlways）
+
+120. `subtypep` 返回单值而非双值（CL 要求 `(values subtypedefinite-p)`，microlisp 返回裸 `#t`）— 已确认已修复（代码已返回 multiVal 双值）
+
+121. `format ~s` 打印符号大写（`foo` 打印为 `FOO`，CL 默认应保持读取时的大小写）— 非Bug（CL reader 默认大写化符号名，~s 打印大写是正确行为）
+
+122. `map` 不支持 `'list` 结果类型（`(map 'list #'1+ '(1 2 3))` 报错 "unsupported result-type: LIST"）— 已修复（builtinMap switch 使用大写符号名匹配 "LIST"/"CONS"/"VECTOR"/"STRING"）

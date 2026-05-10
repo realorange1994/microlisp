@@ -931,12 +931,24 @@ func vcomplex(r, i float64) *Value {
 
 // vcomplexAlways creates a VComplex value even when imaginary part is zero.
 // Used for (coerce x '(complex float)) where the result type must be complex.
+// Sets isFloat=true so that printing preserves the float appearance (e.g., #c(1.0 0.0)).
 func vcomplexAlways(r, i float64) *Value {
 	v := gcv()
 	v.typ = VComplex
 	v.num = r
 	v.imag = i
+	v.isFloat = true
 	return v
+}
+
+// formatComplexPart formats a float64 part of a complex number,
+// ensuring that if isFloat is true, the result always has a decimal point.
+func formatComplexPart(f float64, isFloat bool) string {
+	s := strconv.FormatFloat(f, 'g', -1, 64)
+	if isFloat && !strings.Contains(s, ".") && !strings.Contains(s, "e") && !strings.Contains(s, "E") && !strings.Contains(s, "inf") && !strings.Contains(s, "Inf") && !strings.Contains(s, "NaN") {
+		s += ".0"
+	}
+	return s
 }
 func gcd(a, b int64) int64 {
 	for b != 0 {
@@ -1984,7 +1996,15 @@ func (p *Parser) readExpr() (*Value, error) {
 			imagVal, err2 := parseFloatStr(imagStr)
 			if err1 == nil && err2 == nil {
 				p.advance()
-				return vcomplex(realVal, imagVal), nil
+				v := vcomplexAlways(realVal, imagVal)
+				// Mark as float if either part was written as a float literal
+				if v.typ == VComplex {
+					hasFloat := strings.ContainsAny(realStr, ".eEdDfFsSlL") || strings.ContainsAny(imagStr, ".eEdDfFsSlL")
+					if hasFloat {
+						v.isFloat = true
+					}
+				}
+				return v, nil
 			}
 		}
 		return nil, fmt.Errorf("invalid complex number literal: #C(%s)", inner)
@@ -8076,6 +8096,10 @@ func builtinCharName(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("char-name: expected a character")
 	}
 	ch := args[0].ch
+	// CL spec: code 127 is named "Rubout" (not "Del" which is an implementation-dependent synonym)
+	if ch == 127 {
+		return vstr("Rubout"), nil
+	}
 	// Check named characters (return capitalized name per CL spec)
 	for name, r := range charNameMap {
 		if r == ch {
@@ -8295,8 +8319,16 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 										vv = vv.cdr
 									}
 									} else {
+									var optDefault *Value
 									if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
-										env.Set(varName.str, elem.cdr.car)
+										optDefault = elem.cdr.car
+									}
+									if optDefault != nil {
+										evalDef, _ := eval(optDefault, env)
+										if evalDef == nil {
+											evalDef = vnil()
+										}
+										env.Set(varName.str, evalDef)
 									} else {
 										env.Set(varName.str, vnil())
 									}
@@ -8365,7 +8397,11 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 									env.Set(keySuppliedPSym.str, vbool(true))
 								}
 							} else if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
-								env.Set(varName.str, elem.cdr.car)
+								evalDef, _ := eval(elem.cdr.car, env)
+								if evalDef == nil {
+									evalDef = vnil()
+								}
+								env.Set(varName.str, evalDef)
 								if keySuppliedPSym != nil {
 									env.Set(keySuppliedPSym.str, vbool(false))
 								}
@@ -8383,7 +8419,37 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 							}
 							subVar := varName.cdr
 							if subVar != nil && subVar.typ == VSym {
-								// subVar is the symbol directly
+								// (:keyword var) simple form - bind var from keyword map or nil
+								if val, ok := keyValMap[keywordName]; ok {
+									env.Set(subVar.str, val)
+								} else {
+									env.Set(subVar.str, vnil())
+								}
+								// Handle (:keyword var default) and (:keyword var default supplied-p)
+								if elem.cdr != nil && elem.cdr.typ == VPair {
+									var kwDefault *Value
+									var kwSuppliedP *Value
+									if elem.cdr.car != nil {
+										kwDefault = elem.cdr.car
+									}
+									if elem.cdr.cdr != nil && elem.cdr.cdr.typ == VPair && elem.cdr.cdr.car != nil && elem.cdr.cdr.car.typ == VSym {
+										kwSuppliedP = elem.cdr.cdr.car
+									}
+									if _, ok := keyValMap[keywordName]; !ok {
+										if kwDefault != nil {
+											evalDef, _ := eval(kwDefault, env)
+											if evalDef == nil {
+												evalDef = vnil()
+											}
+											env.Set(subVar.str, evalDef)
+										}
+										if kwSuppliedP != nil {
+											env.Set(kwSuppliedP.str, vbool(false))
+										}
+									} else if kwSuppliedP != nil {
+										env.Set(kwSuppliedP.str, vbool(true))
+									}
+								}
 							} else if subVar != nil && subVar.typ == VPair && subVar.car != nil && subVar.car.typ == VSym {
 								// subVar is a list like (VAR) - extract car
 								subVar = subVar.car
@@ -8397,7 +8463,11 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 										env.Set(kwSuppliedPSym.str, vbool(true))
 									}
 								} else if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
-									env.Set(subVar.str, elem.cdr.car)
+									evalDef2, _ := eval(elem.cdr.car, env)
+									if evalDef2 == nil {
+										evalDef2 = vnil()
+									}
+									env.Set(subVar.str, evalDef2)
 									if kwSuppliedPSym != nil {
 										env.Set(kwSuppliedPSym.str, vbool(false))
 									}
@@ -14195,14 +14265,14 @@ func builtinMap(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("map: result-type must be a symbol, got %v", resultType)
 	}
 	switch resultType.str {
-	case "list", "cons":
+	case "LIST", "CONS":
 		return listFromSlice(result), nil
-	case "vector":
+	case "VECTOR":
 		av := gcv()
 		av.typ = VArray
 		av.array = &LispArray{dims: []int{len(result)}, elements: result, fillPtr: -1}
 		return av, nil
-	case "string":
+	case "STRING":
 		var sb strings.Builder
 		for _, v := range result {
 			if v.typ == VChar {
@@ -19433,13 +19503,12 @@ func builtinCoerce(args []*Value) (*Value, error) {
 				return vcomplexAlways(r, i), nil
 			}
 			return vcomplexAlways(toNum(obj), 0), nil
-		case "rational":
-			// (complex rational) - complex with rational parts
-			n := toNum(obj)
-			if n == float64(int64(n)) {
-				return vcomplexAlways(float64(int64(n)), 0), nil
+		case "rational", "integer":
+			// (complex rational) or (complex integer) - must always produce a VComplex
+			if obj.typ == VComplex {
+				return obj, nil
 			}
-			return toRational(n), nil // This won't work well, but handle as best as possible
+			return vcomplexAlways(toNum(obj), 0), nil
 		default:
 			// Plain (complex) or unknown subtype
 			if obj.typ == VComplex {
@@ -20844,8 +20913,8 @@ func toString(v *Value) string {
 	case VRat:
 		return strconv.FormatInt(v.irat, 10) + "/" + strconv.FormatInt(v.iden, 10)
 	case VComplex:
-		r := strconv.FormatFloat(v.num, 'g', -1, 64)
-		i := strconv.FormatFloat(v.imag, 'g', -1, 64)
+		r := formatComplexPart(v.num, v.isFloat)
+		i := formatComplexPart(v.imag, v.isFloat)
 		return "#c(" + r + " " + i + ")"
 	case VBigInt:
 		return v.bigInt.String()
