@@ -84,15 +84,15 @@
 40. `butlast` 对 n<=0 返回原列表而非副本
 41. `block`/`return-from` 不接受 nil 作为块名
 42. `eq`/`equal` 不将 nil 符号和 VNil（空列表）视为相等
-43. 双反引号嵌套求值错误（`(quasiquote (quasiquote X))` 未正确解包）
-44. `unquote`/`unquote-splicing` 在 depth>0 时未递归处理
+43. 双反引号嵌套求值错误（`(quasiquote (quasiquote X))` 未正确解包）— 已修复（evalQuasiquote 重写：QUASIQUOTE 递归 depth+1 并包装结果；UNQUOTE/UNQUOTE-SPLICING 在 depth==1 时求值，depth>1 时递归 depth-1 并包装）
+44. `unquote`/`unquote-splicing` 在 depth>0 时未递归处理 — 已修复（与 Bug #43 同修复）
 45. `loop` 的 `for x = expr` 子句在 expr 中引用其他循环变量时报 undefined
-46. `load` 不支持 `:if-does-not-exist nil` 关键字参数
+46. `load` 不支持 `:if-does-not-exist nil` 关键字参数 — 已确认已实现（builtinLoad 已处理 :if-does-not-exist 和 :if-exists 关键字参数）
 47. `stringp`/`numberp` 谓词函数未实现
 48. `loop` 不支持 `being each present-symbol/external-symbol of package` 子句
 49. `random` 函数接受浮点数参数时总是返回 0（截断为整数导致 rand.Intn(0/1)）
 50. `macroexpand` 不展开 quasiquote 形式（返回原始形式不变）
-51. `loop` 不支持解构模式如 `(for (a b) in list)`
+51. `loop` 不支持解构模式如 `(for (a b) in list)` — 已确认已实现（loop 宏已支持 destr-specs/destructuring-bind 包装解构模式）
 52. `functionp` 谓词函数未实现
 53. `defun` 接受 `(setf name)` 作为函数名 — 已修复
 54. `ignore-errors` 错误时未返回 `(values nil condition)`
@@ -105,12 +105,12 @@
 61. `logand`/`logior`/`logxor` 对非整数参数静默转为0而非报type-error — 已修复（已有 `isIntegerValue` 检查和 `signalTypeError` 返回）
 62. `(setf (values ...) ...)` 未实现
 63. `char-name` 对 C1 控制字符（128-159）返回 nil — 已修复（返回 "C128"、"C129" 等实现定义名称，C0 未命名控制字符也返回 "C0"、"C1" 等）
-64. `type-of` 返回 `"unknown"` 对于 `pathname`、`random-state`、`array`、`integer`（大整数）类型
-65. `typep`/`subtypep` 类型比较大小写不敏感问题（符号名大写后比较失败）
+64. `type-of` 返回 `"unknown"` 对于 `pathname`、`random-state`、`array`、`integer`（大整数）类型 — 已修复（typeStr 返回正确类型名称；typepCheckRec 符号分支添加 PATHNAME、RANDOM-STATE、PACKAGE、READTABLE、METHOD、RESTART、GENERIC、INSTANCE、HASH-TABLE、CHARACTER、STREAM、CLASS、MACRO、BOOLEAN、SEQUENCE、ATOM、RATIONAL、COMPLEX 类型检查；复合类型说明符分支添加相同类型检查并修复缩进）
+65. `typep`/`subtypep` 类型比较大小写不敏感问题（符号名大写后比较失败）— 已修复（subtypepChecks 使用 strings.ToUpper 标准化类型名后比较，simpleSubtype 也使用大写比较）
 66. `destructuring-bind` 的 Go 实现中 lambda-list 关键字大小写不匹配（`&rest` vs `&REST`）
 67. `set!`/`setq` 不更新 globalEnv 中已定义的全局变量
 68. `isNil()` 不识别 VSym "NIL"（导致 length/butlast 等函数对 nil 报错）
-69. `find-all-symbols` 函数未实现
+69. `find-all-symbols` 函数未实现 — 已确认已实现（builtinFindAllSymbols 已存在于代码中）
 70. `coerce` 类型说明符大小写敏感（`'STRING` vs `'string`）
 71. 关键字参数大小写不匹配（reader 大写化后 Go 侧用小写匹配）
 72. `checked-compile` 宏引用 bug（`eval` 未正确展开变量）

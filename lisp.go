@@ -5512,11 +5512,20 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 		if v.cdr == nil || v.cdr.typ != VPair {
 			return nil, fmt.Errorf("unquote-splicing: malformed form")
 		}
+		if depth == 1 {
+			// The unquote-splicing belongs to the nearest quasiquote, evaluate the argument
+			inner, e := eval(v.cdr.car, env)
+			if e != nil {
+				return nil, e
+			}
+			return list(vsym("unquote-splicing"), inner), nil
+		}
+		// depth > 1: preserve the comma but process recursively
 		inner, e := evalQuasiquote(v.cdr.car, depth-1, env)
 		if e != nil {
 			return nil, e
 		}
-		return list(vsym("quasiquote"), list(vsym("unquote-splicing"), inner)), nil
+		return list(vsym("unquote-splicing"), inner), nil
 	}
 	// (unquote-splicing expr) at depth 0 - not valid here
 	if strings.EqualFold(symName, "UNQUOTE-SPLICING") && depth == 0 {
@@ -5527,17 +5536,58 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 		if v.cdr == nil || v.cdr.typ != VPair {
 			return nil, fmt.Errorf("quasiquote: malformed form")
 		}
-		return evalQuasiquote(v.cdr.car, depth+1, env)
+		inner, e := evalQuasiquote(v.cdr.car, depth+1, env)
+		if e != nil {
+			return nil, e
+		}
+		return list(vsym("quasiquote"), inner), nil
 	}
 	if strings.EqualFold(symName, "UNQUOTE") && depth > 0 {
 		if v.cdr == nil || v.cdr.typ != VPair {
 			return nil, fmt.Errorf("unquote: malformed form")
 		}
+		if depth == 1 {
+			// The unquote belongs to the nearest quasiquote: comma is consumed.
+			// Evaluate the argument, but if it's quasiquote-related, process with
+			// evalQuasiquote and preserve the inner wrapper structure.
+			arg := v.cdr.car
+			if isPair(arg) && arg.car != nil && arg.car.typ == VSym {
+				aname := arg.car.str
+				if strings.EqualFold(aname, "QUASIQUOTE") {
+					// Process nested quasiquote form at depth 1, wrap result with (quasiquote ...)
+					inner, e := evalQuasiquote(arg.cdr.car, 1, env)
+					if e != nil {
+						return nil, e
+					}
+					return list(vsym("quasiquote"), inner), nil
+				}
+				if strings.EqualFold(aname, "UNQUOTE") {
+					// ,,x: the inner unquote belongs to the inner quasiquote,
+					// the outer comma consumes the unquote wrapper.
+					// Evaluate the innermost argument directly.
+					if isPair(arg.cdr) {
+						return eval(arg.cdr.car, env)
+					}
+					return nil, fmt.Errorf("unquote: malformed form")
+				}
+				if strings.EqualFold(aname, "UNQUOTE-SPLICING") {
+					// Process inner unquote-splicing at depth 0, wrap with (unquote-splicing ...)
+					inner, e := evalQuasiquote(arg, 0, env)
+					if e != nil {
+						return nil, e
+					}
+					return list(vsym("unquote-splicing"), inner), nil
+				}
+			}
+			// Simple argument: evaluate directly (comma consumed)
+			return eval(arg, env)
+		}
+		// depth > 1: process argument at depth-1 and preserve the unquote wrapper
 		inner, e := evalQuasiquote(v.cdr.car, depth-1, env)
 		if e != nil {
 			return nil, e
 		}
-		return list(vsym("quasiquote"), list(vsym("unquote"), inner)), nil
+		return list(vsym("unquote"), inner), nil
 	}
 	// Build list
 	var result *Value = vnil()
@@ -10125,8 +10175,8 @@ func subtypepChecks(v1, v2 *Value) (bool, bool) {
 		return false
 	}
 
-	n1 := typeName(v1)
-	n2 := typeName(v2)
+	n1 := strings.ToUpper(typeName(v1))
+	n2 := strings.ToUpper(typeName(v2))
 
 	// If both are simple type names
 	if v1.typ == VSym && v2.typ == VSym {
@@ -10143,7 +10193,9 @@ func subtypepChecks(v1, v2 *Value) (bool, bool) {
 		if n2 == "*" || n2 == "T" {
 			return true, true
 		}
-		if simpleSubtype(n1, n2) {
+		n1u := strings.ToUpper(n1)
+		n2u := strings.ToUpper(n2)
+		if simpleSubtype(n1u, n2u) {
 			return true, true
 		}
 		cls1 := findClass(n1)
