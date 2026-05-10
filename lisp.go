@@ -8245,24 +8245,31 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 								env.Set(elem.str, vnil())
 							}
 						} else if elem.typ == VPair {
-							// (var default-value) or (var)
+							// (var default-value supplied-p) or (var default-value) or (var)
 							varName := elem.car
 							if varName != nil && varName.typ == VSym {
+								var optSuppliedPSym *Value
+								if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.cdr != nil && elem.cdr.cdr.typ == VPair && elem.cdr.cdr.car != nil && elem.cdr.cdr.car.typ == VSym {
+									optSuppliedPSym = elem.cdr.cdr.car
+								}
 								if !isNil(vv) {
 									env.Set(varName.str, vv.car)
+									if optSuppliedPSym != nil {
+										env.Set(optSuppliedPSym.str, vbool(true))
+									}
 									if !isNil(vv) {
 										vv = vv.cdr
 									}
-								} else {
-									// Use default value if provided, else nil
+									} else {
 									if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
-										// Can't eval default in Go - bind to nil as fallback
-										// The macro-based implementation handles this properly
-										env.Set(varName.str, vnil())
+										env.Set(varName.str, elem.cdr.car)
 									} else {
 										env.Set(varName.str, vnil())
 									}
-								}
+									if optSuppliedPSym != nil {
+										env.Set(optSuppliedPSym.str, vbool(false))
+									}
+									}
 							}
 						} else {
 							// Non-symbol/non-list element (e.g., number literal in default),
@@ -8314,14 +8321,24 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 						// (var default-value) or ((:keyword var) default-value) or (:keyword var) or (:keyword var default-value)
 						varName := elem.car
 						if varName != nil && varName.typ == VSym {
+							var keySuppliedPSym *Value
+							if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.cdr != nil && elem.cdr.cdr.typ == VPair && elem.cdr.cdr.car != nil && elem.cdr.cdr.car.typ == VSym {
+								keySuppliedPSym = elem.cdr.cdr.car
+							}
 							if val, ok := keyValMap[varName.str]; ok {
 								env.Set(varName.str, val)
+								if keySuppliedPSym != nil {
+									env.Set(keySuppliedPSym.str, vbool(true))
+								}
+							} else if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
+								env.Set(varName.str, elem.cdr.car)
+								if keySuppliedPSym != nil {
+									env.Set(keySuppliedPSym.str, vbool(false))
+								}
 							} else {
-								// Use default value if provided, else nil
-								if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
-									env.Set(varName.str, vnil())
-								} else {
-									env.Set(varName.str, vnil())
+								env.Set(varName.str, vnil())
+								if keySuppliedPSym != nil {
+									env.Set(keySuppliedPSym.str, vbool(false))
 								}
 							}
 						} else if varName != nil && varName.typ == VPair && varName.car != nil && varName.car.typ == VSym {
@@ -8332,12 +8349,29 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 							}
 							subVar := varName.cdr
 							if subVar != nil && subVar.typ == VSym {
+								// subVar is the symbol directly
+							} else if subVar != nil && subVar.typ == VPair && subVar.car != nil && subVar.car.typ == VSym {
+								// subVar is a list like (VAR) - extract car
+								subVar = subVar.car
+								var kwSuppliedPSym *Value
+								if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.cdr != nil && elem.cdr.cdr.typ == VPair && elem.cdr.cdr.car != nil && elem.cdr.cdr.car.typ == VSym {
+									kwSuppliedPSym = elem.cdr.cdr.car
+								}
 								if val, ok := keyValMap[keywordName]; ok {
 									env.Set(subVar.str, val)
+									if kwSuppliedPSym != nil {
+										env.Set(kwSuppliedPSym.str, vbool(true))
+									}
 								} else if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
-									env.Set(subVar.str, vnil())
+									env.Set(subVar.str, elem.cdr.car)
+									if kwSuppliedPSym != nil {
+										env.Set(kwSuppliedPSym.str, vbool(false))
+									}
 								} else {
 									env.Set(subVar.str, vnil())
+									if kwSuppliedPSym != nil {
+										env.Set(kwSuppliedPSym.str, vbool(false))
+									}
 								}
 							}
 						}
