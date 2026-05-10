@@ -120,6 +120,8 @@ type Value struct {
 	params []string
 	rest   string
 	whole  string // &whole binding
+	optDefaults []*Value // default expressions for &optional params (nil = default to NIL)
+	keySpecs    []*Value // (key-name param-name default) triples for &key params
 	body   *Value
 	env    *Env
 	fn     NativeFunc
@@ -979,6 +981,7 @@ func vbool(b bool) *Value {
 func vchar(ch rune) *Value    { v := gcv(); v.typ = VChar; v.ch = ch; return v }
 func vnil() *Value            { return globalEnv.bindings["nil"] }
 func cons(a, b *Value) *Value { v := gcv(); v.typ = VPair; v.car = a; v.cdr = b; return v }
+func list3(a, b, c *Value) *Value { return cons(a, cons(b, cons(c, vnil()))) }
 
 func isNil(v *Value) bool { return v == nil || v.typ == VNil || (v.typ == VSym && strings.EqualFold(v.str, "nil")) }
 
@@ -2268,12 +2271,14 @@ evalLoop:
 				}
 				fn := gcv()
 				fn.typ = VFunc
-				params, rest, e := parseParams(v.cdr.car)
+				params, rest, optDefaults, keySpecs, e := parseParams(v.cdr.car)
 				if e != nil {
 					return nil, e
 				}
 				fn.params = params
 				fn.rest = rest
+				fn.optDefaults = optDefaults
+				fn.keySpecs = keySpecs
 				fn.body = v.cdr.cdr
 				fn.env = env
 				return fn, nil
@@ -2403,12 +2408,14 @@ evalLoop:
 					}
 					fparams := b.cdr.car
 					fbody := b.cdr.cdr
-					params, rest, e := parseParams(fparams)
+					params, rest, optDefaults, keySpecs, e := parseParams(fparams)
 					if e != nil {
 						return nil, e
 					}
 					fn.params = params
 					fn.rest = rest
+					fn.optDefaults = optDefaults
+					fn.keySpecs = keySpecs
 					fn.body = fbody
 					fn.env = newEnv
 					newEnv.Set(fname, fn)
@@ -2471,12 +2478,14 @@ evalLoop:
 					}
 					fparams := b.cdr.car
 					fbody := b.cdr.cdr
-					params, rest, e := parseParams(fparams)
+					params, rest, optDefaults, keySpecs, e := parseParams(fparams)
 					if e != nil {
 						return nil, e
 					}
 					fn.params = params
 					fn.rest = rest
+					fn.optDefaults = optDefaults
+					fn.keySpecs = keySpecs
 					fn.body = fbody
 					bindings = bindings.cdr
 				}
@@ -2512,7 +2521,7 @@ evalLoop:
 						return nil, fmt.Errorf("define: function name must be a symbol")
 					}
 					name = head.car.str
-					params, rest, e := parseParams(head.cdr)
+					params, rest, optDefaults, keySpecs, e := parseParams(head.cdr)
 					if e != nil {
 						return nil, e
 					}
@@ -2521,6 +2530,8 @@ evalLoop:
 					fn.name = name
 					fn.params = params
 					fn.rest = rest
+					fn.optDefaults = optDefaults
+					fn.keySpecs = keySpecs
 					fn.body = v.cdr.cdr
 					fn.env = env
 					val = fn
@@ -2675,7 +2686,7 @@ evalLoop:
 					return nil, fmt.Errorf("defun: missing lambda list")
 				}
 				lambdaList := v.cdr.cdr.car
-				params, rest, e := parseParams(lambdaList)
+				params, rest, optDefaults, keySpecs, e := parseParams(lambdaList)
 				if e != nil {
 					return nil, fmt.Errorf("defun: %v", e)
 				}
@@ -2685,6 +2696,8 @@ evalLoop:
 				fn.name = name
 				fn.params = params
 				fn.rest = rest
+				fn.optDefaults = optDefaults
+				fn.keySpecs = keySpecs
 				fn.body = body
 				fn.env = NewEnv(globalEnv)
 				globalEnv.Set(name, fn)
@@ -4833,29 +4846,100 @@ func apply(fn *Value, args *Value, env *Env) (result *Value, err error) {
 			}
 			evArgs[i] = primaryValue(v)
 		}
-		newEnv := NewEnv(fn.env)
-		if fn.rest != "" {
-			for i, p := range fn.params {
-				if i < len(evArgs) {
-					newEnv.Set(p, evArgs[i])
-				} else {
-					newEnv.Set(p, vnil())
-				}
-			}
-			newEnv.Set(fn.rest, listFromSlice(evArgs[len(fn.params):]))
-		} else {
-			for i, p := range fn.params {
-				if i < len(evArgs) {
-					newEnv.Set(p, evArgs[i])
-				} else {
-					s := fmt.Sprintf("need %d got %d: params=[", len(fn.params), len(evArgs))
-					for _, p := range fn.params {
-						s += p + ","
+				newEnv := NewEnv(fn.env)
+		numRequired := len(fn.params) - len(fn.optDefaults) - len(fn.keySpecs)
+		if numRequired < 0 {
+			numRequired = 0
+		}
+
+		// Extract keyword args if function has key specs
+		keyVals := make(map[string]*Value)
+		positionalArgs := evArgs
+		if len(fn.keySpecs) > 0 {
+			var nonKeyword []*Value
+			i := 0
+			for i < len(evArgs) {
+				if evArgs[i] != nil && evArgs[i].typ == VSym && len(evArgs[i].str) > 0 && evArgs[i].str[0] == ':' {
+					keyName := evArgs[i].str[1:]
+					if i+1 < len(evArgs) {
+						keyVals[keyName] = evArgs[i+1]
+						i += 2
+					} else {
+						nonKeyword = append(nonKeyword, evArgs[i])
+						i++
 					}
-					s += "]"
-					return nil, fmt.Errorf("apply: too few args, %s", s)
+				} else {
+					nonKeyword = append(nonKeyword, evArgs[i])
+					i++
 				}
 			}
+			positionalArgs = nonKeyword
+		}
+
+		// Bind required params
+		for i := 0; i < numRequired; i++ {
+			if i < len(positionalArgs) {
+				newEnv.Set(fn.params[i], positionalArgs[i])
+			} else {
+				return nil, fmt.Errorf("apply: missing required argument")
+			}
+		}
+
+		// Evaluate optional defaults and bind optional params
+		paramIdx := numRequired
+		for _, defaultExpr := range fn.optDefaults {
+			if paramIdx < len(positionalArgs) {
+				newEnv.Set(fn.params[paramIdx], positionalArgs[paramIdx])
+			} else if !isNil(defaultExpr) {
+				defVal, err := eval(defaultExpr, newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(fn.params[paramIdx], defVal)
+			} else {
+				newEnv.Set(fn.params[paramIdx], vnil())
+			}
+			paramIdx++
+		}
+
+		// Bind key params
+		paramIdx = numRequired + len(fn.optDefaults)
+		for _, spec := range fn.keySpecs {
+			if spec == nil || spec.typ != VPair || spec.car == nil || spec.cdr == nil || spec.cdr.typ != VPair || spec.cdr.cdr == nil || spec.cdr.cdr.typ != VPair {
+				paramIdx++
+				continue
+			}
+			keyName := spec.car.str
+			if len(keyName) > 0 && keyName[0] == ':' {
+				keyName = keyName[1:]
+			}
+			paramName := spec.cdr.car.str
+			defaultExpr := spec.cdr.cdr.car
+			if val, ok := keyVals[keyName]; ok {
+				newEnv.Set(paramName, val)
+			} else if !isNil(defaultExpr) {
+				defVal, err := eval(defaultExpr, newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(paramName, defVal)
+			} else {
+				newEnv.Set(paramName, vnil())
+			}
+			paramIdx++
+		}
+
+		// Bind rest param if present
+		if fn.rest != "" {
+			var restElems []*Value
+			if len(fn.keySpecs) > 0 {
+				restElems = positionalArgs[paramIdx:]
+			} else if fn.optDefaults != nil {
+				restElems = positionalArgs[len(fn.params)-len(fn.optDefaults):]
+			} else {
+				restElems = positionalArgs[len(fn.params):]
+			}
+			newEnv.Set(fn.rest, listFromSlice(restElems))
 		}
 		body := fn.body
 		if isNil(body) {
@@ -5269,60 +5353,122 @@ func evalQuasiquote(v *Value, depth int, env *Env) (*Value, error) {
 	return result, nil
 }
 
-func parseParams(v *Value) ([]string, string, error) {
+func parseParams(v *Value) ([]string, string, []*Value, []*Value, error) {
 	if v.typ == VSym {
-		return nil, v.str, nil
+		return nil, v.str, nil, nil, nil
 	}
 	var params []string
+	var optDefaults []*Value // default exprs for optional params (nil = use NIL)
+	var keySpecs []*Value    // (keyword param-name default) for &key params
 	seen := make(map[*Value]bool)
+	inOptional := false
+	inKey := false
 	for !isNil(v) {
 		if seen[v] {
-			return nil, "", fmt.Errorf("bad lambda parameter list: circular")
+			return nil, "", nil, nil, fmt.Errorf("bad lambda parameter list: circular")
 		}
 		seen[v] = true
-		if v.car != nil && v.car.typ == VSym {
-			s := v.car.str
+		elem := v.car
+		// Check for keyword symbols first
+		if elem != nil && elem.typ == VSym {
+			s := elem.str
 			if s == "&rest" || s == "&REST" || s == "&body" || s == "&BODY" {
-				// Next symbol is the rest param name
 				if v.cdr == nil || v.cdr.typ != VPair || v.cdr.car == nil || v.cdr.car.typ != VSym {
-					return nil, "", fmt.Errorf("bad lambda parameter list: %s requires a symbol", s)
+					return nil, "", nil, nil, fmt.Errorf("bad lambda parameter list: %s requires a symbol", s)
 				}
-				return params, v.cdr.car.str, nil
+				return params, v.cdr.car.str, optDefaults, keySpecs, nil
 			}
-			if s == "&optional" || s == "&OPTIONAL" || s == "&key" || s == "&KEY" || s == "&allow-other-keys" || s == "&aux" || s == "&AUX" || s == "&whole" || s == "&WHOLE" || s == "&environment" || s == "&ENVIRONMENT" {
-				// Collect remaining parameter names (from &optional, &key, &aux lists)
-				rest := v.cdr
-				for !isNil(rest) {
-					if rest.typ != VPair {
-						break
-					}
-					elem := rest.car
-					// Each element can be a symbol or a list (sym default init-supplied-p)
-					if elem != nil {
-						if elem.typ == VSym {
-							params = append(params, elem.str)
-						} else if elem.typ == VPair && elem.car != nil && elem.car.typ == VSym {
-							params = append(params, elem.car.str)
+			if s == "&optional" || s == "&OPTIONAL" {
+				inOptional = true
+				inKey = false
+				v = v.cdr
+				continue
+			}
+			if s == "&key" || s == "&KEY" {
+				inOptional = false
+				inKey = true
+				v = v.cdr
+				continue
+			}
+			if s == "&allow-other-keys" || s == "&AUX" || s == "&aux" || s == "&whole" || s == "&WHOLE" || s == "&environment" || s == "&ENVIRONMENT" {
+				v = v.cdr
+				continue
+			}
+			// Not a keyword, fall through to param handling
+		}
+		if inKey {
+			// &key param
+			var keyword, paramName string
+			var defaultExpr *Value = vnil()
+			if elem != nil && elem.typ == VSym {
+				keyword = ":" + elem.str
+				paramName = elem.str
+			} else if elem != nil && elem.typ == VPair && elem.car != nil && elem.car.typ == VSym {
+				// Check if this is ((keyword param) default) or (param default)
+				if elem.car.typ == VSym && elem.car.str != "" && elem.car.str[0] == ':' {
+					// This is ((:keyword param) default) format
+					keyword = elem.car.str // already starts with ':'
+					if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil && elem.cdr.car.typ == VSym {
+						paramName = elem.cdr.car.str
+						if elem.cdr.cdr != nil && elem.cdr.cdr.typ == VPair && elem.cdr.cdr.car != nil {
+							defaultExpr = elem.cdr.cdr.car
 						}
 					}
-					rest = rest.cdr
+				} else if elem.car.typ == VPair && elem.car.car != nil && elem.car.car.typ == VSym {
+					// This is ((keyword param) default) format where keyword may not start with ':'
+					keyword = ":" + elem.car.car.str
+					if elem.car.cdr != nil && elem.car.cdr.typ == VPair && elem.car.cdr.car != nil && elem.car.cdr.car.typ == VSym {
+						paramName = elem.car.cdr.car.str
+					}
+					if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
+						defaultExpr = elem.cdr.car
+					}
+				} else {
+					// This is (param default) format - keyword is :PARAM
+					keyword = ":" + elem.car.str
+					paramName = elem.car.str
+					if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
+						defaultExpr = elem.cdr.car
+					}
 				}
-				break
 			}
-			params = append(params, s)
+			if paramName != "" {
+				params = append(params, paramName)
+				keySpecs = append(keySpecs, list3(vsym(keyword), vsym(paramName), defaultExpr))
+			} else {
+			}
 			v = v.cdr
-		} else {
-			break
+			continue
 		}
+		if inOptional {
+			// Optional param: can be symbol or (symbol default)
+			if elem != nil && elem.typ == VSym {
+				params = append(params, elem.str)
+				optDefaults = append(optDefaults, nil)
+			} else if elem != nil && elem.typ == VPair && elem.car != nil && elem.car.typ == VSym {
+				params = append(params, elem.car.str)
+				var defaultExpr *Value = vnil()
+				if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
+					defaultExpr = elem.cdr.car
+				}
+				optDefaults = append(optDefaults, defaultExpr)
+			}
+			v = v.cdr
+			continue
+		}
+		// Regular required param
+		if elem != nil && elem.typ == VSym {
+			params = append(params, elem.str)
+		}
+		v = v.cdr
 	}
 	if !isNil(v) && v.typ == VSym {
-		return params, v.str, nil
+		return params, v.str, optDefaults, keySpecs, nil
 	}
-	// Remaining content after &optional/&key/&aux is OK - just return what we collected
-	return params, "", nil
+	return params, "", optDefaults, keySpecs, nil
 }
 
-// parseMacroParams handles &whole, &rest, &body, &environment, &optional, &key, &aux lambda list keywords
+
 func parseMacroParams(v *Value) (params []string, rest string, whole string, envSym string, err error) {
 	// Check for &whole at the beginning
 	if v.typ == VPair && v.car != nil && v.car.typ == VSym && (v.car.str == "&whole" || v.car.str == "&WHOLE") {
@@ -10546,24 +10692,95 @@ func builtinApply(args []*Value) (*Value, error) {
 	case VPrim:
 		return fn.fn(evalArgs)
 	case VFunc:
-		newEnv := NewEnv(fn.env)
+				newEnv := NewEnv(fn.env)
+		numRequired := len(fn.params) - len(fn.optDefaults) - len(fn.keySpecs)
+		if numRequired < 0 {
+			numRequired = 0
+		}
+
+		keyVals := make(map[string]*Value)
+		positionalArgs := evalArgs
+		if len(fn.keySpecs) > 0 {
+			var nonKeyword []*Value
+			i := 0
+			for i < len(evalArgs) {
+				if evalArgs[i] != nil && evalArgs[i].typ == VSym && len(evalArgs[i].str) > 0 && evalArgs[i].str[0] == ':' {
+					keyName := evalArgs[i].str[1:]
+					if i+1 < len(evalArgs) {
+						keyVals[keyName] = evalArgs[i+1]
+						i += 2
+					} else {
+						nonKeyword = append(nonKeyword, evalArgs[i])
+						i++
+					}
+				} else {
+					nonKeyword = append(nonKeyword, evalArgs[i])
+					i++
+				}
+			}
+			positionalArgs = nonKeyword
+		}
+
+		for i := 0; i < numRequired; i++ {
+			if i < len(positionalArgs) {
+				newEnv.Set(fn.params[i], positionalArgs[i])
+			} else {
+				return nil, fmt.Errorf("apply: missing required argument")
+			}
+		}
+
+		paramIdx := numRequired
+		for _, defaultExpr := range fn.optDefaults {
+			if paramIdx < len(positionalArgs) {
+				newEnv.Set(fn.params[paramIdx], positionalArgs[paramIdx])
+			} else if !isNil(defaultExpr) {
+				defVal, err := eval(defaultExpr, newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(fn.params[paramIdx], defVal)
+			} else {
+				newEnv.Set(fn.params[paramIdx], vnil())
+			}
+			paramIdx++
+		}
+
+		paramIdx = numRequired + len(fn.optDefaults)
+		for _, spec := range fn.keySpecs {
+			if spec == nil || spec.typ != VPair || spec.car == nil || spec.cdr == nil || spec.cdr.typ != VPair || spec.cdr.cdr == nil || spec.cdr.cdr.typ != VPair {
+				paramIdx++
+				continue
+			}
+			keyName := spec.car.str
+			if len(keyName) > 0 && keyName[0] == ':' {
+				keyName = keyName[1:]
+			}
+			paramName := spec.cdr.car.str
+			defaultExpr := spec.cdr.cdr.car
+			if val, ok := keyVals[keyName]; ok {
+				newEnv.Set(paramName, val)
+			} else if !isNil(defaultExpr) {
+				defVal, err := eval(defaultExpr, newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(paramName, defVal)
+			} else {
+				newEnv.Set(paramName, vnil())
+			}
+			paramIdx++
+		}
+
 		if fn.rest != "" {
-			for i, p := range fn.params {
-				if i < len(evalArgs) {
-					newEnv.Set(p, evalArgs[i])
-				} else {
-					newEnv.Set(p, vnil())
-				}
+			var restElems []*Value
+			if len(fn.keySpecs) > 0 {
+				restElems = positionalArgs[paramIdx:]
+			} else if fn.optDefaults != nil {
+				restElems = positionalArgs[len(fn.params)-len(fn.optDefaults):]
+			} else {
+				restElems = positionalArgs[len(fn.params):]
 			}
-			newEnv.Set(fn.rest, listFromSlice(evalArgs[len(fn.params):]))
-		} else {
-			for i, p := range fn.params {
-				if i < len(evalArgs) {
-					newEnv.Set(p, evalArgs[i])
-				} else {
-					newEnv.Set(p, vnil())
-				}
-			}
+			newEnv.Set(fn.rest, listFromSlice(restElems))
 		}
 		body := fn.body
 		if isNil(body) {
@@ -12268,24 +12485,95 @@ func callWithValueArgs(fn *Value, args []*Value) (*Value, error) {
 	case VPrim:
 		return fn.fn(args)
 	case VFunc:
-		newEnv := NewEnv(fn.env)
+				newEnv := NewEnv(fn.env)
+		numRequired := len(fn.params) - len(fn.optDefaults) - len(fn.keySpecs)
+		if numRequired < 0 {
+			numRequired = 0
+		}
+
+		keyVals := make(map[string]*Value)
+		positionalArgs := args
+		if len(fn.keySpecs) > 0 {
+			var nonKeyword []*Value
+			i := 0
+			for i < len(args) {
+				if args[i] != nil && args[i].typ == VSym && len(args[i].str) > 0 && args[i].str[0] == ':' {
+					keyName := args[i].str[1:]
+					if i+1 < len(args) {
+						keyVals[keyName] = args[i+1]
+						i += 2
+					} else {
+						nonKeyword = append(nonKeyword, args[i])
+						i++
+					}
+				} else {
+					nonKeyword = append(nonKeyword, args[i])
+					i++
+				}
+			}
+			positionalArgs = nonKeyword
+		}
+
+		for i := 0; i < numRequired; i++ {
+			if i < len(positionalArgs) {
+				newEnv.Set(fn.params[i], positionalArgs[i])
+			} else {
+				return nil, fmt.Errorf("call: missing required argument")
+			}
+		}
+
+		paramIdx := numRequired
+		for _, defaultExpr := range fn.optDefaults {
+			if paramIdx < len(positionalArgs) {
+				newEnv.Set(fn.params[paramIdx], positionalArgs[paramIdx])
+			} else if !isNil(defaultExpr) {
+				defVal, err := eval(defaultExpr, newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(fn.params[paramIdx], defVal)
+			} else {
+				newEnv.Set(fn.params[paramIdx], vnil())
+			}
+			paramIdx++
+		}
+
+		paramIdx = numRequired + len(fn.optDefaults)
+		for _, spec := range fn.keySpecs {
+			if spec == nil || spec.typ != VPair || spec.car == nil || spec.cdr == nil || spec.cdr.typ != VPair || spec.cdr.cdr == nil || spec.cdr.cdr.typ != VPair {
+				paramIdx++
+				continue
+			}
+			keyName := spec.car.str
+			if len(keyName) > 0 && keyName[0] == ':' {
+				keyName = keyName[1:]
+			}
+			paramName := spec.cdr.car.str
+			defaultExpr := spec.cdr.cdr.car
+			if val, ok := keyVals[keyName]; ok {
+				newEnv.Set(paramName, val)
+			} else if !isNil(defaultExpr) {
+				defVal, err := eval(defaultExpr, newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(paramName, defVal)
+			} else {
+				newEnv.Set(paramName, vnil())
+			}
+			paramIdx++
+		}
+
 		if fn.rest != "" {
-			for i, p := range fn.params {
-				if i < len(args) {
-					newEnv.Set(p, args[i])
-				} else {
-					newEnv.Set(p, vnil())
-				}
+			var restElems []*Value
+			if len(fn.keySpecs) > 0 {
+				restElems = positionalArgs[paramIdx:]
+			} else if fn.optDefaults != nil {
+				restElems = positionalArgs[len(fn.params)-len(fn.optDefaults):]
+			} else {
+				restElems = positionalArgs[len(fn.params):]
 			}
-			newEnv.Set(fn.rest, listFromSlice(args[len(fn.params):]))
-		} else {
-			for i, p := range fn.params {
-				if i < len(args) {
-					newEnv.Set(p, args[i])
-				} else {
-					return nil, fmt.Errorf("call: too few args for %s", fn.name)
-				}
-			}
+			newEnv.Set(fn.rest, listFromSlice(restElems))
 		}
 		body := fn.body
 		if isNil(body) {
@@ -12963,24 +13251,95 @@ func callFnOnSeq(fn *Value, args []*Value, env *Env) (*Value, error) {
 
 			traceDepth++
 		}
-		newEnv := NewEnv(callFn.env)
+						newEnv := NewEnv(callFn.env)
+		numRequired := len(callFn.params) - len(callFn.optDefaults) - len(callFn.keySpecs)
+		if numRequired < 0 {
+			numRequired = 0
+		}
+
+		keyVals := make(map[string]*Value)
+		positionalArgs := args
+		if len(callFn.keySpecs) > 0 {
+			var nonKeyword []*Value
+			i := 0
+			for i < len(args) {
+				if args[i] != nil && args[i].typ == VSym && len(args[i].str) > 0 && args[i].str[0] == ':' {
+					keyName := args[i].str[1:]
+					if i+1 < len(args) {
+						keyVals[keyName] = args[i+1]
+						i += 2
+					} else {
+						nonKeyword = append(nonKeyword, args[i])
+						i++
+					}
+				} else {
+					nonKeyword = append(nonKeyword, args[i])
+					i++
+				}
+			}
+			positionalArgs = nonKeyword
+		}
+
+		for i := 0; i < numRequired; i++ {
+			if i < len(positionalArgs) {
+				newEnv.Set(callFn.params[i], positionalArgs[i])
+			} else {
+				return nil, fmt.Errorf("call: missing required argument")
+			}
+		}
+
+		paramIdx := numRequired
+		for _, defaultExpr := range callFn.optDefaults {
+			if paramIdx < len(positionalArgs) {
+				newEnv.Set(callFn.params[paramIdx], positionalArgs[paramIdx])
+			} else if !isNil(defaultExpr) {
+				defVal, err := eval(defaultExpr, newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(callFn.params[paramIdx], defVal)
+			} else {
+				newEnv.Set(callFn.params[paramIdx], vnil())
+			}
+			paramIdx++
+		}
+
+		paramIdx = numRequired + len(callFn.optDefaults)
+		for _, spec := range callFn.keySpecs {
+			if spec == nil || spec.typ != VPair || spec.car == nil || spec.cdr == nil || spec.cdr.typ != VPair || spec.cdr.cdr == nil || spec.cdr.cdr.typ != VPair {
+				paramIdx++
+				continue
+			}
+			keyName := spec.car.str
+			if len(keyName) > 0 && keyName[0] == ':' {
+				keyName = keyName[1:]
+			}
+			paramName := spec.cdr.car.str
+			defaultExpr := spec.cdr.cdr.car
+			if val, ok := keyVals[keyName]; ok {
+				newEnv.Set(paramName, val)
+			} else if !isNil(defaultExpr) {
+				defVal, err := eval(defaultExpr, newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(paramName, defVal)
+			} else {
+				newEnv.Set(paramName, vnil())
+			}
+			paramIdx++
+		}
+
 		if callFn.rest != "" {
-			for i, p := range callFn.params {
-				if i < len(args) {
-					newEnv.Set(p, args[i])
-				} else {
-					newEnv.Set(p, vnil())
-				}
+			var restElems []*Value
+			if len(callFn.keySpecs) > 0 {
+				restElems = positionalArgs[paramIdx:]
+			} else if callFn.optDefaults != nil {
+				restElems = positionalArgs[len(callFn.params)-len(callFn.optDefaults):]
+			} else {
+				restElems = positionalArgs[len(callFn.params):]
 			}
-			newEnv.Set(callFn.rest, listFromSlice(args[len(callFn.params):]))
-		} else {
-			for i, p := range callFn.params {
-				if i < len(args) {
-					newEnv.Set(p, args[i])
-				} else {
-					newEnv.Set(p, vnil())
-				}
-			}
+			newEnv.Set(callFn.rest, listFromSlice(restElems))
 		}
 		body := callFn.body
 		if isNil(body) {
