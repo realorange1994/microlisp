@@ -1558,7 +1558,7 @@ func (p *delimitedParser) readExpr() (*Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		return cons(vsym("quasiquote"), cons(v, vnil())), nil
+		return cons(vsym("QUASIQUOTE"), cons(v, vnil())), nil
 	case ',':
 		if p.pos+1 < len(p.src) && p.src[p.pos+1] == '@' {
 			p.pos += 2
@@ -1566,14 +1566,14 @@ func (p *delimitedParser) readExpr() (*Value, error) {
 			if err != nil {
 				return nil, err
 			}
-			return cons(vsym("unquote-splicing"), cons(v, vnil())), nil
+			return cons(vsym("UNQUOTE-SPLICING"), cons(v, vnil())), nil
 		}
 		p.pos++
 		v, err := p.readExpr()
 		if err != nil {
 			return nil, err
 		}
-		return cons(vsym("unquote"), cons(v, vnil())), nil
+		return cons(vsym("UNQUOTE"), cons(v, vnil())), nil
 	case '#':
 		return p.readDispatch()
 	case '"':
