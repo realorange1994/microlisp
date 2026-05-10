@@ -98,7 +98,7 @@
 57. `delete-duplicates` 使用指针相等而非值相等判断重复
 58. `*random-state*` 未初始化 — 已修复
 59. `coerce` 不支持 `'vector` 和 `'array` 结果类型
-60. `typep` 不处理复合 `vector` 类型说明符如 `(vector *)`
+60. `typep` 不处理复合 `vector` 类型说明符如 `(vector *)` 且不识别字符串为 vector/array — 已修复（字符串是 CL 中的 vector 和 array 子类型）
 61. `logand`/`logior`/`logxor` 对非整数参数静默转为0而非报type-error
 62. `(setf (values ...) ...)` 未实现
 63. `char-name` 对 C1 控制字符（128-159）返回 nil
