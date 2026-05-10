@@ -139,3 +139,13 @@
 93. `expt` 对复数基底的整数指数幂返回错误结果（`(expt #c(0 1) 2)` 返回 0 而非 -1）— 已修复（新增 VComplex 分支，使用二进制幂法计算复数整数幂）
 
 94. `arrayToString` 对 nil 数组元素崩溃（未初始化数组的 nil 元素导致 elem.typ 访问 Go nil 指针）— 已修复（添加 nil/VNil 元素检查）
+
+95. `parseParams` 对 lambda 点对语法 `(lambda (a . rest) ...)` 中 rest 参数未捕获（`((lambda (a . rest) rest) 1 2 3)` 报 "undefined: REST"）— 已修复（在 parseParams 循环体开头增加 VSym 检测，当 v 变为 VSym 时作为 &rest 参数返回）
+
+96. `seqParseKeys` 完全不支持 `:test-not` 关键字参数（导致 `member`、`find`、`position`、`count`、`remove`、`substitute` 等函数无法使用 `:test-not`，且 `:test` 测试函数参数顺序与 CL 规范相反（`(element item)` 应为 `(item element)`））— 已修复（`seqParseKeys` 增加 `testNotFn` 返回值，更新所有 18 个调用方添加额外的 `_` 忽略该值，`builtinMember` 和 `testItemMatchFull` 正确实现 `:test-not` 语义和 CL 规范参数顺序）
+
+97. `assoc` 函数为 Lisp 简易实现（仅使用 `equal?` 比较），不支持 `:test`、`:test-not`、`:key` 关键字参数（`assoc-if` 的 Go 版本已实现但不完整）— 已修复（添加 `builtinAssoc` Go 实现，支持完整的 `:test`、`:test-not`、`:key` 参数，移除 Lisp 定义）
+
+98. `destructuring-bind` 不支持 `&key` 的 supplied-p 变量（如 `(destructuring-bind (&key (x (funcall x) x-supplied)) () ...)` 报 "undefined: X-SUPPLIED"）— 未修复（需要修改 `destructuringBind` 参数解析逻辑）
+
+99. `destructuring-bind` 的 `&key` 默认值不生效（如 `(destructuring-bind (&key (a 99)) () a)` 返回 `nil` 而非 `99`）— 未修复

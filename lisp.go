@@ -6119,6 +6119,7 @@ var builtins = []builtinDef{
 	{"string-elt", builtinStringElt},
 	{"reverse", builtinReverse},
 	{"replace", builtinReplace},
+	{"assoc", builtinAssoc},
 	{"acons", builtinAcons},
 	{"rassoc", builtinRassoc},
 	{"rassoc-if", builtinRassocIf},
@@ -13135,9 +13136,10 @@ func builtinBitNot(args []*Value) (*Value, error) {
 // -------- Sequence operations --------
 
 // seqParseKeys extracts keyword arguments from args[startIdx:]
-func seqParseKeys(args []*Value, startIdx int) (keyFn, testFn *Value, fromEnd bool, count, start, end int, initialVal *Value, err error) {
+func seqParseKeys(args []*Value, startIdx int) (keyFn, testFn, testNotFn *Value, fromEnd bool, count, start, end int, initialVal *Value, err error) {
 	keyFn = vnil()
 	testFn = vnil()
+	testNotFn = vnil()
 	count = -1
 	start = 0
 	end = -1
@@ -13155,6 +13157,11 @@ func seqParseKeys(args []*Value, startIdx int) (keyFn, testFn *Value, fromEnd bo
 				if i+1 < len(args) {
 					i++
 					testFn = args[i]
+				}
+			case ":TEST-NOT":
+				if i+1 < len(args) {
+					i++
+					testNotFn = args[i]
 				}
 			case ":FROM-END":
 				fromEnd = true
@@ -13442,7 +13449,7 @@ func builtinSeqReduce(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("seq-reduce: need function and sequence")
 	}
 	fn := args[0]
-	keyFn, _, _, _, start, end, initialVal, err := seqParseKeys(args, 2)
+	keyFn, _, _, _, _, start, end, initialVal, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -13497,7 +13504,7 @@ func builtinSeqSort(args []*Value) (*Value, error) {
 	}
 	seq := args[0]
 	pred := args[1]
-	keyFn, _, _, _, _, _, _, err := seqParseKeys(args, 2)
+	keyFn, _, _, _, _, _, _, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -13540,7 +13547,7 @@ func builtinSeqRemoveIf(args []*Value) (*Value, error) {
 	}
 	pred := args[0]
 	seq := args[1]
-	keyFn, _, _, count, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, _, _, _, count, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -13601,7 +13608,7 @@ func builtinSeqFind(args []*Value) (*Value, error) {
 	if err := checkSequenceArg(seq, "seq-find"); err != nil {
 		return nil, err
 	}
-	keyFn, testFn, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, testFn, testNotFn, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -13614,13 +13621,13 @@ func builtinSeqFind(args []*Value) (*Value, error) {
 	}
 	if fromEnd {
 		for i := end - 1; i >= start; i-- {
-			if testItemMatch(item, elements[i], testFn, keyFn) {
+			if testItemMatchFull(item, elements[i], testFn, testNotFn, keyFn) {
 				return elements[i], nil
 			}
 		}
 	} else {
 		for i := start; i < end; i++ {
-			if testItemMatch(item, elements[i], testFn, keyFn) {
+			if testItemMatchFull(item, elements[i], testFn, testNotFn, keyFn) {
 				return elements[i], nil
 			}
 		}
@@ -13629,7 +13636,13 @@ func builtinSeqFind(args []*Value) (*Value, error) {
 }
 
 func testItemMatch(item, el *Value, testFn, keyFn *Value) bool {
-	a, b := el, item
+	return testItemMatchFull(item, el, testFn, nil, keyFn)
+}
+
+func testItemMatchFull(item, el, testFn, testNotFn, keyFn *Value) bool {
+	// CL spec: test function is called as (test item element), so b=item, a=element (keyed)
+	b := item
+	a := el
 	if !isNil(keyFn) {
 		var err error
 		a, err = callFnOnSeq(keyFn, []*Value{a}, globalEnv)
@@ -13641,8 +13654,15 @@ func testItemMatch(item, el *Value, testFn, keyFn *Value) bool {
 			return false
 		}
 	}
+	if !isNil(testNotFn) {
+		cmp, err := callFnOnSeq(testNotFn, []*Value{b, a}, globalEnv)
+		if err != nil {
+			return false
+		}
+		return !isTruthy(cmp)
+	}
 	if !isNil(testFn) {
-		cmp, err := callFnOnSeq(testFn, []*Value{a, b}, globalEnv)
+		cmp, err := callFnOnSeq(testFn, []*Value{b, a}, globalEnv)
 		if err != nil {
 			return false
 		}
@@ -13657,7 +13677,7 @@ func builtinSeqPosition(args []*Value) (*Value, error) {
 	}
 	item := args[0]
 	seq := args[1]
-	keyFn, testFn, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, testFn, testNotFn, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -13673,13 +13693,13 @@ func builtinSeqPosition(args []*Value) (*Value, error) {
 	}
 	if fromEnd {
 		for i := end - 1; i >= start; i-- {
-			if testItemMatch(item, elements[i], testFn, keyFn) {
+			if testItemMatchFull(item, elements[i], testFn, testNotFn, keyFn) {
 				return vnum(float64(i)), nil
 			}
 		}
 	} else {
 		for i := start; i < end; i++ {
-			if testItemMatch(item, elements[i], testFn, keyFn) {
+			if testItemMatchFull(item, elements[i], testFn, testNotFn, keyFn) {
 				return vnum(float64(i)), nil
 			}
 		}
@@ -13694,7 +13714,7 @@ func builtinSeqSubstitute(args []*Value) (*Value, error) {
 	newVal := args[0]
 	old := args[1]
 	seq := args[2]
-	keyFn, testFn, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+	keyFn, testFn, testNotFn, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -13716,7 +13736,7 @@ func builtinSeqSubstitute(args []*Value) (*Value, error) {
 			if count >= 0 && replaced >= count {
 				break
 			}
-			if testItemMatch(old, elements[i], testFn, keyFn) {
+			if testItemMatchFull(old, elements[i], testFn, testNotFn, keyFn) {
 				result[i] = newVal
 				replaced++
 			}
@@ -13726,7 +13746,7 @@ func builtinSeqSubstitute(args []*Value) (*Value, error) {
 			if count >= 0 && replaced >= count {
 				break
 			}
-			if testItemMatch(old, elements[i], testFn, keyFn) {
+			if testItemMatchFull(old, elements[i], testFn, testNotFn, keyFn) {
 				result[i] = newVal
 				replaced++
 			}
@@ -14942,6 +14962,66 @@ func builtinPairlis(args []*Value) (*Value, error) {
 	return listFromSlice(result), nil
 }
 
+// -------- assoc --------
+func builtinAssoc(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("assoc: need item and alist")
+	}
+	item := args[0]
+	alist := args[1]
+	keyFn, testFn, testNotFn, _, _, _, _, _, err := seqParseKeys(args, 2)
+	if err != nil {
+		return nil, err
+	}
+	// Apply key to item
+	keyedItem := item
+	if !isNil(keyFn) {
+		keyedItem, err = callFnOnSeq(keyFn, []*Value{item}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	cur := alist
+	for !isNil(cur) && cur.typ == VPair {
+		entry := cur.car
+		// Skip nil elements (per CL spec)
+		if isNil(entry) {
+			cur = cur.cdr
+			continue
+		}
+		if entry.typ == VPair {
+			keyedKey := entry.car
+			if !isNil(keyFn) {
+				keyedKey, err = callFnOnSeq(keyFn, []*Value{entry.car}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			match := false
+			if !isNil(testNotFn) {
+				cmp, err := callFnOnSeq(testNotFn, []*Value{keyedItem, keyedKey}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+				match = !isTruthy(cmp)
+			} else if !isNil(testFn) {
+				cmp, err := callFnOnSeq(testFn, []*Value{keyedItem, keyedKey}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+				match = isTruthy(cmp)
+			} else {
+				match = eqVal(keyedItem, entry.car)
+			}
+			if match {
+				return entry, nil
+			}
+		}
+		cur = cur.cdr
+	}
+	return vnil(), nil
+}
+
 func builtinAssocIf(args []*Value) (*Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("assoc-if: need predicate and alist")
@@ -15076,9 +15156,17 @@ func builtinMember(args []*Value) (*Value, error) {
 	if lst.typ != VPair && lst.typ != VNil {
 		return nil, fmt.Errorf("member: expected a proper list")
 	}
-	keyFn, testFn, _, _, _, _, _, err := seqParseKeys(args, 2)
+	keyFn, testFn, testNotFn, _, _, _, _, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
+	}
+	// Apply key to item (per CL spec, key is applied to item too)
+	keyedItem := item
+	if !isNil(keyFn) {
+		keyedItem, err = callFnOnSeq(keyFn, []*Value{item}, globalEnv)
+		if err != nil {
+			return nil, err
+		}
 	}
 	seen := make(map[*Value]bool)
 	for !isNil(lst) && lst.typ == VPair {
@@ -15096,8 +15184,14 @@ func builtinMember(args []*Value) (*Value, error) {
 			}
 		}
 		match := false
-		if !isNil(testFn) {
-			cmp, err := callFnOnSeq(testFn, []*Value{compareVal, item}, globalEnv)
+		if !isNil(testNotFn) {
+			cmp, err := callFnOnSeq(testNotFn, []*Value{keyedItem, compareVal}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			match = !isTruthy(cmp)
+		} else if !isNil(testFn) {
+			cmp, err := callFnOnSeq(testFn, []*Value{keyedItem, compareVal}, globalEnv)
 			if err != nil {
 				return nil, err
 			}
@@ -15205,7 +15299,7 @@ func builtinSeqCount(args []*Value) (*Value, error) {
 	}
 	item := args[0]
 	seq := args[1]
-	keyFn, testFn, _, _, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, testFn, testNotFn, _, _, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -15218,7 +15312,7 @@ func builtinSeqCount(args []*Value) (*Value, error) {
 	}
 	cnt := 0
 	for i := start; i < end; i++ {
-		if testItemMatch(item, elements[i], testFn, keyFn) {
+		if testItemMatchFull(item, elements[i], testFn, testNotFn, keyFn) {
 			cnt++
 		}
 	}
@@ -15231,7 +15325,7 @@ func builtinSeqCountIf(args []*Value) (*Value, error) {
 	}
 	pred := args[0]
 	seq := args[1]
-	keyFn, _, _, _, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, _, _, _, _, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -15272,7 +15366,7 @@ func builtinSeqRemove(args []*Value) (*Value, error) {
 	}
 	item := args[0]
 	seq := args[1]
-	keyFn, testFn, fromEnd, count, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, testFn, testNotFn, fromEnd, count, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -15295,7 +15389,7 @@ func builtinSeqRemove(args []*Value) (*Value, error) {
 			if count >= 0 && removed >= count {
 				break
 			}
-			if testItemMatch(item, elements[i], testFn, keyFn) {
+			if testItemMatchFull(item, elements[i], testFn, testNotFn, keyFn) {
 				removeSet[i] = true
 				removed++
 			}
@@ -15308,7 +15402,7 @@ func builtinSeqRemove(args []*Value) (*Value, error) {
 	} else {
 		for i, el := range elements {
 			if i >= start && i < end && (count < 0 || removed < count) {
-				if testItemMatch(item, el, testFn, keyFn) {
+				if testItemMatchFull(item, el, testFn, testNotFn, keyFn) {
 					removed++
 					continue
 				}
@@ -15348,7 +15442,7 @@ func builtinDelete(args []*Value) (*Value, error) {
 	if seq.typ != VPair {
 		return nil, fmt.Errorf("delete: expected a list, got %s", typeStr(seq))
 	}
-	keyFn, testFn, fromEnd, count, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, testFn, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -15452,7 +15546,7 @@ func builtinDeleteIf(args []*Value) (*Value, error) {
 	if seq.typ != VPair {
 		return nil, fmt.Errorf("delete-if: expected a list, got %s", typeStr(seq))
 	}
-	keyFn, _, _, count, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, _, _, _, count, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -15537,7 +15631,7 @@ func builtinDeleteDuplicates(args []*Value) (*Value, error) {
 	if seq.typ != VPair {
 		return nil, fmt.Errorf("delete-duplicates: expected a list, got %s", typeStr(seq))
 	}
-	keyFn, _, _, _, start, end, _, err := seqParseKeys(args, 1)
+	keyFn, _, _, _, _, start, end, _, err := seqParseKeys(args, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -15584,7 +15678,7 @@ func builtinNsubstituteIf(args []*Value) (*Value, error) {
 	newVal := args[0]
 	pred := args[1]
 	seq := args[2]
-		keyFn, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+		keyFn, _, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -15655,7 +15749,7 @@ func builtinSeqRemoveDuplicates(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("seq-remove-duplicates: need sequence")
 	}
 	seq := args[0]
-	keyFn, testFn, fromEnd, _, start, end, _, err := seqParseKeys(args, 1)
+	keyFn, testFn, _, fromEnd, _, start, end, _, err := seqParseKeys(args, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -15718,7 +15812,7 @@ func builtinSeqFindIf(args []*Value) (*Value, error) {
 	}
 	pred := args[0]
 	seq := args[1]
-	keyFn, _, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, _, _, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -15778,7 +15872,7 @@ func builtinSeqPositionIf(args []*Value) (*Value, error) {
 	}
 	pred := args[0]
 	seq := args[1]
-	keyFn, _, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
+	keyFn, _, _, fromEnd, _, start, end, _, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -15875,7 +15969,7 @@ func builtinSeqSubstituteIf(args []*Value) (*Value, error) {
 	newVal := args[0]
 	pred := args[1]
 	seq := args[2]
-	keyFn, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+	keyFn, _, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -15960,7 +16054,7 @@ func builtinNsubstitute(args []*Value) (*Value, error) {
 	newVal := args[0]
 	oldVal := args[1]
 	seq := args[2]
-	keyFn, testFn, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+	keyFn, testFn, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
 	if err != nil {
 		return nil, err
 	}
@@ -21258,9 +21352,6 @@ var initLib = `
 (define (member? x lst)
   (if (null? lst) #f
     (if (equal? x (car lst)) #t (member? x (cdr lst)))))
-(define (assoc x alist)
-  (if (null? alist) nil
-    (if (equal? x (caar alist)) (car alist) (assoc x (cdr alist)))))
 (define (any pred lst)
   (cond
     ((null? lst) #f)
