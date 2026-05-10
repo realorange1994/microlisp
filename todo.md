@@ -100,7 +100,7 @@
 58. `*random-state*` 未初始化 — 已修复
 59. `coerce` 不支持 `'vector` 和 `'array` 结果类型
 60. `typep` 不处理复合 `vector` 类型说明符如 `(vector *)` 且不识别字符串为 vector/array — 已修复（字符串是 CL 中的 vector 和 array 子类型）
-61. `logand`/`logior`/`logxor` 对非整数参数静默转为0而非报type-error
+61. `logand`/`logior`/`logxor` 对非整数参数静默转为0而非报type-error — 已修复（已有 `isIntegerValue` 检查和 `signalTypeError` 返回）
 62. `(setf (values ...) ...)` 未实现
 63. `char-name` 对 C1 控制字符（128-159）返回 nil
 64. `type-of` 返回 `"unknown"` 对于 `pathname`、`random-state`、`array`、`integer`（大整数）类型
@@ -212,6 +212,16 @@
 125. `read-from-string` 返回 `(value . position)` cons 对，但 `eval` 双重求值时 `((quasiquote ...))` 被当作函数调用导致 "not a procedure: pair" 错误（双重反引号 `(eval (eval (read-from-string expr)))` 测试失败）— 已修复（与 Bug #126 同根因：eval 对 car 为 quasiquote 的列表形式增加特殊处理）
 
 126. `eval` 对 `(quasiquote ...)` 列表求值时，当 `quasiquote` 符号出现在嵌套列表首元素时被当作函数调用（`(eval '((quasiquote (unquote (*RR* *SS*)))))` 报错 "not a procedure: pair" 而非识别为 backquote 形式）— 已修复（在 eval 的 VPair 分支中，检测 car 为 `(quasiquote ...)` 或 `(backquote ...)` 时，调用 evalQuasiquote 展开并返回结果，而非尝试函数调用）
+
+## 第五轮测试发现的 Bug（advanced_numerics/advanced_clos/advanced_packages/list-pure）
+
+131. `typeStr` 返回小写类型名称（如 "rational", "complex", "integer"）而非 ANSI CL 要求的大写名称（如 "RATIONAL", "COMPLEX", "INTEGER"）— 已修复（将 typeStr 中所有返回值改为大写）
+
+132. `#C(n 0)` 复数字面量在虚部为 0 时未简化为实数（ANSI CL 要求 `#C(5 0)` => `5`）— 已修复（TComplex 解析器分支从 `vcomplexAlways` 改为 `vcomplex`）
+
+133. `coerce` 到 `'complex` 类型时对零虚部值返回简化后的实数而非复数（`(coerce 0.5 'complex)` 返回 `0.5` 而非 `#c(0.5 0.0)`）— 已修复（`coerce` 中 plain `'complex` 默认分支改用 `vcomplexAlways`）
+
+## 新发现但未修复的 Bug
 
 127. `random` 对某些值报错 "limit must be >= 1"（SBCL random.pure.lisp 测试文件加载时触发，可能由 `(if x high 10)` 中 `checked-compile` 展开或 `funcall` 调用中的值传递问题导致）
 

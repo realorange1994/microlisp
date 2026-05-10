@@ -2040,7 +2040,7 @@ func (p *Parser) readExpr() (*Value, error) {
 			imagVal, err2 := parseFloatStr(imagStr)
 			if err1 == nil && err2 == nil {
 				p.advance()
-				v := vcomplexAlways(realVal, imagVal)
+				v := vcomplex(realVal, imagVal)
 				// Mark as float if either part was written as a float literal
 				if v.typ == VComplex {
 					hasFloat := strings.ContainsAny(realStr, ".eEdDfFsSlL") || strings.ContainsAny(imagStr, ".eEdDfFsSlL")
@@ -5738,59 +5738,59 @@ func typeStr(v *Value) string {
 		return "nil"
 	case VNum:
 		if v.isFloat {
-			return "single-float"
+			return "SINGLE-FLOAT"
 		}
-		return "integer"
+		return "INTEGER"
 	case VRat:
-		return "rational"
+		return "RATIONAL"
 	case VComplex:
-		return "complex"
+		return "COMPLEX"
 	case VStr:
-		return "string"
+		return "STRING"
 	case VSym:
-		return "symbol"
+		return "SYMBOL"
 	case VBool:
-		return "boolean"
+		return "BOOLEAN"
 	case VPair:
-		return "pair"
+		return "PAIR"
 	case VPrim:
-		return "procedure"
+		return "PROCEDURE"
 	case VFunc:
-		return "procedure"
+		return "PROCEDURE"
 	case VMacro:
-		return "macro"
+		return "MACRO"
 	case VClass:
-		return "class"
+		return "CLASS"
 	case VGeneric:
-		return "generic"
+		return "GENERIC"
 	case VInstance:
-		return "instance"
+		return "INSTANCE"
 	case VVHash:
-		return "hash-table"
+		return "HASH-TABLE"
 	case VThread:
-		return "thread"
+		return "THREAD"
 	case VLock:
-		return "lock"
+		return "LOCK"
 	case VChar:
-		return "character"
+		return "CHARACTER"
 	case VStream:
-		return "stream"
+		return "STREAM"
 	case VArray:
-		return "array"
+		return "ARRAY"
 	case VMultiVal:
-		return "multi-value"
+		return "MULTI-VALUE"
 	case VBigInt:
-		return "integer"
+		return "INTEGER"
 	case VPackage:
-		return "package"
+		return "PACKAGE"
 	case VReadtable:
-		return "readtable"
+		return "READTABLE"
 	case VPathname:
-		return "pathname"
+		return "PATHNAME"
 	case VRandomState:
-		return "random-state"
+		return "RANDOM-STATE"
 	default:
-		return "unknown"
+		return "UNKNOWN"
 	}
 }
 
@@ -19621,10 +19621,10 @@ func builtinCoerce(args []*Value) (*Value, error) {
 			return toRational(n), nil
 		}
 		return nil, fmt.Errorf("coerce: cannot coerce to rational")
-	case "complex", ":complex":
+	case "complex", ":complex", "COMPLEX":
 		// Check for compound type specifier: (complex float), (complex single-float), (complex double-float)
 		switch typeSub {
-		case "float", "single-float":
+		case "float", "single-float", "FLOAT", "SINGLE-FLOAT":
 			if obj.typ == VComplex {
 				r := float64(float32(obj.num))
 				i := float64(float32(obj.imag))
@@ -19632,25 +19632,25 @@ func builtinCoerce(args []*Value) (*Value, error) {
 			}
 			r := float64(float32(toNum(obj)))
 			return vcomplexAlways(r, 0), nil
-		case "double-float":
+		case "double-float", "DOUBLE-FLOAT":
 			if obj.typ == VComplex {
 				r := toNum(obj)
 				i := obj.imag
 				return vcomplexAlways(r, i), nil
 			}
 			return vcomplexAlways(toNum(obj), 0), nil
-		case "rational", "integer":
+		case "rational", "integer", "RATIONAL", "INTEGER":
 			// (complex rational) or (complex integer) - must always produce a VComplex
 			if obj.typ == VComplex {
 				return obj, nil
 			}
 			return vcomplexAlways(toNum(obj), 0), nil
 		default:
-			// Plain (complex) or unknown subtype
+			// Plain (complex) or unknown subtype - always return a VComplex per CL
 			if obj.typ == VComplex {
 				return obj, nil
 			}
-			return vcomplex(toNum(obj), 0), nil
+			return vcomplexAlways(toNum(obj), 0), nil
 		}
 	case "character", ":character":
 		if obj.typ == VChar {
