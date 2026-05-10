@@ -728,16 +728,19 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 				}
 				return false
 			case "ARRAY":
-				// (array element-type) - check if array
-				if val.typ != VArray {
+				// (array element-type) - check if array (strings are also arrays in CL)
+				if val.typ != VArray && val.typ != VStr {
 					return false
 				}
 				return true
 			case "VECTOR":
-				// (vector) - check if 1D array
+				// (vector) - check if 1D array or string (strings are vectors in CL)
 				// (vector element-type) - check if 1D array
-				if val.typ != VArray {
+				if val.typ != VArray && val.typ != VStr {
 					return false
+				}
+				if val.typ == VStr {
+					return true // strings are vectors of characters
 				}
 				return len(val.array.dims) == 1
 			case "CONS":
@@ -864,10 +867,10 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 		return val.typ == VStream
 	}
 	if typeName == "ARRAY" {
-		return val.typ == VArray
+		return val.typ == VArray || val.typ == VStr
 	}
 	if typeName == "VECTOR" {
-		return val.typ == VArray && len(val.array.dims) == 1
+		return val.typ == VArray && len(val.array.dims) == 1 || val.typ == VStr
 	}
 	if typeName == "PROCEDURE" {
 		return val.typ == VPrim || val.typ == VFunc
