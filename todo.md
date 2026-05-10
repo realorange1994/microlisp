@@ -132,3 +132,4 @@
 88. `delete` 不支持字符串输入（只接受 VPair）— 已修复（对字符串委托给 remove）
 89. `delete-if` 不支持字符串输入（只接受 VPair）— 已修复（对字符串委托给 remove-if）
 90. `round` 的 two-argument 形式（`round x d`）未使用 round-half-to-even 规则 — 已修复
+91. `lambda`/`defun` 中 `&optional` 和 `&key` 参数的默认值不生效（parseParams 中 elem 变量作用域问题）— 已修复（重构 parseParams 和 apply 函数，正确处理可选/关键字参数的默认值和绑定）
