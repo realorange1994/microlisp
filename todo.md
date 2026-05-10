@@ -13,7 +13,7 @@
 ### Setf 扩展
 - [x] `(defun (setf foo) ...)` 不支持复合函数名 — 已修复
 - [x] `(setf (values ...))` 不支持 — 已修复
-- [ ] `(setf (macro-function ...))` 不支持
+- [x] `(setf (macro-function ...))` 不支持 — 已修复（实现 `builtinMacroFunction` 和 `builtinMacroFunctionSetf`，`expandMacro` 增加 VFunc/VPrim 直接调用分支，`&whole` 机制传递完整宏调用表单）
 - [ ] `defsetf` 不支持 `&environment` 参数
 
 ### CLOS / 对象系统

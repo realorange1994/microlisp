@@ -4599,7 +4599,7 @@ evalLoop:
 				for !isNil(rest) {
 					if rest.typ == VPair && rest.car.typ == VSym {
 						sname := rest.car.str
-						if sname == ":IF-DOES-NOT-EXIST" || sname == ":IF-DOES-NOT-EXIST" {
+						if sname == ":IF-DOES-NOT-EXIST" {
 							if rest.cdr.typ == VPair {
 								// Evaluate the keyword argument value
 								val := rest.cdr.car
@@ -5132,6 +5132,39 @@ func expandMacro(m *Value, args *Value, env *Env) (*Value, error) {
 	}
 	result := vnil()
 	for !isNil(body) {
+		head := body.car
+		// If body.car is a VFunc/VPrim and the rest of body is an argument list,
+		// call the function with evaluated arguments (this handles macros set
+		// via (setf (macro-function ...) fn)).
+		if head != nil && (head.typ == VFunc || head.typ == VPrim || head.typ == VGeneric) {
+			// Collect and evaluate remaining items in body as args
+			var callArgs []*Value
+			for p := body.cdr; p != nil && p.typ == VPair; p = p.cdr {
+				if p.car != nil {
+					var ev *Value
+					var err error
+					// Special: #ENV resolves to the current lexical environment (passed as nil
+					// for macro-function-setf macros, since the interpreter doesn't expose
+					// environment objects to Lisp code; the macro function's closure captures
+					// its original environment for free-variable resolution).
+					if p.car.typ == VSym && p.car.str == "#ENV" {
+						ev = vnil()
+					} else {
+						ev, err = eval(p.car, newEnv)
+						if err != nil {
+							return nil, err
+						}
+					}
+					callArgs = append(callArgs, primaryValue(ev))
+				}
+			}
+			v, err := callFnOnSeq(head, callArgs, newEnv)
+			if err != nil {
+				return nil, err
+			}
+			result = v
+			break // function call is the entire macro body
+		}
 		v, e := eval(body.car, newEnv)
 		if e != nil {
 			return nil, e
@@ -5578,6 +5611,8 @@ var builtins = []builtinDef{
 	{"symbol-name", builtinSymStr},
 	{"symbol-value", builtinSymbolValue},
 	{"symbol-function", builtinSymbolFunction},
+	{"macro-function", builtinMacroFunction},
+	{"macro-function-setf", builtinMacroFunctionSetf},
 	{"symbol-plist", builtinSymbolPlist},
 	{"symbol-plist-setf", builtinSymbolPlistSetf},
 	{"boundp", builtinBoundp},
@@ -8560,6 +8595,85 @@ func builtinSymbolValue(args []*Value) (*Value, error) {
 		return vnil(), nil
 	}
 	return val, nil
+}
+
+// builtinMacroFunction handles both:
+// (macro-function sym) - returns the macro function or nil
+// (macro-function (macro-function sym) new-fn) - setter form for setf
+func builtinMacroFunction(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("macro-function: need a symbol or setter form")
+	}
+	// Setter form: (macro-function (macro-function sym) new-fn)
+	if args[0].typ == VPair && args[0].car != nil && args[0].car.typ == VSym && args[0].car.str == "MACRO-FUNCTION" {
+		// args[0] = (MACRO-FUNCTION sym), args[1] = new-fn
+		accessorArgs := args[0].cdr
+		if accessorArgs == nil || accessorArgs.typ != VPair {
+			return nil, fmt.Errorf("macro-function setf: malformed")
+		}
+		sym := accessorArgs.car
+		// Evaluate (quote sym) form if present
+		if sym.typ == VPair && sym.car != nil && sym.car.typ == VSym && sym.car.str == "QUOTE" {
+			sym = sym.cdr.car
+		}
+		if sym.typ != VSym {
+			return nil, fmt.Errorf("macro-function setf: symbol required")
+		}
+		if len(args) < 2 {
+			return nil, fmt.Errorf("macro-function setf: need new value")
+		}
+		return builtinMacroFunctionSetf([]*Value{args[1], sym})
+	}
+	// Getter: (macro-function sym)
+	sym := args[0]
+	// Evaluate (quote sym) form if present
+	if sym.typ == VPair && sym.car != nil && sym.car.typ == VSym && sym.car.str == "QUOTE" {
+		sym = sym.cdr.car
+	}
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("macro-function: not a symbol")
+	}
+	val, err := globalEnv.Get(sym.str)
+	if err != nil || val == nil || val.typ != VMacro {
+		return vnil(), nil
+	}
+	return val, nil
+}
+
+// builtinMacroFunctionSetf implements (setf (macro-function sym) fn).
+// fn must be a function of two arguments: (form environment) -> expansion.
+func builtinMacroFunctionSetf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("setf (macro-function): need value and symbol")
+	}
+	newFn := args[0]
+	sym := args[1]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("setf (macro-function): symbol required")
+	}
+	// Use expandMacro's &whole mechanism to pass the whole form (macro-name . args).
+	// Set m.whole = "#FORM" so expandMacro binds the whole form to #FORM.
+	// Then the body is (fn-ref #FORM #ENV) where #FORM = whole form and #ENV = nil.
+	var closureForm *Value
+	if newFn.typ == VSym {
+		closureForm = list(newFn, vsym("#FORM"), vsym("#ENV"))
+	} else {
+		closureForm = list(newFn, vsym("#FORM"), vsym("#ENV"))
+	}
+	m := gcv()
+	m.typ = VMacro
+	m.str = sym.str
+	m.params = nil      // no macro lambda-list params
+	m.rest = ""
+	m.whole = "#FORM"   // expandMacro binds whole form to #FORM
+	m.body = closureForm
+	if newFn.typ == VFunc || newFn.typ == VMacro {
+		m.env = newFn.env
+	} else {
+		m.env = globalEnv
+	}
+	globalEnv.Set(sym.str, m)
+	return newFn, nil
 }
 
 func builtinSymbolFunction(args []*Value) (*Value, error) {
