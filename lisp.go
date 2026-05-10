@@ -449,6 +449,10 @@ func initGlobalEnv() {
 	globalEnv.Set("*readtable*", vrt(standardReadtable))
 	// CL constant: exclusive upper bound on character codes (Unicode has 1114112 code points)
 	globalEnv.Set("char-code-limit", vnum(1114112))
+		// CL standard constants
+		globalEnv.Set("pi", vnum(math.Pi))
+		globalEnv.Set("most-positive-fixnum", vnum(4611686018427387903))
+		globalEnv.Set("most-negative-fixnum", vnum(-4611686018427387904))
 }
 
 // -------- GC --------
@@ -19243,6 +19247,9 @@ func builtinCoerce(args []*Value) (*Value, error) {
 		if obj.typ == VPair || isNil(obj) {
 			return obj, nil
 		}
+		if obj.typ == VComplex {
+			return listFromSlice([]*Value{vnum(obj.num), vnum(obj.imag)}), nil
+		}
 		if obj.typ == VStr {
 			return listFromSlice(stringToCharList(obj.str)), nil
 		}
@@ -21500,10 +21507,18 @@ var initLib = `
     (list 'setf place (list 'cons item place))))
 
 (define-macro (incf place . delta)
-  (list 'setf place (list '+ place (if (null? delta) 1 (car delta)))))
+  (if (null? delta)
+    (list 'setf place (list '+ place 1))
+    (let ((g (gensym)))
+      (list 'let (list (list g (car delta)))
+        (list 'setf place (list '+ place g))))))
 
 (define-macro (decf place . delta)
-  (list 'setf place (list '- place (if (null? delta) 1 (car delta)))))
+  (if (null? delta)
+    (list 'setf place (list '- place 1))
+    (let ((g (gensym)))
+      (list 'let (list (list g (car delta)))
+        (list 'setf place (list '- place g))))))
 
 (define-macro (rotatef . places)
   (if (null? places) #f

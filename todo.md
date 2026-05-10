@@ -159,3 +159,11 @@
 103. `coerce` 的 `character` 类型对多字符字符串应报错而非静默取首字符 — 已修复（添加长度>1的错误检查）
 
 104. `coerce` 不支持 `simple-vector` 结果类型 — 已修复（添加到 `vector` case 的同组处理）
+
+105. `incf`/`decf` 带 delta 表达式时先读取 place 后求值 delta（如 `(let ((x 1)) (flet ((d () (setf x (* 2 x)))) (incf x (d))) x)` 返回 3 而非 4）— 已修复（修改宏展开用 gensym 先绑定 delta 表达式，`(let* ((g delta-expr)) (setf place (+ place g)))`）
+
+106. `handler-case` 条件类型匹配大小写不敏感（`findClass` 和 `classHasAncestorRec` 使用严格字符串比较，但 reader 全大写化符号名，导致 `(handler-case (error "test") (error (c) ...))` 无法匹配）— 已修复（`findClass` 添加 `strings.ToUpper` 回退，`classHasAncestorRec` 改用 `strings.EqualFold` 比较）
+
+107. `coerce` 的 `list` 类型不支持复数（如 `(coerce #c(3 4) 'list)` 应返回 `(3 4)`）— 已修复（添加 VComplex 分支）
+
+108. `pi`、`most-positive-fixnum`、`most-negative-fixnum` 等 CL 标准常量未定义 — 已修复（在 Go 初始化代码中添加 `pi`、`most-positive-fixnum`、`most-negative-fixnum` 常量）

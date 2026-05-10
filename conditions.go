@@ -66,13 +66,13 @@ func classHasAncestor(cls *Value, name string) bool {
 
 func classHasAncestorRec(cls *Value, name string, seen map[*Value]bool) bool {
 	if cls == nil {
-		return name == "condition"
+		return strings.EqualFold(name, "condition")
 	}
 	if seen[cls] {
 		return false // cycle detected
 	}
 	seen[cls] = true
-	if cls.str == name {
+	if strings.EqualFold(cls.str, name) {
 		return true
 	}
 	if cls.classParents != nil {
@@ -96,6 +96,11 @@ func classMatchesCondition(typeSym string, cond *Value) bool {
 // findClass looks up a class by name, checking the class registry first.
 func findClass(name string) *Value {
 	if cls, ok := classRegistry[name]; ok {
+		return cls
+	}
+	// Case-insensitive lookup: reader uppercases symbols, but builtins may use lowercase
+	upper := strings.ToUpper(name)
+	if cls, ok := classRegistry[upper]; ok {
 		return cls
 	}
 	return globalEnv.bindings[name]
