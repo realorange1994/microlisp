@@ -13640,20 +13640,17 @@ func testItemMatch(item, el *Value, testFn, keyFn *Value) bool {
 }
 
 func testItemMatchFull(item, el, testFn, testNotFn, keyFn *Value) bool {
-	// CL spec: test function is called as (test item element), so b=item, a=element (keyed)
-	b := item
+	// CL spec: test function is called as (test item (key element)).
+	// The key function is applied to the ELEMENT only, not the item.
 	a := el
 	if !isNil(keyFn) {
 		var err error
-		a, err = callFnOnSeq(keyFn, []*Value{a}, globalEnv)
-		if err != nil {
-			return false
-		}
-		b, err = callFnOnSeq(keyFn, []*Value{b}, globalEnv)
+		a, err = callFnOnSeq(keyFn, []*Value{el}, globalEnv)
 		if err != nil {
 			return false
 		}
 	}
+	b := item
 	if !isNil(testNotFn) {
 		cmp, err := callFnOnSeq(testNotFn, []*Value{b, a}, globalEnv)
 		if err != nil {
@@ -14973,14 +14970,6 @@ func builtinAssoc(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Apply key to item
-	keyedItem := item
-	if !isNil(keyFn) {
-		keyedItem, err = callFnOnSeq(keyFn, []*Value{item}, globalEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
 	cur := alist
 	for !isNil(cur) && cur.typ == VPair {
 		entry := cur.car
@@ -14990,30 +14979,7 @@ func builtinAssoc(args []*Value) (*Value, error) {
 			continue
 		}
 		if entry.typ == VPair {
-			keyedKey := entry.car
-			if !isNil(keyFn) {
-				keyedKey, err = callFnOnSeq(keyFn, []*Value{entry.car}, globalEnv)
-				if err != nil {
-					return nil, err
-				}
-			}
-			match := false
-			if !isNil(testNotFn) {
-				cmp, err := callFnOnSeq(testNotFn, []*Value{keyedItem, keyedKey}, globalEnv)
-				if err != nil {
-					return nil, err
-				}
-				match = !isTruthy(cmp)
-			} else if !isNil(testFn) {
-				cmp, err := callFnOnSeq(testFn, []*Value{keyedItem, keyedKey}, globalEnv)
-				if err != nil {
-					return nil, err
-				}
-				match = isTruthy(cmp)
-			} else {
-				match = eqVal(keyedItem, entry.car)
-			}
-			if match {
+			if testItemMatchFull(item, entry.car, testFn, testNotFn, keyFn) {
 				return entry, nil
 			}
 		}
@@ -15160,14 +15126,6 @@ func builtinMember(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Apply key to item (per CL spec, key is applied to item too)
-	keyedItem := item
-	if !isNil(keyFn) {
-		keyedItem, err = callFnOnSeq(keyFn, []*Value{item}, globalEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
 	seen := make(map[*Value]bool)
 	for !isNil(lst) && lst.typ == VPair {
 		if seen[lst] {
@@ -15175,31 +15133,7 @@ func builtinMember(args []*Value) (*Value, error) {
 		}
 		seen[lst] = true
 		el := lst.car
-		compareVal := el
-		if !isNil(keyFn) {
-			var err error
-			compareVal, err = callFnOnSeq(keyFn, []*Value{el}, globalEnv)
-			if err != nil {
-				return nil, err
-			}
-		}
-		match := false
-		if !isNil(testNotFn) {
-			cmp, err := callFnOnSeq(testNotFn, []*Value{keyedItem, compareVal}, globalEnv)
-			if err != nil {
-				return nil, err
-			}
-			match = !isTruthy(cmp)
-		} else if !isNil(testFn) {
-			cmp, err := callFnOnSeq(testFn, []*Value{keyedItem, compareVal}, globalEnv)
-			if err != nil {
-				return nil, err
-			}
-			match = isTruthy(cmp)
-		} else {
-			match = eqVal(compareVal, item)
-		}
-		if match {
+		if testItemMatchFull(item, el, testFn, testNotFn, keyFn) {
 			return lst, nil
 		}
 		lst = lst.cdr
