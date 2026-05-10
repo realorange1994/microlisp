@@ -10415,6 +10415,15 @@ func builtinAref(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("aref: need array and subscripts")
 	}
 	arr := args[0]
+	// Strings are also arrays in CL; (aref "hello" 0) returns a character
+	if arr.typ == VStr {
+		idx := int(args[1].num)
+		if idx < 0 || idx >= len(arr.str) {
+			return nil, fmt.Errorf("aref: index %d out of bounds for string of length %d", idx, len(arr.str))
+		}
+		ch := []rune(arr.str)[idx]
+		return vchar(ch), nil
+	}
 	if arr.typ != VArray || arr.array == nil {
 		return nil, fmt.Errorf("aref: first argument must be an array")
 	}
