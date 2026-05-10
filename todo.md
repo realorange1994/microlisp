@@ -19,7 +19,7 @@
 - [x] `defsetf` 不支持 `&environment` 参数 — 已修复（添加 `remove-env` 辅助函数过滤 `&environment`，修复 `-SETF` 后缀大小写匹配问题）
 
 ### CLOS / 对象系统
-- [ ] CLOS method combinations 未实现
+- [x] CLOS method combinations 未实现 — 已修复（实现 standard/progn/and/or/list/append/nconc/min/max/+ 方法组合，添加 methodCombo 字段到 VGeneric，set-method-combination 内置函数，defgeneric 支持 :method-combination 选项，isTypeSpecializerMatch 和 methodSpecificity 使用大写类型名匹配）
 - [x] `find-method` / `remove-method` 未实现 — 已修复（添加 VMethod 类型，实现 builtinFindMethod 和 builtinRemoveMethod，支持 qualifier/specializer-list/errorp 参数，特化器匹配处理大小写和 t="" 等价）
 - [ ] `call-next-method` 未实现 — 已确认可用（defmethod + CLOS dispatch 中已有 call-next-method/next-method-p 绑定实现，支持方法链调用）
 
@@ -38,6 +38,8 @@
 - [ ] `checked-compile` 不适用（sbcl 特有）
 - [x] `char-code-limit` 未定义为常量 — 已修复，定义为 1114112（Unicode 码点上限）
 - [x] `#+sb-unicode` 特性不存在 — 已修复（添加 `:sb-unicode` 到 features 列表，并修复 feature lookup 大小写不敏感问题）
+- [x] `with-standard-io-syntax` 宏未实现 — 已修复（Go 初始化代码中添加 *print-radix*、*print-readably*、*print-gensym*、*print-array*、*read-base*、*read-default-float-format*、*read-eval*、*read-suppress* 等 IO 变量，defmacro 用 unwind-protect 实现 save/restore 模式）
+- [x] `with-hash-table-iterator` 宏未实现 — 已修复（实现为 macrolet 包装，内部绑定 keys 列表和 index 计数器，每次调用返回 (values key value present-p) 三值）
 
 ## 已修复的 Bug（来自 sbcl-tests 测试）
 
@@ -268,3 +270,11 @@
 149. `gethash` 未返回 `(values value present-p)` 双值 — 已修复（找到时返回 multiVal(value, vbool(true))，未找到时返回 multiVal(default, vnil())）
 
 150. `array-has-fill-pointer-p`/`adjustable-array-p`/`array-displacement` 未实现 — 已修复（添加 builtinArrayHasFillPointerP、builtinAdjustableArrayP、builtinArrayDisplacement）
+
+## 新修复的 Bug（本次会话 — 第五轮）
+
+151. CLOS method combinations 未实现 — 已修复（VGeneric 添加 methodCombo 字段，实现 standard/progn/and/or/list/append/nconc/min/max/+ 方法组合分发，set-method-combination 内置函数，defgeneric 支持 :method-combination 选项，isTypeSpecializerMatch/methodSpecificity 使用大写类型名）
+
+152. `with-standard-io-syntax` 宏未实现 — 已修复（Go 初始化添加 *print-radix*/*print-readably*/*print-gensym*/*print-array*/*read-base*/*read-default-float-format*/*read-eval*/*read-suppress* 变量，defmacro 用 unwind-protect save/restore 所有 IO 变量）
+
+153. `with-hash-table-iterator` 宏未实现 — 已修复（实现为 let+macrolet 包装，内部绑定 hash-table-keys 和 index 计数器，迭代器宏返回 (values key value present-p) 三值）

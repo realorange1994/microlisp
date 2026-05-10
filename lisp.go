@@ -135,6 +135,7 @@ type Value struct {
 	classParents []*Value
 	cpl          []*Value
 	genMethods   []genMethod
+	methodCombo  string         // method combination type: "standard", "progn", "and", "or", "list", "append", "nconc", "min", "max", "+"
 	instClass    *Value
 	instSlots    map[string]*Value
 	hashTab      *HashTable
@@ -443,6 +444,15 @@ func initGlobalEnv() {
 	globalEnv.Set("*print-length*", vnil())
 	globalEnv.Set("*print-level*", vnil())
 	globalEnv.Set("*print-pretty*", vbool(false))
+	globalEnv.Set("*print-base*", vnum(10))
+	globalEnv.Set("*print-radix*", vbool(false))
+	globalEnv.Set("*print-readably*", vbool(true))
+	globalEnv.Set("*print-gensym*", vbool(true))
+	globalEnv.Set("*print-array*", vbool(true))
+	globalEnv.Set("*read-base*", vnum(10))
+	globalEnv.Set("*read-default-float-format*", vsym("SINGLE-FLOAT"))
+	globalEnv.Set("*read-eval*", vbool(true))
+	globalEnv.Set("*read-suppress*", vbool(false))
 	// Standard load-time special variables (bound dynamically during load)
 	globalEnv.Set("*load-pathname*", vnil())
 	globalEnv.Set("*load-truename*", vnil())
@@ -5267,6 +5277,382 @@ func apply(fn *Value, args *Value, env *Env) (result *Value, err error) {
 		}
 
 		// Separate methods by qualifier
+		combo := fn.methodCombo
+		if combo == "" {
+			combo = "standard"
+		}
+
+		if combo != "standard" {
+			// Non-standard method combination
+			var before, after, around, comboPrimary []genMethod
+			comboQual := ":" + strings.ToUpper(combo)
+			for _, m := range applicable {
+				switch m.qualifier {
+				case ":BEFORE":
+					before = append(before, m)
+				case ":AFTER":
+					after = append(after, m)
+				case ":AROUND":
+					around = append(around, m)
+				case comboQual:
+					comboPrimary = append(comboPrimary, m)
+				default:
+					if m.qualifier == "" {
+						comboPrimary = append(comboPrimary, m)
+					}
+				}
+			}
+
+			// Sort methods by specificity
+			for i := 0; i < len(comboPrimary); i++ {
+				for j := i + 1; j < len(comboPrimary); j++ {
+					if methodSpecificity(comboPrimary[j], evArgs) < methodSpecificity(comboPrimary[i], evArgs) {
+						comboPrimary[i], comboPrimary[j] = comboPrimary[j], comboPrimary[i]
+					}
+				}
+			}
+			for i := 0; i < len(before); i++ {
+				for j := i + 1; j < len(before); j++ {
+					if methodSpecificity(before[j], evArgs) < methodSpecificity(before[i], evArgs) {
+						before[i], before[j] = before[j], before[i]
+					}
+				}
+			}
+			for i := 0; i < len(after); i++ {
+				for j := i + 1; j < len(after); j++ {
+					if methodSpecificity(after[j], evArgs) > methodSpecificity(after[i], evArgs) {
+						after[i], after[j] = after[j], after[i]
+					}
+				}
+			}
+			for i := 0; i < len(around); i++ {
+				for j := i + 1; j < len(around); j++ {
+					if methodSpecificity(around[j], evArgs) < methodSpecificity(around[i], evArgs) {
+						around[i], around[j] = around[j], around[i]
+					}
+				}
+			}
+
+			execCombo := func() (*Value, error) {
+				// Execute :before methods
+				for _, m := range before {
+					menv := NewEnv(m.env)
+					for j, p := range m.params {
+						if j < len(evArgs) {
+							menv.Set(p, evArgs[j])
+						}
+					}
+					if m.body != nil {
+						bodyList := m.body
+						for !isNil(bodyList) {
+							_, e := eval(bodyList.car, menv)
+							if e != nil {
+								return nil, e
+							}
+							bodyList = bodyList.cdr
+						}
+					}
+				}
+
+				var result *Value = vnil()
+				switch combo {
+				case "progn":
+					for _, m := range comboPrimary {
+						pEnv := NewEnv(m.env)
+						for j, p := range m.params {
+							if j < len(evArgs) {
+								pEnv.Set(p, evArgs[j])
+							}
+						}
+						if m.body != nil {
+							bodyList := m.body
+							for !isNil(bodyList) {
+								r, e := eval(bodyList.car, pEnv)
+								if e != nil {
+									return nil, e
+								}
+								result = r
+								bodyList = bodyList.cdr
+							}
+						}
+					}
+				case "and":
+					result = vsym("T")
+					for _, m := range comboPrimary {
+						pEnv := NewEnv(m.env)
+						for j, p := range m.params {
+							if j < len(evArgs) {
+								pEnv.Set(p, evArgs[j])
+							}
+						}
+						if m.body != nil {
+							bodyList := m.body
+							for !isNil(bodyList) {
+								r, e := eval(bodyList.car, pEnv)
+								if e != nil {
+									return nil, e
+								}
+								result = r
+								bodyList = bodyList.cdr
+							}
+						}
+						if isNil(result) {
+							return vnil(), nil
+						}
+					}
+				case "or":
+					for _, m := range comboPrimary {
+						pEnv := NewEnv(m.env)
+						for j, p := range m.params {
+							if j < len(evArgs) {
+								pEnv.Set(p, evArgs[j])
+							}
+						}
+						if m.body != nil {
+							bodyList := m.body
+							for !isNil(bodyList) {
+								r, e := eval(bodyList.car, pEnv)
+								if e != nil {
+									return nil, e
+								}
+								result = r
+								bodyList = bodyList.cdr
+							}
+						}
+						if !isNil(result) {
+							return result, nil
+						}
+					}
+					return vnil(), nil
+				case "list":
+					var results []*Value
+					for _, m := range comboPrimary {
+						pEnv := NewEnv(m.env)
+						for j, p := range m.params {
+							if j < len(evArgs) {
+								pEnv.Set(p, evArgs[j])
+							}
+						}
+						if m.body != nil {
+							bodyList := m.body
+							for !isNil(bodyList) {
+								r, e := eval(bodyList.car, pEnv)
+								if e != nil {
+									return nil, e
+								}
+								result = r
+								bodyList = bodyList.cdr
+							}
+						}
+						results = append(results, result)
+					}
+					return listFromSlice(results), nil
+				case "append", "nconc":
+					var elems []*Value
+					for _, m := range comboPrimary {
+						pEnv := NewEnv(m.env)
+						for j, p := range m.params {
+							if j < len(evArgs) {
+								pEnv.Set(p, evArgs[j])
+							}
+						}
+						if m.body != nil {
+							bodyList := m.body
+							for !isNil(bodyList) {
+								r, e := eval(bodyList.car, pEnv)
+								if e != nil {
+									return nil, e
+								}
+								result = r
+								bodyList = bodyList.cdr
+							}
+						}
+						if !isNil(result) && result.typ == VPair {
+							for p := result; p != nil && p.typ == VPair; p = p.cdr {
+								elems = append(elems, p.car)
+							}
+						} else if !isNil(result) {
+							elems = append(elems, result)
+						}
+					}
+					return listFromSlice(elems), nil
+				case "min":
+					if len(comboPrimary) == 0 {
+						return vnil(), nil
+					}
+					var minVal *Value
+					for _, m := range comboPrimary {
+						pEnv := NewEnv(m.env)
+						for j, p := range m.params {
+							if j < len(evArgs) {
+								pEnv.Set(p, evArgs[j])
+							}
+						}
+						if m.body != nil {
+							bodyList := m.body
+							for !isNil(bodyList) {
+								r, e := eval(bodyList.car, pEnv)
+								if e != nil {
+									return nil, e
+								}
+								result = r
+								bodyList = bodyList.cdr
+							}
+						}
+						if minVal == nil || compareNumeric(result, minVal) < 0 {
+							minVal = result
+						}
+					}
+					return minVal, nil
+				case "max":
+					if len(comboPrimary) == 0 {
+						return vnil(), nil
+					}
+					var maxVal *Value
+					for _, m := range comboPrimary {
+						pEnv := NewEnv(m.env)
+						for j, p := range m.params {
+							if j < len(evArgs) {
+								pEnv.Set(p, evArgs[j])
+							}
+						}
+						if m.body != nil {
+							bodyList := m.body
+							for !isNil(bodyList) {
+								r, e := eval(bodyList.car, pEnv)
+								if e != nil {
+									return nil, e
+								}
+								result = r
+								bodyList = bodyList.cdr
+							}
+						}
+						if maxVal == nil || compareNumeric(result, maxVal) > 0 {
+							maxVal = result
+						}
+					}
+					return maxVal, nil
+				case "+":
+					sum := 0.0
+					hasFloat := false
+					for _, m := range comboPrimary {
+						pEnv := NewEnv(m.env)
+						for j, p := range m.params {
+							if j < len(evArgs) {
+								pEnv.Set(p, evArgs[j])
+							}
+						}
+						if m.body != nil {
+							bodyList := m.body
+							for !isNil(bodyList) {
+								r, e := eval(bodyList.car, pEnv)
+								if e != nil {
+									return nil, e
+								}
+								result = r
+								bodyList = bodyList.cdr
+							}
+						}
+						if result.isFloat {
+							hasFloat = true
+						}
+						sum += toNum(result)
+					}
+					if hasFloat {
+						return vfloat(sum), nil
+					}
+					return vnum(sum), nil
+				default:
+					if len(comboPrimary) > 0 {
+						pm := comboPrimary[0]
+						pEnv := NewEnv(pm.env)
+						for j, p := range pm.params {
+							if j < len(evArgs) {
+								pEnv.Set(p, evArgs[j])
+							}
+						}
+						if pm.body != nil {
+							bodyList := pm.body
+							for !isNil(bodyList) {
+								r, e := eval(bodyList.car, pEnv)
+								if e != nil {
+									return nil, e
+								}
+								result = r
+								bodyList = bodyList.cdr
+							}
+						}
+					}
+				}
+
+				// Execute :after methods
+				for _, m := range after {
+					aEnv := NewEnv(m.env)
+					for j, p := range m.params {
+						if j < len(evArgs) {
+							aEnv.Set(p, evArgs[j])
+						}
+					}
+					if m.body != nil {
+						bodyList := m.body
+						for !isNil(bodyList) {
+							_, e := eval(bodyList.car, aEnv)
+							if e != nil {
+								return nil, e
+							}
+							bodyList = bodyList.cdr
+						}
+					}
+				}
+
+				return result, nil
+			}
+
+			// Wrap around methods
+			nextMethodFn := execCombo
+			for i := len(around) - 1; i >= 0; i-- {
+				am := around[i]
+				prevNext := nextMethodFn
+				nextMethodFn = func() (*Value, error) {
+					aEnv := NewEnv(am.env)
+					for j, p := range am.params {
+						if j < len(evArgs) {
+							aEnv.Set(p, evArgs[j])
+						}
+					}
+					aEnv.Set("call-next-method", &Value{
+						typ: VPrim,
+						fn: func(args2 []*Value) (*Value, error) {
+							return prevNext()
+						},
+					})
+					aEnv.Set("next-method-p", &Value{
+						typ: VPrim,
+						fn: func(ignored []*Value) (*Value, error) {
+							return vbool(true), nil
+						},
+					})
+					var result *Value = vnil()
+					if am.body != nil {
+						bodyList := am.body
+						for !isNil(bodyList) {
+							r, e := eval(bodyList.car, aEnv)
+							if e != nil {
+								return nil, e
+							}
+							result = r
+							bodyList = bodyList.cdr
+						}
+					}
+					return result, nil
+				}
+			}
+
+			return nextMethodFn()
+		}
+
+		// Standard method combination (before/primary/after + around)
+		// Separate methods by qualifier
 		var primary, before, after, around []genMethod
 		for _, m := range applicable {
 			switch m.qualifier {
@@ -6095,6 +6481,7 @@ var builtins = []builtinDef{
 	{"boundp", builtinBoundp},
 	{"fboundp", builtinFboundp},
 	{"functionp", builtinFunctionP},
+	{"make-generic-function", builtinMakeGenericFunction},
 	{"makunbound", builtinMakunbound},
 	{"fmakunbound", builtinFmakunbound},
 	{"string->symbol", builtinStrSym},
@@ -6214,6 +6601,7 @@ var builtins = []builtinDef{
 	{"instance?", builtinInstanceP},
 	{"find-method", builtinFindMethod},
 	{"remove-method", builtinRemoveMethod},
+	{"set-method-combination", builtinSetMethodCombination},
 	{"make-hash-table", builtinMakeHashTable},
 	{"hash-table-p", builtinHashTableP},
 	{"gethash", builtinGethash},
@@ -9422,6 +9810,17 @@ func builtinFunctionP(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("functionp: need an argument")
 	}
 	return vbool(args[0].typ == VPrim || args[0].typ == VFunc || args[0].typ == VGeneric), nil
+}
+
+func builtinMakeGenericFunction(args []*Value) (*Value, error) {
+	gf := gcv()
+	gf.typ = VGeneric
+	if len(args) > 0 && args[0].typ == VSym {
+		gf.str = args[0].str
+	} else if len(args) > 0 && args[0].typ == VStr {
+		gf.str = args[0].str
+	}
+	return gf, nil
 }
 
 func builtinMakunbound(args []*Value) (*Value, error) {
@@ -12803,35 +13202,35 @@ func valueMatchesEQLKey(arg *Value, key string) bool {
 func isTypeSpecializerMatch(arg *Value, typeName string) bool {
 	arg = primaryValue(arg)
 	switch typeName {
-	case "t":
+	case "t", "T":
 		return true
-	case "null":
+	case "null", "NULL":
 		return isNil(arg)
-	case "list":
+	case "list", "LIST":
 		return isNil(arg) || arg.typ == VPair
-	case "cons":
+	case "cons", "CONS":
 		return arg.typ == VPair
-	case "symbol":
+	case "symbol", "SYMBOL":
 		return arg.typ == VSym || isNil(arg)
-	case "string":
+	case "string", "STRING":
 		return arg.typ == VStr
-	case "number":
+	case "number", "NUMBER":
 		return arg.typ == VNum
-	case "integer":
+	case "integer", "INTEGER":
 		return arg.typ == VNum && !arg.isFloat && arg.num == float64(int64(arg.num))
-	case "float", "single-float", "double-float":
+	case "float", "single-float", "double-float", "FLOAT", "SINGLE-FLOAT", "DOUBLE-FLOAT":
 		return arg.typ == VNum && arg.isFloat
-	case "character":
+	case "character", "CHARACTER":
 		return arg.typ == VChar
-	case "vector":
+	case "vector", "VECTOR":
 		return arg.typ == VArray && arg.array != nil && len(arg.array.dims) == 1
-	case "array":
+	case "array", "ARRAY":
 		return arg.typ == VArray
-	case "function":
+	case "function", "FUNCTION":
 		return arg.typ == VFunc || arg.typ == VPrim || arg.typ == VGeneric
-	case "hash-table":
+	case "hash-table", "HASH-TABLE":
 		return arg.typ == VVHash
-	case "stream":
+	case "stream", "STREAM":
 		return arg.typ == VStream
 	}
 	return false
@@ -12895,16 +13294,18 @@ func methodSpecificity(m genMethod, evArgs []*Value) int {
 				}
 			}
 		} else if isTypeSpecializerMatch(evArgs[0], sp) {
-			// Built-in type specializers: more specific types get lower scores
-			switch sp {
-			case "null":
+			spUp := strings.ToUpper(sp)
+			switch spUp {
+			case "NULL":
 				baseScore = 1
-			case "cons":
+			case "CONS":
 				baseScore = 2
-			case "list":
+			case "LIST":
 				baseScore = 3
+			case "T":
+				baseScore = 999
 			default:
-				baseScore = 5
+				baseScore = 500
 			}
 		}
 	}
@@ -13137,6 +13538,36 @@ func builtinRemoveMethod(args []*Value) (*Value, error) {
 		}
 	}
 	return nil, fmt.Errorf("remove-method: method not found in generic function")
+}
+
+func builtinSetMethodCombination(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("set-method-combination: need generic-function and combination-type")
+	}
+	gf := primaryValue(args[0])
+	if gf.typ != VGeneric {
+		return nil, fmt.Errorf("set-method-combination: first argument must be a generic function")
+	}
+	combo := primaryValue(args[1])
+	comboStr := ""
+	if combo.typ == VSym {
+		comboStr = strings.ToUpper(combo.str)
+	} else if combo.typ == VStr {
+		comboStr = strings.ToUpper(combo.str)
+	} else if combo.typ == VPair && combo.car != nil && combo.car.typ == VSym {
+		// (progn) or (progn most-specific-first) etc.
+		comboStr = strings.ToUpper(combo.car.str)
+	}
+	validCombos := map[string]bool{
+		"STANDARD": true, "PROGN": true, "AND": true, "OR": true,
+		"LIST": true, "APPEND": true, "NCONC": true,
+		"MIN": true, "MAX": true, "+": true,
+	}
+	if !validCombos[comboStr] {
+		return nil, fmt.Errorf("set-method-combination: unknown combination type %s", comboStr)
+	}
+	gf.methodCombo = strings.ToLower(comboStr)
+	return gf, nil
 }
 
 // -------- Hash Table support --------
@@ -23850,9 +24281,16 @@ var initLib = `
   form)
 
 ;; -------- defgeneric --------
+;; (defgeneric name args &rest options)
+;; Options: (:method-combination combo) (:method ...)
 (define-macro (defgeneric name args . options)
-  (list 'define name (list 'lambda args
-    (list 'error (list 'string-append "No method defined for " (list 'symbol->string (list 'quote name)))))))
+  (let ((combo-opt (defpackage-find-opt options ':method-combination))
+        (method-forms (filter (lambda (o) (and (pair? o) (equal? (car o) ':method))) options)))
+    (let ((base (list 'defparameter name (list 'make-generic-function (list 'quote name))))
+          (combo-form (if (null? combo-opt) '()
+                         (list (list 'set-method-combination name (list 'quote (car combo-opt))))))
+          (method-defs (mapcar (lambda (m) (cons 'defmethod (cons name (cdr m)))) method-forms)))
+      (cons 'progn (append (list base) combo-form method-defs)))))
 
 ;; -------- defpackage --------
 ;; defpackage: create a package with optional use, export, nicknames
@@ -24023,6 +24461,83 @@ var initLib = `
 (defun arithmetic-error-operation (c) (slot-value c 'operation))
 (defun arithmetic-error-operands (c) (slot-value c 'operands))
 (defun package-error-package (c) (slot-value c 'package))
+
+;; -------- with-standard-io-syntax --------
+;; (with-standard-io-syntax &body body)
+;; Binds all standard read/write variables to their ANSI CL defaults,
+;; executes body, then restores the original values.
+(define-macro (with-standard-io-syntax . body)
+  (list 'let
+        (list (list '*old-print-base* '*print-base*)
+              (list '*old-print-case* '*print-case*)
+              (list '*old-print-radix* '*print-radix*)
+              (list '*old-print-escape* '*print-escape*)
+              (list '*old-print-circle* '*print-circle*)
+              (list '*old-print-pretty* '*print-pretty*)
+              (list '*old-print-length* '*print-length*)
+              (list '*old-print-level* '*print-level*)
+              (list '*old-print-readably* '*print-readably*)
+              (list '*old-print-gensym* '*print-gensym*)
+              (list '*old-print-array* '*print-array*)
+              (list '*old-read-base* '*read-base*)
+              (list '*old-read-default-float-format* '*read-default-float-format*)
+              (list '*old-read-eval* '*read-eval*)
+              (list '*old-read-suppress* '*read-suppress*))
+        (list 'unwind-protect
+              (list 'progn
+                    (list 'set! '*print-base* 10)
+                    (list 'set! '*print-case* (list 'quote ':upcase))
+                    (list 'set! '*print-radix* 'nil)
+                    (list 'set! '*print-escape* #t)
+                    (list 'set! '*print-circle* 'nil)
+                    (list 'set! '*print-pretty* 'nil)
+                    (list 'set! '*print-length* 'nil)
+                    (list 'set! '*print-level* 'nil)
+                    (list 'set! '*print-readably* #t)
+                    (list 'set! '*print-gensym* #t)
+                    (list 'set! '*print-array* #t)
+                    (list 'set! '*read-base* 10)
+                    (list 'set! '*read-default-float-format* (list 'quote 'single-float))
+                    (list 'set! '*read-eval* #t)
+                    (list 'set! '*read-suppress* 'nil)
+                    (cons 'progn body))
+              (list 'progn
+                    (list 'set! '*print-base* '*old-print-base*)
+                    (list 'set! '*print-case* '*old-print-case*)
+                    (list 'set! '*print-radix* '*old-print-radix*)
+                    (list 'set! '*print-escape* '*old-print-escape*)
+                    (list 'set! '*print-circle* '*old-print-circle*)
+                    (list 'set! '*print-pretty* '*old-print-pretty*)
+                    (list 'set! '*print-length* '*old-print-length*)
+                    (list 'set! '*print-level* '*old-print-level*)
+                    (list 'set! '*print-readably* '*old-print-readably*)
+                    (list 'set! '*print-gensym* '*old-print-gensym*)
+                    (list 'set! '*print-array* '*old-print-array*)
+                    (list 'set! '*read-base* '*old-read-base*)
+                    (list 'set! '*read-default-float-format* '*old-read-default-float-format*)
+                    (list 'set! '*read-eval* '*old-read-eval*)
+                    (list 'set! '*read-suppress* '*old-read-suppress*)))))
+
+;; -------- with-hash-table-iterator --------
+;; (with-hash-table-iterator (name hash-table) &body body)
+;; Creates a local macro NAME that on each call returns (values key value t)
+;; or (values nil nil nil) at end.
+(define-macro (with-hash-table-iterator spec . body)
+  (let ((name (car spec))
+        (ht (cadr spec))
+        (keys-var (gensym))
+        (idx-var (gensym)))
+    (list 'let (list (list keys-var (list 'hash-table-keys ht))
+                     (list idx-var 0))
+      (list 'macrolet
+            (list (list name '()
+                  (list 'let (list (list 'k (list 'nth idx-var keys-var)))
+                    (list 'if (list '< idx-var (list 'length keys-var))
+                          (list 'progn
+                                (list 'set! idx-var (list '+ idx-var 1))
+                                (list 'values 'k (list 'gethash 'k ht) #t))
+                          (list 'values 'nil 'nil 'nil)))))
+            (cons 'progn body)))))
 
 `
 
