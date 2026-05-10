@@ -38,6 +38,7 @@ const (
 	VFunc
 	VMacro
 	VSymMacro
+	VRestart
 	VClass
 	VGeneric
 	VInstance
@@ -280,10 +281,14 @@ type restartEntry struct {
 	handlerFn *Value
 	condition *Value
 	env       *Env
+	id        int // unique ID for restart object identity
 }
 
 var handlerStack []handlerEntry
 var restartStack []restartEntry
+var nextRestartID int
+var signaledCondition *Value // tracks the currently-being-handled condition
+var innermostRestartFrame int = -1 // start index of innermost restart-case's restarts
 
 // Recursion depth limit to prevent infinite recursion / stack overflow
 const maxEvalDepth = 3000
@@ -300,6 +305,7 @@ var loopIterationCount int
 type restartInvoke struct {
 	name string
 	args *Value
+	id   int // restart ID for precise matching
 }
 
 func (r *restartInvoke) Error() string { return "restart-invoke" }
@@ -311,6 +317,16 @@ type handledError struct {
 }
 
 func (h *handledError) Error() string { return "handled" }
+
+// conditionError wraps a Go error with the condition that was signaled,
+// so restart-case can auto-associate its restarts with the condition.
+type conditionError struct {
+	condition *Value
+	err       error
+}
+
+func (c *conditionError) Error() string { return c.err.Error() }
+func (c *conditionError) Unwrap() error { return c.err }
 
 func initFeatures() {
 	lispFeatures = make(map[string]bool)
@@ -4061,7 +4077,9 @@ evalLoop:
 						handlerFn: nil, // body is evaluated on invoke
 						condition: nil,
 						env:       env,
+						id:        nextRestartID,
 					})
+					nextRestartID++
 					_ = varName
 					_ = body
 					clauses = clauses.cdr
@@ -4072,86 +4090,117 @@ evalLoop:
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
+							// Save restart stack before truncating
+							stk := restartStack
+							// Check for condition in panic to auto-associate restarts
+							var panicCond *Value
+							if he, ok := r.(*handledError); ok {
+								panicCond = he.condition
+							}
+							if panicCond != nil {
+								for i := savedLen; i < len(stk); i++ {
+									if stk[i].condition == nil {
+										stk[i].condition = panicCond
+									}
+								}
+							}
+							restartStack = restartStack[:savedLen]
 							if ri, ok := r.(*restartInvoke); ok {
-								// Save restart stack before truncating
-								stk := restartStack
-								restartStack = restartStack[:savedLen]
-								// Find matching restart and evaluate body
-								for i := len(stk) - 1; i >= 0; i-- {
-									if stk[i].name == ri.name {
-										// Evaluate body - walk clauses again
-										cl2 := v.cdr.cdr
-										cl2Seen := make(map[*Value]bool)
-										for !isNil(cl2) && cl2.typ == VPair {
-											if cl2Seen[cl2] {
-												break
-											}
-											cl2Seen[cl2] = true
-											if cl2.typ != VPair {
-												break
-											}
-											cl2c := cl2.car
-											if cl2c == nil || cl2c.typ != VPair || cl2c.car == nil || cl2c.car.typ != VSym {
-												cl2 = cl2.cdr
-												continue
-											}
-											if cl2c.car.str == ri.name {
-												bd := cl2c.cdr
-												// Parse lambda list: extract var names
-												varNames := []*Value{}
-												var restVar *Value = nil
-												ll := bd // lambda list is first element of body
-												if isPair(ll) && isPair(ll.car) {
-													ll = ll.car
-													for !isNil(ll) {
-														if ll.car != nil && ll.car.typ == VSym {
-															s := ll.car.str
-															if s == "&rest" || s == "&body" {
-																if ll.cdr != nil && ll.cdr.typ == VPair && ll.cdr.car != nil && ll.cdr.car.typ == VSym {
-																	restVar = ll.cdr.car
-																}
-																break
-															} else if s == "&optional" || s == "&key" || s == "&allow-other-keys" || s == "&aux" {
-																ll = ll.cdr
-																continue
-															}
-															varNames = append(varNames, ll.car)
-														}
-														ll = ll.cdr
-													}
-												}
-												bd = bd.cdr // skip lambda list
-												newEnv := NewEnv(env)
-												// Bind args to vars
-												argVals := ri.args
-												for j := 0; j < len(varNames) && !isNil(argVals); j++ {
-													newEnv.Set(varNames[j].str, argVals.car)
-													argVals = argVals.cdr
-												}
-												// Bind rest var to remaining args as list
-												if restVar != nil {
-													newEnv.Set(restVar.str, argVals)
-												}
-												rcResult = vnil()
-												for !isNil(bd) {
-													rcResult, rcErr = eval(bd.car, newEnv)
-													if rcErr != nil {
-														return
-													}
-													bd = bd.cdr
-												}
-												return
-											}
-											cl2 = cl2.cdr
+								// Find matching restart by ID in our range [savedLen, len(stk))
+								targetIdx := -1
+								for i := savedLen; i < len(stk); i++ {
+									if stk[i].id == ri.id {
+										targetIdx = i
+										break
+									}
+								}
+								if targetIdx >= 0 {
+									// Map to clause position: targetIdx - savedLen
+									clausePos := targetIdx - savedLen
+									cl2 := v.cdr.cdr
+									cl2Seen := make(map[*Value]bool)
+									for !isNil(cl2) && cl2.typ == VPair {
+										if cl2Seen[cl2] {
+											break
 										}
+										cl2Seen[cl2] = true
+										if cl2.typ != VPair {
+											break
+										}
+										cl2c := cl2.car
+										if cl2c == nil || cl2c.typ != VPair || cl2c.car == nil || cl2c.car.typ != VSym {
+											cl2 = cl2.cdr
+											continue
+										}
+										if clausePos == 0 {
+											bd := cl2c.cdr
+											// Parse lambda list: extract var names
+											varNames := []*Value{}
+											var restVar *Value = nil
+											ll := bd
+											if isPair(ll) && isPair(ll.car) {
+												ll = ll.car
+												for !isNil(ll) {
+													if ll.car != nil && ll.car.typ == VSym {
+														s := ll.car.str
+														if s == "&rest" || s == "&body" {
+															if ll.cdr != nil && ll.cdr.typ == VPair && ll.cdr.car != nil && ll.cdr.car.typ == VSym {
+																restVar = ll.cdr.car
+															}
+															break
+														} else if s == "&optional" || s == "&key" || s == "&allow-other-keys" || s == "&aux" {
+														ll = ll.cdr
+														continue
+														}
+														varNames = append(varNames, ll.car)
+													}
+													ll = ll.cdr
+												}
+											}
+											bd = bd.cdr
+											newEnv := NewEnv(env)
+											argVals := ri.args
+											for j := 0; j < len(varNames) && !isNil(argVals); j++ {
+												newEnv.Set(varNames[j].str, argVals.car)
+												argVals = argVals.cdr
+											}
+											if restVar != nil {
+												newEnv.Set(restVar.str, argVals)
+											}
+											rcResult = vnil()
+											for !isNil(bd) {
+												rcResult, rcErr = eval(bd.car, newEnv)
+												if rcErr != nil {
+													return
+												}
+												bd = bd.cdr
+											}
+											return
+										}
+										clausePos--
+										cl2 = cl2.cdr
 									}
 								}
 							}
 							restartStack = restartStack[:savedLen]
 							panic(r)
 						}
+						// Normal return: check if error carries a condition
+						// and auto-associate our restart entries with it.
+						if ce, ok := rcErr.(*conditionError); ok {
+							for i := savedLen; i < len(restartStack); i++ {
+								if restartStack[i].condition == nil {
+									restartStack[i].condition = ce.condition
+								}
+							}
+						}
 						restartStack = restartStack[:savedLen]
 					}()
+					// Set innermost restart frame so builtinError knows
+					// which restarts to auto-associate with the signaled condition
+					oldFrame := innermostRestartFrame
+					innermostRestartFrame = savedLen
+					defer func() { innermostRestartFrame = oldFrame }()
 					rcResult, rcErr = eval(valForm, env)
 				}()
 				if rcErr != nil {
@@ -5776,6 +5825,8 @@ func typeStr(v *Value) string {
 		return "MACRO"
 	case VClass:
 		return "CLASS"
+	case VRestart:
+		return "RESTART"
 	case VGeneric:
 		return "GENERIC"
 	case VInstance:
@@ -21349,6 +21400,8 @@ func toString(v *Value) string {
 		return "#<random-state>"
 	case VMethod:
 		return "#<method " + v.str + ">"
+	case VRestart:
+		return "#<restart " + v.str + ">"
 	default:
 		return "#<unknown>"
 	}

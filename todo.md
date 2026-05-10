@@ -94,7 +94,7 @@
 50. `macroexpand` 不展开 quasiquote 形式（返回原始形式不变）
 51. `loop` 不支持解构模式如 `(for (a b) in list)`
 52. `functionp` 谓词函数未实现
-53. ✅ `defun` 接受 `(setf name)` 作为函数名 — 已修复
+53. `defun` 接受 `(setf name)` 作为函数名 — 已修复
 54. `ignore-errors` 错误时未返回 `(values nil condition)`
 55. `nth-value` 无法从 VMultiVal 正确提取第 n 个值
 56. `delete-if`/`nsubstitute-if` 谓词函数调用方式错误（eval 而非 callFnOnSeq）
@@ -232,3 +232,15 @@
 129. `#*` 位向量字面量语法未实现 — 已修复（lexer 添加 `#*` 解析，生成 TVector token 并通过 `l.bitVec` 传递，readExpr TVector 分支检查 sentinel 值返回 bitVec，sxhashSeen 添加 VArray 分支使用 `h = seed*31 + elem_hash` 混合公式）
 
 130. `#.` (sharp-dot) 读者宏未实现（SBCL backq 测试中 `#.(write-to-string ...)` 无法读取）— 已修复（lexer 添加 TSharpDot token 类型，Parser.readExpr 中读取下一个表达式并立即 eval；delimitedParser.readDispatch 中添加 `.` 分支实现读取时求值）
+
+131. `make-condition` 不评估 `:initform`（`builtinMakeCondition` 是简化实现，直接将 keyword 参数放入 slot，不读取 defclass 中定义的 :initform 值，也不继承 CPL 的 slot 定义）— 已修复（`builtinMakeCondition` 委托给 `builtinMakeInstance`，后者完整支持 :initform 求值、:initarg 映射、CPL 继承）
+
+132. `error` 函数不接受条件类符号作为 datum（`builtinError` 只处理 VStr 和 VInstance，不处理 VSym 条件类名，导致 `(error 'simple-error :message "test")` 报错 "unsupported datum type"）— 已修复（添加 VSym 分支：查找类名，调用 `builtinMakeInstance` 创建条件实例，完整支持 handler-case 捕获和 break-on-signals）
+
+133. `princ-to-string` 对条件实例返回空字符串（条件对象无格式控制，无法输出错误描述信息，SBCL 测试断言 `(princ-to-string condition)` 包含特定文本）— 已修复（添加 `conditionReportString` 函数，支持 format-control/format-arguments、type-error、cell-error、message 槽、report 函数等多种格式）
+
+134. `with-condition-restarts` 宏未实现（SBCL 条件系统核心功能，`with-condition-restarts cond-form restarts-form body` 关联临时 restarts 与条件，handler-bind 中 compute-restarts 可过滤条件相关 restarts）— 已修复（添加 Lisp 宏定义 + `%associate-restarts-with-condition` 和 `%dissociate-restarts-with-condition` Go 内置函数，`builtinComputeRestarts` 支持可选条件过滤参数）
+
+135. `handler-bind` 的 handler 函数调用中 `tailCall` 和 `restartInvoke` 异常被吞没（handler-bind 的 recover 将 tailCall panic 转为错误，导致 TCO 和 restart 调用链中断）— 已修复（handler-bind recover 增加对 tailCall/restartInvoke/handledError 的 re-panic；handler 函数调用改用 `applyAndResolveTailCall` 而非 `apply`）
+
+136. `type-error-datum`/`type-error-expected-type` 条件访问器未实现（ANSI CL 标准函数，访问 type-error 条件的 datum 和 expected-type 槽，SBCL condition.pure.lisp 测试依赖）— 已修复（添加 Lisp 定义调用 slot-value；同时添加 stream-error-stream/file-error-pathname/arithmetic-error-operation/operands/package-error-package 标准访问器）

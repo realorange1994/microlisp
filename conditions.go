@@ -166,54 +166,65 @@ func builtinError(args []*Value) (*Value, error) {
 	}
 	datum := args[0]
 	var msg string
+	var cond *Value
 	if datum.typ == VStr {
 		msg = datum.str
 	} else if datum.typ == VInstance {
-		// If datum is already a condition, use it directly
-		cond := datum
+		cond = datum
 		if len(args) > 1 {
 			msg = formatMessage(toString(primaryValue(args[1])), args[2:])
 			cond.instSlots["message"] = vstr(msg)
 		}
-		checkBreakOnSignals(cond)
-		if len(handlerStack) > 0 {
-			for i := len(handlerStack) - 1; i >= 0; i-- {
-				h := handlerStack[i]
-				if conditionMatchesType(cond, h.typeSymbol) {
-					fn := h.handlerFn
-					if fn.typ == VPrim {
-						result, err := fn.fn([]*Value{cond})
-						if err != nil {
-							panic(fmt.Errorf("handler-function panicked: %v", err))
-						}
-						panic(&handledError{condition: cond, result: result})
-					} else if fn.typ == VFunc {
-						result, err := apply(fn, cons(cond, vnil()), h.env)
-						if err != nil {
-							panic(fmt.Errorf("handler-function panicked: %v", err))
-						}
-						panic(&handledError{condition: cond, result: result})
-					}
-				}
+	} else if datum.typ == VSym {
+		cls := findClass(datum.str)
+		if cls != nil && cls.typ == VClass {
+			var err error
+			cond, err = builtinMakeInstance(args)
+			if err != nil {
+				return nil, err
 			}
-			panic(&handledError{condition: cond, result: nil})
 		}
-		if slotMsg, ok := cond.instSlots["message"]; ok {
-			return nil, fmt.Errorf("error: %s", toString(slotMsg))
+	}
+	// For non-VInstance datum without condition class: create simple-error condition
+	if cond == nil {
+		if datum.typ != VStr {
+			msg = toString(datum)
 		}
-		return nil, fmt.Errorf("error: %s", toString(cond))
+		if len(args) > 1 {
+			msg = formatMessage(msg, args[1:])
+		}
+		cond = makeSimpleCondition("simple-error", msg)
 	}
-	// For non-VInstance datum: create simple-error condition
-	if datum.typ != VStr {
-		msg = toString(datum)
+
+	// Track the signaled condition for compute-restarts filtering
+	oldSignaled := signaledCondition
+	signaledCondition = cond
+	defer func() { signaledCondition = oldSignaled }()
+
+	// ANSI CL: restart-case implicitly associates its restarts with the
+	// condition being signaled. We temporarily associate restarts from the
+	// innermost restart-case frame with the signaled condition, then restore.
+	startIdx := innermostRestartFrame
+	if startIdx < 0 {
+		startIdx = 0
 	}
-	if len(args) > 1 {
-		msg = formatMessage(msg, args[1:])
+	associatedIndices := []int{}
+	for i := startIdx; i < len(restartStack); i++ {
+		if restartStack[i].condition == nil {
+			restartStack[i].condition = cond
+			associatedIndices = append(associatedIndices, i)
+		}
 	}
-	cond := makeSimpleCondition("simple-error", msg)
+	// Restore condition associations after handler walk
+	defer func() {
+		for _, idx := range associatedIndices {
+			if idx < len(restartStack) && restartStack[idx].condition == cond {
+				restartStack[idx].condition = nil
+			}
+		}
+	}()
 
 	checkBreakOnSignals(cond)
-
 	// Walk handler stack
 	if len(handlerStack) > 0 {
 		for i := len(handlerStack) - 1; i >= 0; i-- {
@@ -221,23 +232,43 @@ func builtinError(args []*Value) (*Value, error) {
 			if conditionMatchesType(cond, h.typeSymbol) {
 				fn := h.handlerFn
 				if fn.typ == VPrim {
-					result, err := fn.fn([]*Value{cond})
+					_, err := fn.fn([]*Value{cond})
 					if err != nil {
+						if _, ok := err.(*tailCall); ok {
+							panic(err)
+						}
+						if he, ok := err.(*handledError); ok {
+							panic(he)
+						}
 						panic(fmt.Errorf("handler-function panicked: %v", err))
 					}
-					panic(&handledError{condition: cond, result: result})
+					// Handler returned normally - continue signaling (handler-bind semantics)
 				} else if fn.typ == VFunc {
-					result, err := apply(fn, cons(cond, vnil()), h.env)
+					_, err := applyAndResolveTailCall(fn, cons(cond, vnil()), h.env)
 					if err != nil {
+						if _, ok := err.(*tailCall); ok {
+							panic(err)
+						}
+						if he, ok := err.(*handledError); ok {
+							panic(he)
+						}
 						panic(fmt.Errorf("handler-function panicked: %v", err))
 					}
-					panic(&handledError{condition: cond, result: result})
+					// Handler returned normally - continue signaling (handler-bind semantics)
 				}
 			}
 		}
-		panic(&handledError{condition: cond, result: nil})
 	}
-	return nil, fmt.Errorf("error: %s", msg)
+	// No handler caught it - return as Go error, wrapped with condition
+	var goErr error
+	if slotMsg, ok := cond.instSlots["message"]; ok {
+		goErr = fmt.Errorf("error: %s", toString(slotMsg))
+	} else if msg != "" {
+		goErr = fmt.Errorf("error: %s", msg)
+	} else {
+		goErr = fmt.Errorf("error: %s", toString(cond))
+	}
+	return nil, &conditionError{condition: cond, err: goErr}
 }
 
 // builtinCError implements (cerror continue-format-control datum &rest arguments)
