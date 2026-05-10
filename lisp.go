@@ -429,6 +429,14 @@ func initGlobalEnv() {
 	// Initialize *random-state* per CL spec
 	rs, _ := builtinMakeRandomState(nil)
 	globalEnv.Set("*random-state*", rs)
+	// Initialize *posix-argv* (SBCL extension): list of command-line argument strings
+	{
+		argvVals := make([]*Value, len(os.Args))
+		for i, a := range os.Args {
+			argvVals[i] = vstr(a)
+		}
+		globalEnv.Set("*posix-argv*", listFromSlice(argvVals))
+	}
 	if initLib != "" {
 		_, err := evalString(initLib, globalEnv)
 		if err != nil {

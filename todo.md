@@ -22,13 +22,13 @@
 - [ ] `call-next-method` 未实现
 
 ### Loop
-- [ ] `loop ... from ... downto ... by ...` 语法不支持
+- [x] `loop ... from ... downto ... by ...` 语法不支持 — 已验证实现（downto/by/above/below 均已支持）
 - [ ] `loop` hash-key 迭代挂起
 - [ ] `loop` destructuring 不完整
 
 ### 其他
 - [x] `#p""` pathname 字面量语法未支持 — 已修复（lexer 和 parser 均已实现）
-- [ ] `*posix-argv*` 未实现（sbcl 扩展）
+- [x] `*posix-argv*` 未实现（sbcl 扩展）— 已实现（Go 初始化时使用 `os.Args` 填充列表）
 - [x] `*random-state*` 未定义为特殊变量 — 已修复（`builtinRandom` 现在会从 `globalEnv` 查找 `*random-state*` 作为默认 rng）
 - [x] `|...|` 转义符号读取不支持 — 已修复（添加 lexBarSym，保留大小写，支持 \\ 和 \| 转义）
 - [ ] `sb-int:constant-form-value` 不适用（sbcl 特有）
