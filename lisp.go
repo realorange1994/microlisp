@@ -902,6 +902,16 @@ func vcomplex(r, i float64) *Value {
 	v.imag = i
 	return v
 }
+
+// vcomplexAlways creates a VComplex value even when imaginary part is zero.
+// Used for (coerce x '(complex float)) where the result type must be complex.
+func vcomplexAlways(r, i float64) *Value {
+	v := gcv()
+	v.typ = VComplex
+	v.num = r
+	v.imag = i
+	return v
+}
 func gcd(a, b int64) int64 {
 	for b != 0 {
 		a, b = b, a%b
@@ -13062,6 +13072,18 @@ func builtinSeqRemoveIf(args []*Value) (*Value, error) {
 		}
 		result = append(result, el)
 	}
+	// If input was a string and all results are characters, return a string
+	if seq.typ == VStr {
+		var sb strings.Builder
+		for _, v := range result {
+			if v.typ == VChar {
+				sb.WriteRune(v.ch)
+			} else {
+				return listFromSlice(result), nil
+			}
+		}
+		return vstr(sb.String()), nil
+	}
 	return listFromSlice(result), nil
 }
 
@@ -13204,6 +13226,18 @@ func builtinSeqSubstitute(args []*Value) (*Value, error) {
 				replaced++
 			}
 		}
+	}
+	// If input was a string and all results are characters, return a string
+	if seq.typ == VStr {
+		var sb strings.Builder
+		for _, v := range result {
+			if v.typ == VChar {
+				sb.WriteRune(v.ch)
+			} else {
+				return listFromSlice(result), nil
+			}
+		}
+		return vstr(sb.String()), nil
 	}
 	return listFromSlice(result), nil
 }
@@ -14777,6 +14811,18 @@ func builtinSeqRemove(args []*Value) (*Value, error) {
 			result = append(result, el)
 		}
 	}
+	// If input was a string and all results are characters, return a string
+	if seq.typ == VStr {
+		var sb strings.Builder
+		for _, v := range result {
+			if v.typ == VChar {
+				sb.WriteRune(v.ch)
+			} else {
+				return listFromSlice(result), nil
+			}
+		}
+		return vstr(sb.String()), nil
+	}
 	return listFromSlice(result), nil
 }
 
@@ -14789,6 +14835,10 @@ func builtinDelete(args []*Value) (*Value, error) {
 	seq := args[1]
 	if seq.typ == VNil {
 		return seq, nil
+	}
+	// For strings, delegate to remove (strings are immutable in CL)
+	if seq.typ == VStr {
+		return builtinSeqRemove(args)
 	}
 	if seq.typ != VPair {
 		return nil, fmt.Errorf("delete: expected a list, got %s", typeStr(seq))
@@ -14889,6 +14939,10 @@ func builtinDeleteIf(args []*Value) (*Value, error) {
 	seq := args[1]
 	if seq.typ == VNil {
 		return seq, nil
+	}
+	// For strings, delegate to remove-if (strings are immutable in CL)
+	if seq.typ == VStr {
+		return builtinSeqRemoveIf(args)
 	}
 	if seq.typ != VPair {
 		return nil, fmt.Errorf("delete-if: expected a list, got %s", typeStr(seq))
@@ -15377,6 +15431,18 @@ func builtinSeqSubstituteIf(args []*Value) (*Value, error) {
 				replaced++
 			}
 		}
+	}
+	// If input was a string and all results are characters, return a string
+	if seq.typ == VStr {
+		var sb strings.Builder
+		for _, v := range result {
+			if v.typ == VChar {
+				sb.WriteRune(v.ch)
+			} else {
+				return listFromSlice(result), nil
+			}
+		}
+		return vstr(sb.String()), nil
 	}
 	return listFromSlice(result), nil
 }
@@ -17121,6 +17187,16 @@ func builtinRound(args []*Value) (*Value, error) {
 			return nil, fmt.Errorf("round: division by zero")
 		}
 		q := math.Round(n / div)
+		// Round half to even
+		if diff := math.Abs(n/div - q); diff == 0.5 {
+			if math.Mod(q, 2) != 0 {
+				if n/div > 0 {
+					q--
+				} else {
+					q++
+				}
+			}
+		}
 		rem := n - q*div
 		return multiVal(vnum(q), vnum(rem)), nil
 	}
@@ -18502,11 +18578,15 @@ func builtinCoerce(args []*Value) (*Value, error) {
 	obj := args[0]
 	resultType := args[1]
 	typeStr := ""
+	typeSub := ""
 	if resultType.typ == VSym {
 		typeStr = strings.ToLower(resultType.str)
 	} else if isPair(resultType) && resultType.car != nil && resultType.car.typ == VSym {
 		// Compound type specifier like (complex float)
 		typeStr = strings.ToLower(resultType.car.str)
+		if isPair(resultType.cdr) && resultType.cdr.car != nil && resultType.cdr.car.typ == VSym {
+			typeSub = strings.ToLower(resultType.cdr.car.str)
+		}
 	}
 
 	switch typeStr {
@@ -18521,7 +18601,7 @@ func builtinCoerce(args []*Value) (*Value, error) {
 			return vstr(obj.str), nil
 		}
 		if obj.typ == VPair || isNil(obj) {
-			// list of characters/numbers -> string
+			// list of characters/numbers/symbols/strings -> string
 			var sb strings.Builder
 			cur := obj
 			for !isNil(cur) {
@@ -18531,6 +18611,10 @@ func builtinCoerce(args []*Value) (*Value, error) {
 						sb.WriteRune(elt.ch)
 					} else if elt.typ == VNum {
 						sb.WriteRune(rune(toNum(elt)))
+					} else if elt.typ == VSym {
+						sb.WriteString(elt.str)
+					} else if elt.typ == VStr {
+						sb.WriteString(elt.str)
 					}
 					cur = cur.cdr
 				} else {
@@ -18572,10 +18656,37 @@ func builtinCoerce(args []*Value) (*Value, error) {
 		}
 		return nil, fmt.Errorf("coerce: cannot coerce to rational")
 	case "complex", ":complex":
-		if obj.typ == VComplex {
-			return obj, nil
+		// Check for compound type specifier: (complex float), (complex single-float), (complex double-float)
+		switch typeSub {
+		case "float", "single-float":
+			if obj.typ == VComplex {
+				r := float64(float32(obj.num))
+				i := float64(float32(obj.imag))
+				return vcomplexAlways(r, i), nil
+			}
+			r := float64(float32(toNum(obj)))
+			return vcomplexAlways(r, 0), nil
+		case "double-float":
+			if obj.typ == VComplex {
+				r := toNum(obj)
+				i := obj.imag
+				return vcomplexAlways(r, i), nil
+			}
+			return vcomplexAlways(toNum(obj), 0), nil
+		case "rational":
+			// (complex rational) - complex with rational parts
+			n := toNum(obj)
+			if n == float64(int64(n)) {
+				return vcomplexAlways(float64(int64(n)), 0), nil
+			}
+			return toRational(n), nil // This won't work well, but handle as best as possible
+		default:
+			// Plain (complex) or unknown subtype
+			if obj.typ == VComplex {
+				return obj, nil
+			}
+			return vcomplex(toNum(obj), 0), nil
 		}
-		return vcomplex(toNum(obj), 0), nil
 	case "character", ":character":
 		if obj.typ == VChar {
 			return obj, nil

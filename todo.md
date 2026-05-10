@@ -120,3 +120,15 @@
 79. `floor`/`ceiling`/`truncate`/`round` 返回 list 而非 VMultiVal（多值应使用 multiVal 而非 list）— 已修复
 80. `=`/`/=` 等数值比较对复数只比较实部（`compareNumeric` 忽略虚部）— 已修复
 81. `coerce` 不支持 `standard-char`/`base-char` 作为结果类型 — 已修复
+
+## 新发现并修复的 Bug
+
+82. `coerce` 到 `(complex float)` / `(complex single-float)` / `(complex double-float)` 类型说明符时返回实数而非复数（vcomplex 在虚部为0时返回 vnum）— 已修复（新增 vcomplexAlways 函数，coerce 中对 compound type specifier 使用 vcomplexAlways）
+83. `coerce` 将列表如 `'(a b c)` 转为字符串时返回空字符串（list-to-string 未处理 VSym/VStr 元素）— 已修复
+84. `substitute` 对字符串输入返回列表而非字符串 — 已修复
+85. `substitute-if` 对字符串输入返回列表而非字符串 — 已修复
+86. `remove` 对字符串输入返回列表而非字符串 — 已修复
+87. `remove-if` 对字符串输入返回列表而非字符串 — 已修复
+88. `delete` 不支持字符串输入（只接受 VPair）— 已修复（对字符串委托给 remove）
+89. `delete-if` 不支持字符串输入（只接受 VPair）— 已修复（对字符串委托给 remove-if）
+90. `round` 的 two-argument 形式（`round x d`）未使用 round-half-to-even 规则 — 已修复
