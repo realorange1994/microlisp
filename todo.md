@@ -168,3 +168,21 @@
 107. `coerce` 的 `list` 类型不支持复数（如 `(coerce #c(3 4) 'list)` 应返回 `(3 4)`）— 已修复（添加 VComplex 分支）
 
 108. `pi`、`most-positive-fixnum`、`most-negative-fixnum` 等 CL 标准常量未定义 — 已修复（在 Go 初始化代码中添加 `pi`、`most-positive-fixnum`、`most-negative-fixnum` 常量）
+
+## 新发现并修复的 Bug（第二轮测试）
+
+109. `listp` 函数未实现 — 已修复（添加 `builtinListP` Go 函数，注册到 builtin table）
+
+110. `coerce` 到 `float`/`single-float`/`double-float` 返回整数而非浮点数（`(coerce 1 'float)` 返回 `1` 而非 `1.0`，`vnum` 存储后 `toString` 按整数打印）— 已修复（添加 `isFloat` 标志到 Value 结构体，`vfloat()` 创建标记为浮点的 VNum 值，coerce float 分支改用 `vfloat`，toString 对 `isFloat` 值强制打印小数点）
+
+111. 词法分析器不区分整数和浮点数字面量（`1` 和 `1.0` 在内部表示完全相同）— 已修复（Tok 结构体添加 `isFlt` 标志，lexNum 解析到小数点或指数标记时设置 `isFlt=true`，reader 对 `isFlt` token 使用 `vfloat`）
+
+112. 算术运算（`+`, `-`, `*`, `/`）结果丢失浮点标记（`(+ 1 2.0)` 返回 `3` 而非 `3.0`）— 已修复（在 builtinAdd/builtinSub/builtinMul/builtinDiv 的最终 float 返回路径添加 `isFloat` 检查，添加 `numOrFloat` 辅助函数自动传播浮点标记）
+
+113. `floatp` 无法识别 `coerce` 产生的浮点数（`1.0 == math.Trunc(1.0)` 导致判断为整数）— 已修复（使用 `isFloat` 标志而非值是否等于其整数部分来判断）
+
+114. `typep`/`subtypep` 的 INTEGER/FLOAT 类型区分不尊重浮点标记（`(typep 1.0 'integer)` 返回 `#t`）— 已修复（在 conditions.go 的 `typepCheckRec` 和符号类型分支中，INTEGER 检查添加 `!val.isFloat` 条件，FLOAT 检查改为 `val.isFloat`）
+
+115. `type-of` 对所有 VNum 返回 "number" 而非区分整数和浮点数 — 已修复（typeStr 对 `isFloat` VNum 返回 "single-float"，对非浮点整数返回 "integer"）
+
+116. `reverse`/`nreverse` 对点状列表（dotted list）丢失尾部（`(nreverse '(1 2 3 . 4))` 返回 `(3 2 1)` 而非 `(3 2 1 . 4)`）— 已修复（改用 `for i := 0; i < len(elems); i++ { tail = cons(elems[i], tail) }` 方式重建反转列表，保留原始尾部值）

@@ -109,6 +109,7 @@ type Value struct {
 	mark   byte
 	gen    int
 	num    float64
+	isFloat bool // true when value was explicitly created as a floating-point number
 	ch     rune
 	irat   int64
 	iden   int64
@@ -883,6 +884,17 @@ func internOrVsym(name string) *Value {
 }
 
 func vnum(f float64) *Value { v := gcv(); v.typ = VNum; v.num = f; return v }
+func vfloat(f float64) *Value { v := gcv(); v.typ = VNum; v.num = f; v.isFloat = true; return v }
+
+// anyFloat returns vfloat(f) if any arg has isFloat set, else vnum(f)
+func numOrFloat(f float64, args []*Value) *Value {
+	for _, a := range args {
+		if a.typ == VNum && a.isFloat {
+			return vfloat(f)
+		}
+	}
+	return vnum(f)
+}
 func vrat(n, d int64) *Value {
 	if d == 0 {
 		return nil
@@ -1122,6 +1134,7 @@ type Tok struct {
 	pos    int
 	bigInt *big.Int
 	isBar  bool // true if symbol was read via |...| escapes (preserves case)
+	isFlt  bool // true if number was parsed as a floating-point literal
 }
 
 type Lexer struct {
@@ -1477,7 +1490,7 @@ func (l *Lexer) lexNum() Tok {
 	if err != nil {
 		return l.lexSymFrom(start)
 	}
-	l.tok = Tok{typ: TNum, num: f, pos: start}
+	l.tok = Tok{typ: TNum, num: f, pos: start, isFlt: hasDecimal || hasExponent}
 	return l.tok
 }
 
@@ -1711,6 +1724,9 @@ func (p *Parser) read() (*Value, error) {
 			return v, nil
 		}
 		v := vnum(p.tok.num)
+		if p.tok.isFlt {
+			v = vfloat(p.tok.num)
+		}
 		p.advance()
 		return v, nil
 	case TStr:
@@ -5580,7 +5596,10 @@ func typeStr(v *Value) string {
 	case VNil:
 		return "nil"
 	case VNum:
-		return "number"
+		if v.isFloat {
+			return "single-float"
+		}
+		return "integer"
 	case VRat:
 		return "rational"
 	case VComplex:
@@ -5693,6 +5712,7 @@ var builtins = []builtinDef{
 	{"null?", builtinNullP},
 	{"pair?", builtinPairP},
 	{"consp", builtinPairP},
+	{"LISTP", builtinListP},
 	{"number?", builtinNumP},
 	{"string?", builtinStrP},
 	{"package?", builtinPackageP},
@@ -7083,7 +7103,7 @@ func builtinAdd(args []*Value) (*Value, error) {
 			for _, a2 := range args {
 				f += toNum(a2)
 			}
-			return vnum(f), nil
+			return vfloat(f), nil
 		}
 		return vbigint(result), nil
 	}
@@ -7111,7 +7131,7 @@ func builtinAdd(args []*Value) (*Value, error) {
 			for _, a := range args {
 				r += toNum(a)
 			}
-			return vnum(r), nil
+			return vfloat(r), nil
 		}
 		return vrat(n, d), nil
 	}
@@ -7119,7 +7139,7 @@ func builtinAdd(args []*Value) (*Value, error) {
 	for _, a := range args {
 		r += toNum(a)
 	}
-	return vnum(r), nil
+	return numOrFloat(r, args), nil
 }
 
 func builtinSub(args []*Value) (*Value, error) {
@@ -7150,7 +7170,7 @@ func builtinSub(args []*Value) (*Value, error) {
 			for _, a := range args[1:] {
 				f -= toNum(a)
 			}
-			return vnum(f), nil
+			return vfloat(f), nil
 		}
 		for _, a := range args[1:] {
 			bi := toBigInt(a)
@@ -7161,7 +7181,7 @@ func builtinSub(args []*Value) (*Value, error) {
 				for _, a2 := range args {
 					f -= toNum(a2)
 				}
-				return vnum(f), nil
+				return vfloat(f), nil
 			}
 		}
 		return vbigint(result), nil
@@ -7195,7 +7215,7 @@ func builtinSub(args []*Value) (*Value, error) {
 			for _, a := range args[1:] {
 				r -= toNum(a)
 			}
-			return vnum(r), nil
+			return vfloat(r), nil
 		}
 		return vrat(n0, d0), nil
 	}
@@ -7203,7 +7223,7 @@ func builtinSub(args []*Value) (*Value, error) {
 	for _, a := range args[1:] {
 		r -= toNum(a)
 	}
-	return vnum(r), nil
+	return numOrFloat(r, args), nil
 }
 
 func builtinMul(args []*Value) (*Value, error) {
@@ -7238,7 +7258,7 @@ func builtinMul(args []*Value) (*Value, error) {
 			for _, a2 := range args {
 				f *= toNum(a2)
 			}
-			return vnum(f), nil
+			return vfloat(f), nil
 		}
 		return vbigint(result), nil
 	}
@@ -7265,7 +7285,7 @@ func builtinMul(args []*Value) (*Value, error) {
 			for _, a := range args {
 				r *= toNum(a)
 			}
-			return vnum(r), nil
+			return vfloat(r), nil
 		}
 		return vrat(n, d), nil
 	}
@@ -7290,7 +7310,7 @@ func builtinMul(args []*Value) (*Value, error) {
 	for _, a := range args {
 		r *= toNum(a)
 	}
-	return vnum(r), nil
+	return numOrFloat(r, args), nil
 }
 
 func builtinDiv(args []*Value) (*Value, error) {
@@ -7361,7 +7381,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 				}
 				r /= toNum(a)
 			}
-			return vnum(r), nil
+			return vfloat(r), nil
 		}
 		for _, a := range args[1:] {
 			bi := toBigInt(a)
@@ -7373,7 +7393,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 					}
 					r /= toNum(a2)
 				}
-				return vnum(r), nil
+				return vfloat(r), nil
 			}
 			if bi.Sign() == 0 {
 				return nil, signalDivisionByZero()
@@ -7401,7 +7421,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 			new(big.Float).SetInt(num),
 			new(big.Float).SetInt(den),
 		).Float64()
-		return vnum(f), nil
+		return vfloat(f), nil
 	}
 	if needRat(args) {
 		n0, d0, isInt0 := toRatParts(args[0])
@@ -7437,7 +7457,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 				}
 				r /= toNum(a)
 			}
-			return vnum(r), nil
+			return vfloat(r), nil
 		}
 		return vrat(n0, d0), nil
 	}
@@ -7448,7 +7468,7 @@ func builtinDiv(args []*Value) (*Value, error) {
 		}
 		r /= toNum(a)
 	}
-	return vnum(r), nil
+	return numOrFloat(r, args), nil
 }
 
 func builtinEq(args []*Value) (*Value, error) {
@@ -7811,6 +7831,14 @@ func builtinPairP(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("pair?: need 1 argument")
 	}
 	return vbool(isPair(args[0])), nil
+}
+
+func builtinListP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("listp: need 1 argument")
+	}
+	v := args[0]
+	return vbool(isNil(v) || v.typ == VPair), nil
 }
 
 func builtinNumP(args []*Value) (*Value, error) {
@@ -12344,9 +12372,9 @@ func isTypeSpecializerMatch(arg *Value, typeName string) bool {
 	case "number":
 		return arg.typ == VNum
 	case "integer":
-		return arg.typ == VNum && arg.imag == 0 && arg.num == float64(int64(arg.num))
-	case "float":
-		return arg.typ == VNum && arg.imag == 0
+		return arg.typ == VNum && !arg.isFloat && arg.num == float64(int64(arg.num))
+	case "float", "single-float", "double-float":
+		return arg.typ == VNum && arg.isFloat
 	case "character":
 		return arg.typ == VChar
 	case "vector":
@@ -15018,13 +15046,49 @@ func builtinButlast(args []*Value) (*Value, error) {
 			}
 			c = c.cdr
 		}
+		// Preserve dotted tail
+		if !isNil(c) && result.typ == VPair {
+			// find last pair
+			last := result
+			for last.cdr.typ == VPair {
+				last = last.cdr
+			}
+			last.cdr = c
+		}
 		return result, nil
 	}
-	elems := seqToList(list)
+	// n > 0: walk list counting elements, preserving dotted tail
+	cur := list
+	var elems []*Value
+	var cdrs []*Value
+	for cur.typ == VPair {
+		elems = append(elems, cur.car)
+		cdrs = append(cdrs, cur.cdr)
+		cur = cur.cdr
+	}
 	if n >= len(elems) {
 		return vnil(), nil
 	}
-	return listFromSlice(elems[:len(elems)-n]), nil
+	keep := len(elems) - n
+	// The final cdr comes from the 'keep' element's cdr
+	finalCdr := cdrs[keep-1]
+	// Rebuild with only first 'keep' elements
+	if keep == 0 {
+		return finalCdr, nil
+	}
+	result := vnil()
+	for i := keep - 1; i >= 0; i-- {
+		result = cons(elems[i], result)
+	}
+	// Set the final cdr (dotted tail or nil)
+	if !isNil(finalCdr) {
+		last := result
+		for last.cdr.typ == VPair {
+			last = last.cdr
+		}
+		last.cdr = finalCdr
+	}
+	return result, nil
 }
 
 func builtinNbutlast(args []*Value) (*Value, error) {
@@ -16390,11 +16454,27 @@ func builtinSeqNReverse(args []*Value) (*Value, error) {
 		}
 		return vstr(string(runes)), nil
 	}
-	elems := seqToList(seq)
-	for i, j := 0, len(elems)-1; i < j; i, j = i+1, j-1 {
-		elems[i], elems[j] = elems[j], elems[i]
+	if seq.typ == VArray {
+		elems := seq.array.elements
+		for i, j := 0, len(elems)-1; i < j; i, j = i+1, j-1 {
+			elems[i], elems[j] = elems[j], elems[i]
+		}
+		return seq, nil
 	}
-	return listFromSlice(elems), nil
+	// Walk the list collecting elements and the final tail
+	elems := []*Value{}
+	cur := seq
+	for cur != nil && cur.typ == VPair {
+		elems = append(elems, cur.car)
+		cur = cur.cdr
+	}
+	// cur is the final tail (nil for proper list, dotted value otherwise)
+	tail := cur
+	// Rebuild reversed list with the same tail
+	for i := 0; i < len(elems); i++ {
+		tail = cons(elems[i], tail)
+	}
+	return tail, nil
 }
 
 func builtinStringTrim(args []*Value) (*Value, error) {
@@ -17350,11 +17430,33 @@ func builtinReverse(args []*Value) (*Value, error) {
 		}
 		return vstr(string(runes)), nil
 	}
-	elems := seqToList(seq)
-	for i, j := 0, len(elems)-1; i < j; i, j = i+1, j-1 {
-		elems[i], elems[j] = elems[j], elems[i]
+	if seq.typ == VArray {
+		elems := seq.array.elements
+		result := make([]*Value, len(elems))
+		copy(result, elems)
+		for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+			result[i], result[j] = result[j], result[i]
+		}
+		arr := &LispArray{dims: seq.array.dims, elements: result}
+		r := gcv()
+		r.typ = VArray
+		r.array = arr
+		return r, nil
 	}
-	return listFromSlice(elems), nil
+	// Walk the list collecting elements and the final tail
+	elems := []*Value{}
+	cur := seq
+	for cur != nil && cur.typ == VPair {
+		elems = append(elems, cur.car)
+		cur = cur.cdr
+	}
+	// cur is the final tail (nil for proper list, dotted value otherwise)
+	tail := cur
+	// Rebuild reversed list with the same tail
+	for i := 0; i < len(elems); i++ {
+		tail = cons(elems[i], tail)
+	}
+	return tail, nil
 }
 
 // -------- acons --------
@@ -17675,7 +17777,7 @@ func builtinMod(args []*Value) (*Value, error) {
 			if r != 0 && (r > 0) != (df > 0) {
 				r += df
 			}
-			return vnum(r), nil
+			return numOrFloat(r, args), nil
 		}
 		if d.Sign() == 0 {
 			return nil, fmt.Errorf("mod: division by zero")
@@ -17693,7 +17795,7 @@ func builtinMod(args []*Value) (*Value, error) {
 	if r != 0 && (r > 0) != (d > 0) {
 		r += d
 	}
-	return vnum(r), nil
+	return numOrFloat(r, args), nil
 }
 
 func builtinRem(args []*Value) (*Value, error) {
@@ -18727,8 +18829,8 @@ func builtinFloatp(args []*Value) (*Value, error) {
 	}
 	v := args[0]
 	if v.typ == VNum {
-		// floatp only true for non-integer floats
-		return vbool(v.num != math.Trunc(v.num)), nil
+		// floatp true for values explicitly created as float or non-integer VNum
+		return vbool(v.isFloat || v.num != math.Trunc(v.num)), nil
 	}
 	return vbool(false), nil
 }
@@ -19300,7 +19402,7 @@ func builtinCoerce(args []*Value) (*Value, error) {
 		}
 		return listFromSlice(seqToList(obj)), nil
 	case "float", ":float", "single-float", "double-float":
-		return vnum(toNum(obj)), nil
+		return vfloat(toNum(obj)), nil
 	case "rational", "ratio", ":rational", ":ratio":
 		if obj.typ == VRat {
 			return obj, nil
@@ -20710,6 +20812,14 @@ func toString(v *Value) string {
 		return "()"
 	case VNum:
 		f := v.num
+		if v.isFloat {
+			// explicitly a float: always print with decimal point
+			s := strconv.FormatFloat(f, 'g', -1, 64)
+			if !strings.ContainsAny(s, ".eE") {
+				s += ".0"
+			}
+			return s
+		}
 		if f == math.Trunc(f) && !math.IsInf(f, 0) && math.Abs(f) < 1e15 {
 			return strconv.FormatInt(int64(f), 10)
 		}

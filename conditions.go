@@ -771,9 +771,9 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 				}
 				return true
 			case "INTEGER":
-				return (val.typ == VNum && val.num == float64(int64(val.num))) || val.typ == VRat || val.typ == VBigInt
-			case "FLOAT":
-				return val.typ == VNum && val.num != float64(int64(val.num))
+				return (val.typ == VNum && !val.isFloat && val.num == float64(int64(val.num))) || val.typ == VRat || val.typ == VBigInt
+			case "FLOAT", "SINGLE-FLOAT", "DOUBLE-FLOAT", "SHORT-FLOAT", "LONG-FLOAT":
+				return val.typ == VNum && val.isFloat
 			case "NUMBER":
 				return val.typ == VNum || val.typ == VRat || val.typ == VComplex || val.typ == VBigInt
 			case "REAL":
@@ -810,10 +810,10 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 		return false // nil is the empty type - never matches any value
 	}
 	if typeName == "INTEGER" {
-		return (val.typ == VNum && val.num == float64(int64(val.num))) || val.typ == VRat || val.typ == VBigInt
+		return (val.typ == VNum && !val.isFloat && val.num == float64(int64(val.num))) || val.typ == VRat || val.typ == VBigInt
 	}
-	if typeName == "FLOAT" {
-		return val.typ == VNum && val.num != float64(int64(val.num))
+	if typeName == "FLOAT" || typeName == "SINGLE-FLOAT" || typeName == "DOUBLE-FLOAT" || typeName == "SHORT-FLOAT" || typeName == "LONG-FLOAT" {
+		return val.typ == VNum && val.isFloat
 	}
 	if typeName == "NUMBER" {
 		return val.typ == VNum || val.typ == VRat || val.typ == VComplex || val.typ == VBigInt
