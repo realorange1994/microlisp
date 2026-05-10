@@ -2032,6 +2032,38 @@ func parseAll(s string) (*Value, error) {
 	return rev, nil
 }
 
+// parseExprList parses a string of zero or more expressions and returns them
+// as a proper Lisp list. Used by read-delimited-list.
+func parseExprList(s string) (*Value, error) {
+	l := lex(s)
+	p := &Parser{l: l, ptoks: make([]Tok, 0, 64), readtable: currentReadtable, env: globalEnv}
+	p.advance()
+	// Collect all parsed expressions in order
+	var forms []*Value
+	for p.tok.typ != TEOF {
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		if v != nil {
+			forms = append(forms, v)
+		}
+	}
+	// Build a proper Lisp list from the forms (in correct order)
+	var head, tail *Value = nil, nil
+	for _, form := range forms {
+		pair := cons(form, vnil())
+		if head == nil {
+			head = pair
+			tail = pair
+		} else {
+			tail.cdr = pair
+			tail = pair
+		}
+	}
+	return head, nil
+}
+
 // -------- Evaluator --------
 
 func evalString(s string, env *Env) (*Value, error) {
@@ -5488,6 +5520,7 @@ var builtins = []builtinDef{
 	{"write-string", builtinWriteString},
 	{"write-line", builtinWriteLine},
 	{"read-byte", builtinReadByte},
+	{"read-delimited-list", builtinReadDelimitedList},
 	{"write-byte", builtinWriteByte},
 	{"read-sequence", builtinReadSequence},
 	{"write-sequence", builtinWriteSequence},
