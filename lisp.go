@@ -1172,7 +1172,8 @@ const (
 	TComplex
 	TVector  // #( elements ) vector literal
 	TMacro // readtable macro character
-	TSharpDot // #. read-time evaluation
+	TSharpDot   // #. read-time evaluation
+	TSharpMacro // # dispatch macro character
 )
 
 type Tok struct {
@@ -1370,6 +1371,15 @@ func (l *Lexer) next() Tok {
 		if l.pos < len(l.src) && (l.src[l.pos] == '+' || l.src[l.pos] == '-') {
 			l.pos++ // consume +/-
 			return l.lexSymFrom(p)
+		}
+		// Check for user-registered dispatch macro characters
+		if currentReadtable != nil && l.pos < len(l.src) {
+			subCh := rune(l.src[l.pos])
+			if entry, ok := currentReadtable.dispFns[subCh]; ok && entry != nil && entry.lispFn != nil {
+				l.pos++ // consume sub-char
+				l.tok = Tok{typ: TSharpMacro, ch: subCh, pos: p}
+				return l.tok
+			}
 		}
 		// Not #\, fall through to symbol/number handling
 		return l.lexSym()
@@ -2043,6 +2053,13 @@ func (p *Parser) readExpr() (*Value, error) {
 			return nil, fmt.Errorf("#. read-time evaluation error: %v", err)
 		}
 		return result, nil
+	case TSharpMacro:
+		// User-registered # dispatch macro character
+		result, err := p.invokeDispatchMacro()
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
 	case TPathname:
 		pathStr := p.tok.lit
 		p.advance()
@@ -2157,6 +2174,36 @@ func (p *Parser) invokeMacro(ch rune) (*Value, error) {
 	if err != nil {
 		return nil, fmt.Errorf("macro function error: %v", err)
 	}
+	return result, nil
+}
+
+// invokeDispatchMacro calls a user-registered # dispatch macro function.
+// The function is called as: (function stream sub-char num-params)
+func (p *Parser) invokeDispatchMacro() (*Value, error) {
+	rt := p.readtable
+	if rt == nil {
+		rt = currentReadtable
+	}
+	subCh := p.tok.ch
+	entry, ok := rt.dispFns[subCh]
+	if !ok || entry == nil || entry.lispFn == nil {
+		return nil, fmt.Errorf("invokeDispatchMacro: no dispatch function for #%c", subCh)
+	}
+	// Build call: (function stream sub-char)
+	// stream: pass as nil for now (reader stream)
+	// sub-char: the character after #
+	stream := vnil()
+	chVal := &Value{typ: VChar, ch: subCh}
+	callForm := list(entry.lispFn, stream, chVal)
+	env := p.env
+	if env == nil {
+		env = globalEnv
+	}
+	result, err := eval(callForm, env)
+	if err != nil {
+		return nil, fmt.Errorf("# dispatch macro error: %v", err)
+	}
+	p.advance()
 	return result, nil
 }
 
@@ -20825,6 +20872,10 @@ func formatDispatch(fs *fmtState) {
 		} else {
 			s = strconv.FormatFloat(f, 'f', -1, 64)
 		}
+		// ~F must always produce a float: ensure decimal point is present
+		if !strings.Contains(s, ".") {
+			s = s + ".0"
+		}
 		fs.buf.WriteString(s)
 	case '$':
 		// ~$, ~:$, ~@$ - dollar float formatting
@@ -20887,12 +20938,57 @@ func formatDispatch(fs *fmtState) {
 			fs.buf.WriteString(formatCardinal(n))
 		}
 	case 'C':
-		fs.buf.WriteString(princToString(fs.popArg()))
+		arg := fs.popArg()
+		if arg.typ == VChar {
+			if at {
+				// ~@C: print with escape syntax like prin1
+				fs.buf.WriteString(toString(arg))
+			} else if colon {
+				// ~:C: spell out the character name for non-printing chars
+				ch := arg.ch
+				switch ch {
+				case ' ':
+					fs.buf.WriteString("Space")
+				case '\n':
+					fs.buf.WriteString("Newline")
+				case '\t':
+					fs.buf.WriteString("Tab")
+				case '\r':
+					fs.buf.WriteString("Return")
+				case '\x08':
+					fs.buf.WriteString("Backspace")
+				case '\x7f':
+					fs.buf.WriteString("Rubout")
+				case '\f':
+					fs.buf.WriteString("Page")
+				default:
+					if ch < ' ' || ch == '\x7f' {
+						// Non-printing: use #\name form
+						fs.buf.WriteString(toString(arg))
+					} else {
+						fs.buf.WriteRune(ch)
+					}
+				}
+			} else {
+				// ~C: print just the character itself (like princ)
+				fs.buf.WriteRune(arg.ch)
+			}
+		} else {
+			fs.buf.WriteString(princToString(arg))
+		}
 	case '%':
-		fs.buf.WriteString("\n")
+		n := int(fs.getParam(params, 0, 1))
+		for i := 0; i < n; i++ {
+			fs.buf.WriteString("\n")
+		}
 	case '&':
 		// fresh-line: output newline unless already at start of line
+		n := int(fs.getParam(params, 0, 1))
 		if fs.buf.Len() > 0 {
+			fs.buf.WriteString("\n")
+			n--
+		}
+		for i := 0; i < n; i++ {
 			fs.buf.WriteString("\n")
 		}
 	case '|':
@@ -22419,6 +22515,25 @@ var initLib = `
 
 (define-macro (prog2 first second . rest)
   (list 'begin first (cons 'prog1 (cons second rest))))
+
+;; prog: (prog (varlist) . body) => (block nil (let (bindings) (tagbody . body)))
+;; Each var in varlist can be: var, (var), or (var init)
+(define-macro (prog varlist . body)
+  (let ((bindings (mapcar (lambda (v)
+                            (if (pair? v)
+                              (if (null? (cdr v)) (list (car v) nil) v)
+                              (list v nil)))
+                          varlist)))
+    (list 'block 'nil (list 'let bindings (cons 'tagbody body)))))
+
+;; prog*: (prog* (varlist) . body) => (block nil (let* (bindings) (tagbody . body)))
+(define-macro (prog* varlist . body)
+  (let ((bindings (mapcar (lambda (v)
+                            (if (pair? v)
+                              (if (null? (cdr v)) (list (car v) nil) v)
+                              (list v nil)))
+                          varlist)))
+    (list 'block 'nil (list 'let* bindings (cons 'tagbody body)))))
 
 (define-macro (push item place)
   (list 'setf place (list 'cons item place)))

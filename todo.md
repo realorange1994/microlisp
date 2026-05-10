@@ -3,7 +3,7 @@
 ## 未实现的功能
 
 ### Reader / Readtable
-- [ ] `set-dispatch-macro-character` 注册的 dispatch 函数未被 parser 调用（# 分发完全硬编码）
+- [x] `set-dispatch-macro-character` 注册的 dispatch 函数未被 parser 调用（# 分发完全硬编码）— 已修复（添加 TSharpMacro token 类型，lexer 检查 currentReadtable.dispFns，parser 调用 invokeDispatchMacro）
 - [x] `read-delimited-list` 未实现 — 已实现 `builtinReadDelimitedList`
 - [x] `readtable-case` 的 `:preserve` 和 `:invert` 模式未实现（lexer 总是 uppercase 符号名）— 已修复
 
@@ -244,3 +244,15 @@
 139. `with-condition-restarts` 宏未实现 — 已修复（添加 defmacro 定义，使用 list/quote 构建 unwind-protect 形式，添加 %associate-restarts-with-condition 和 %dissociate-restarts-with-condition Go 存根函数）
 
 140. `type-error-datum`/`type-error-expected-type` 条件访问器未实现 — 已修复（添加 type-error-datum、type-error-expected-type、stream-error-stream、file-error-pathname、arithmetic-error-operation、arithmetic-error-operands、package-error-package 七个 defun 访问器函数）
+
+## 新修复的 Bug（本次会话）
+
+141. `format ~f` 对整数不添加 `.0`（`(format nil "~f" 42)` 返回 "42" 而非 "42.0"）— 已修复（在 ~F 格式分支中，检查输出是否包含小数点，不包含则追加 ".0"）
+
+142. `format ~c` 对字符打印 `#\a` 而非 `a`（`(format nil "~c" #\a)` 返回 "#\\a"）— 已修复（~C 分支对 VChar 类型直接 WriteRune 输出字符本身，~@C 使用 prin1 转义形式，~:C 拼写非打印字符名称）
+
+143. `format ~%` 和 `~&` 不接受重复计数参数（`(format nil "~3%")` 只产生 1 个换行）— 已修复（从 params 读取重复计数，默认值为 1）
+
+144. `prog`/`prog*` 宏未实现 — 已修复（添加 defmacro 定义，展开为 `(block nil (let/let* bindings (tagbody body)))`，变量无初始化时默认为 nil）
+
+145. `set-dispatch-macro-character` 注册的 dispatch 函数未被 parser 调用 — 已修复（添加 TSharpMacro token 类型，lexer 检查 currentReadtable.dispFns 并匹配用户注册的字符，parser 的 invokeDispatchMacro 调用 (function stream sub-char)）
