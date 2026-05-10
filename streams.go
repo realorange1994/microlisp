@@ -1931,6 +1931,20 @@ func (p *delimitedParser) readDispatch() (*Value, error) {
 		return cons(vsym("function"), cons(v, vnil())), nil
 	}
 
+	if ch == '.' {
+		// Sharp-dot #.expr — read and evaluate expr immediately
+		p.pos++
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		result, err := eval(v, globalEnv)
+		if err != nil {
+			return nil, fmt.Errorf("#. read-time evaluation error: %v", err)
+		}
+		return result, nil
+	}
+
 	p.pos++
 	return internOrVsym("#" + string(ch)), nil
 }

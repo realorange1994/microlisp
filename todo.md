@@ -209,14 +209,14 @@
 
 ## 新发现但未修复的 Bug（第三轮 SBCL 测试）
 
-125. `read-from-string` 返回 `(value . position)` cons 对，但 `eval` 双重求值时 `((quasiquote ...))` 被当作函数调用导致 "not a procedure: pair" 错误（双重反引号 `(eval (eval (read-from-string expr)))` 测试失败）
+125. `read-from-string` 返回 `(value . position)` cons 对，但 `eval` 双重求值时 `((quasiquote ...))` 被当作函数调用导致 "not a procedure: pair" 错误（双重反引号 `(eval (eval (read-from-string expr)))` 测试失败）— 已修复（与 Bug #126 同根因：eval 对 car 为 quasiquote 的列表形式增加特殊处理）
 
-126. `eval` 对 `(quasiquote ...)` 列表求值时，当 `quasiquote` 符号出现在嵌套列表首元素时被当作函数调用（`(eval '((quasiquote (unquote (*RR* *SS*)))))` 报错 "not a procedure: pair" 而非识别为 backquote 形式）
+126. `eval` 对 `(quasiquote ...)` 列表求值时，当 `quasiquote` 符号出现在嵌套列表首元素时被当作函数调用（`(eval '((quasiquote (unquote (*RR* *SS*)))))` 报错 "not a procedure: pair" 而非识别为 backquote 形式）— 已修复（在 eval 的 VPair 分支中，检测 car 为 `(quasiquote ...)` 或 `(backquote ...)` 时，调用 evalQuasiquote 展开并返回结果，而非尝试函数调用）
 
 127. `random` 对某些值报错 "limit must be >= 1"（SBCL random.pure.lisp 测试文件加载时触发，可能由 `(if x high 10)` 中 `checked-compile` 展开或 `funcall` 调用中的值传递问题导致）
 
-128. `handler-case` 无法捕获 Go 层返回的错误（如 `length: #t is not a sequence` 等 `fmt.Errorf` 错误不经过条件系统，无法被 `handler-case` 或 `assert-error` 捕获）
+128. `handler-case` 无法捕获 Go 层返回的错误（如 `length: #t is not a sequence` 等 `fmt.Errorf` 错误不经过条件系统，无法被 `handler-case` 或 `assert-error` 捕获）— 已修复（在 handler-case 评估 valForm 后，若存在 Go 错误，将其转换为 simple-error 条件，并通过 classMatchesCondition 遍历子句查找匹配的处理程序）
 
 129. `#*` 位向量字面量语法未实现 — 已修复（lexer 添加 `#*` 解析，生成 TVector token 并通过 `l.bitVec` 传递，readExpr TVector 分支检查 sentinel 值返回 bitVec，sxhashSeen 添加 VArray 分支使用 `h = seed*31 + elem_hash` 混合公式）
 
-130. `#.` (sharp-dot) 读者宏未实现（SBCL backq 测试中 `#.(write-to-string ...)` 无法读取）
+130. `#.` (sharp-dot) 读者宏未实现（SBCL backq 测试中 `#.(write-to-string ...)` 无法读取）— 已修复（lexer 添加 TSharpDot token 类型，Parser.readExpr 中读取下一个表达式并立即 eval；delimitedParser.readDispatch 中添加 `.` 分支实现读取时求值）

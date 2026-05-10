@@ -1133,6 +1133,7 @@ const (
 	TComplex
 	TVector  // #( elements ) vector literal
 	TMacro // readtable macro character
+	TSharpDot // #. read-time evaluation
 )
 
 type Tok struct {
@@ -1217,6 +1218,12 @@ func (l *Lexer) next() Tok {
 			// #' is function shorthand: #'name -> (function name)
 			l.pos++ // skip quote
 			l.tok = Tok{typ: TFuncQuote, pos: p}
+			return l.tok
+		}
+		if l.pos < len(l.src) && l.src[l.pos] == '.' {
+			// #. is read-time evaluation: #.expr reads and evaluates expr
+			l.pos++ // skip .
+			l.tok = Tok{typ: TSharpDot, pos: p}
 			return l.tok
 		}
 		if l.pos < len(l.src) && (l.src[l.pos] == 'C' || l.src[l.pos] == 'c') {
@@ -1986,6 +1993,17 @@ func (p *Parser) readExpr() (*Value, error) {
 			return nil, err
 		}
 		return list(vsym("function"), v), nil
+	case TSharpDot:
+		p.advance()
+		v, err := p.readExpr()
+		if err != nil {
+			return nil, err
+		}
+		result, err := eval(v, globalEnv)
+		if err != nil {
+			return nil, fmt.Errorf("#. read-time evaluation error: %v", err)
+		}
+		return result, nil
 	case TPathname:
 		pathStr := p.tok.lit
 		p.advance()
@@ -2220,7 +2238,24 @@ evalLoop:
 			return val, nil
 		case VPair:
 			if v.car == nil || v.car.typ != VSym {
-				// application
+				// Check if the car is quasiquote/backquote — expand and return
+		if v.car != nil && v.car.typ == VPair {
+			carCar := v.car.car
+			if carCar != nil && carCar.typ == VSym {
+				carSym := carCar.str
+				if carSym == "QUASIQUOTE" || carSym == "BACKQUOTE" {
+					expanded, qerr := evalQuasiquote(v.car, 0, env)
+					if qerr != nil {
+						return nil, qerr
+					}
+					// When eval receives ((quasiquote ...)), treat it as just
+					// the quasiquote form — return the expanded data directly
+					return expanded, nil
+				}
+			}
+		}
+
+		// application
 				fn, e := eval(v.car, env)
 				if e != nil {
 					return nil, e
@@ -3822,6 +3857,60 @@ evalLoop:
 					}()
 					hcResult, hcErr = eval(valForm, env)
 				}()
+				// If eval returned a Go error, convert it to a Lisp condition
+				// and walk clauses to find a matching handler.
+				if hcErr != nil && !hcHandled {
+					cond := makeSimpleCondition("simple-error", hcErr.Error())
+					checkBreakOnSignals(cond)
+					cl3 := v.cdr.cdr
+					cl3Seen := make(map[*Value]bool)
+					for !isNil(cl3) && cl3.typ == VPair {
+						if cl3Seen[cl3] {
+							break
+						}
+						cl3Seen[cl3] = true
+						clause := cl3.car
+						if clause == nil || clause.typ != VPair {
+							cl3 = cl3.cdr
+							continue
+						}
+						if clause.car == nil || clause.car.typ != VSym {
+							cl3 = cl3.cdr
+							continue
+						}
+						clauseTypeSym := clause.car.str
+						if clauseTypeSym == ":NO-ERROR" {
+							cl3 = cl3.cdr
+							continue
+						}
+						if classMatchesCondition(clauseTypeSym, cond) {
+							hcHandled = true
+							hcErr = nil
+							body := clause.cdr
+							varName := ""
+							if isPair(body) && isPair(body.car) && body.car.car != nil && body.car.car.typ == VSym {
+								varName = body.car.car.str
+							} else if isPair(body) && body.car != nil && body.car.typ == VSym {
+								varName = body.car.str
+							}
+							newEnv := NewEnv(env)
+							if varName != "" {
+								newEnv.Set(varName, cond)
+							}
+							body = body.cdr
+							hcResult = vnil()
+							for !isNil(body) {
+								hcResult, hcErr = eval(body.car, newEnv)
+								if hcErr != nil {
+									break
+								}
+								body = body.cdr
+							}
+							break
+						}
+						cl3 = cl3.cdr
+					}
+				}
 				if hcErr != nil {
 					return nil, hcErr
 				}
