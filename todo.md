@@ -495,3 +495,12 @@
 
 249. `(setf (find-class ...))` 未实现（ANSI CL CLOS 要求 `(setf (find-class symbol) class)` 能注册或替换 classRegistry 中的类定义，`(setf (find-class 'alias) (find-class 'base))` 应使 `find-class` 返回指定的类）— 已修复（添加 `builtinFindClassSetf` Go 函数，注册为 `find-class-setf` builtin，接受 newClass 和 symbol 参数并写入 classRegistry）
 
+## 新修复的 Bug（本次会话）
+
+250. `nsubstitute-if-not` 非破坏性实现（委托给 `substitute-if-not`，未就地修改序列）— 已修复（添加 `builtinNsubstituteIfNot` Go 函数，实现 VStr/VArray/VPair 的就地修改逻辑，谓词取反；VArray 修改 arr.elements，VStr 更新 seq.str，VPair 直接修改 cons.car；支持 :from-end/:count/:start/:end/:key 关键字参数；替换注册表中的简版实现）
+
+251. `format ~@?` 递归处理变体缺失（`~@?` 应从格式参数弹出控制字符串，剩余参数用于递归格式化，如 `(format nil "~@? ~A" "~A ~A" 1 2 3)` 应返回 `"1 2 3"`）— 已修复（`formatDispatch` 的 `?` 分支增加 `at` 修饰符处理：`~@?` 仅弹出控制字符串，使用 fs.args/fs.argIdx 作为子格式化上下文；`~?` 原有行为不变，仍弹出控制字符串和参数列表）
+
+252. `class-of` 返回符号而非类对象（ANSI CL 要求 `class-of` 返回类元对象（VClass），但 microlisp 返回符号名如 `PERSON`）— 已修复（`builtinClassOf` 对 VInstance 直接返回 instClass（VClass 对象）；对内置类型尝试在 classRegistry 中查找类型名对应的 VClass；未找到时回退到类型符号）
+
+253. `(setf class-name)` 标准函数缺失（ANSI CL CLOS 要求 `(setf (class-name class) new-name)` 能重命名类，`class-name` 返回类名符号但无法修改）— 已修复（添加 `builtinClassNameSetf` Go 函数，从 classRegistry 删除旧名称、更新 cls.str 为 new-name、重新注册到 classRegistry；注册为 `class-name-setf` builtin）

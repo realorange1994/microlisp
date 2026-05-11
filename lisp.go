@@ -6951,6 +6951,7 @@ var builtins = []builtinDef{
 	{"slot-makunbound", builtinSlotMakunbound},
 	{"class-of", builtinClassOf},
 	{"class-name", builtinClassName},
+	{"class-name-setf", builtinClassNameSetf},
 	{"find-class", builtinFindClass},
 	{"find-class-setf", builtinFindClassSetf},
 	{"is-a?", builtinIsA},
@@ -7004,7 +7005,7 @@ var builtins = []builtinDef{
 	{"delete-duplicates", builtinDeleteDuplicates},
 	{"nsubstitute", builtinNsubstitute},
 	{"nsubstitute-if", builtinNsubstituteIf},
-	{"nsubstitute-if-not", builtinSeqSubstituteIfNot}, // simplified: non-destructive
+	{"nsubstitute-if-not", builtinNsubstituteIfNot},
 	{"position-if", builtinSeqPositionIf},
 	{"position-if-not", builtinSeqPositionIfNot},
 	{"member-if-not", builtinMemberIfNot},
@@ -14186,6 +14187,27 @@ func builtinClassName(args []*Value) (*Value, error) {
 	return nil, fmt.Errorf("class-name: need a class or symbol")
 }
 
+// builtinClassNameSetf - (setf (class-name class) new-name)
+func builtinClassNameSetf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("(setf class-name): need class and new-name")
+	}
+	// setf convention: args[0] = new-value, args[1] = place-argument
+	newName := args[0]
+	cls := args[1]
+	if cls.typ != VClass {
+		return nil, fmt.Errorf("(setf class-name): second argument must be a class")
+	}
+	if newName.typ != VSym {
+		return nil, fmt.Errorf("(setf class-name): new name must be a symbol")
+	}
+	// Remove from old name, add under new name
+	delete(classRegistry, cls.str)
+	cls.str = newName.str
+	classRegistry[cls.str] = cls
+	return cls, nil
+}
+
 func builtinFindClass(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("find-class: need a symbol")
@@ -14221,11 +14243,18 @@ func builtinClassOf(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("class-of: need argument")
 	}
-	if args[0].typ == VInstance && args[0].instClass != nil {
-		return vsym(args[0].instClass.str), nil
+	v := args[0]
+	// For instances, return the class object directly
+	if v.typ == VInstance && v.instClass != nil {
+		return v.instClass, nil
 	}
-	// For non-instances, return a type symbol
-	return vsym(typeStr(args[0])), nil
+	// For built-in types, look up the class in classRegistry by type name
+	typeName := strings.ToUpper(typeStr(v))
+	if cls, ok := classRegistry[typeName]; ok {
+		return cls, nil
+	}
+	// If no class registered for this type, return the built-in-class symbol as fallback
+	return vsym(typeName), nil
 }
 
 func builtinIsA(args []*Value) (*Value, error) {
@@ -18655,6 +18684,202 @@ func builtinNsubstituteIf(args []*Value) (*Value, error) {
 				}
 				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
 				if perr == nil && isTruthy(predVal) {
+					cur.car = newVal
+					replaced++
+				}
+			}
+			i++
+			cur = cur.cdr
+		}
+	}
+	return seq, nil
+}
+
+// builtinNsubstituteIfNot - destructive version of substitute-if-not
+func builtinNsubstituteIfNot(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("nsubstitute-if-not: need new, predicate, and sequence")
+	}
+	newVal := args[0]
+	pred := args[1]
+	seq := args[2]
+	keyFn, _, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
+	if err != nil {
+		return nil, err
+	}
+
+	// Handle VStr: strings are immutable in Go, so create a new one
+	if seq.typ == VStr {
+		runes := []rune(seq.str)
+		if end < 0 || end > len(runes) {
+			end = len(runes)
+		}
+		if start < 0 {
+			start = 0
+		}
+		replaced := 0
+		if fromEnd {
+			for i := end - 1; i >= start; i-- {
+				if count >= 0 && replaced >= count {
+					break
+				}
+				v := vchar(runes[i])
+				if !isNil(keyFn) {
+					v2, err2 := callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+					if err2 != nil {
+						return nil, err2
+					}
+					v = v2
+				}
+				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
+				if perr == nil && !isTruthy(predVal) {
+					if newVal.typ == VChar {
+						runes[i] = newVal.ch
+					} else if newVal.typ == VStr && len(newVal.str) == 1 {
+						runes[i] = rune(newVal.str[0])
+					}
+					replaced++
+				}
+			}
+		} else {
+			for i := start; i < end; i++ {
+				if count >= 0 && replaced >= count {
+					break
+				}
+				v := vchar(runes[i])
+				if !isNil(keyFn) {
+					v2, err2 := callFnOnSeq(keyFn, []*Value{vchar(runes[i])}, globalEnv)
+					if err2 != nil {
+						return nil, err2
+					}
+					v = v2
+				}
+				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
+				if perr == nil && !isTruthy(predVal) {
+					if newVal.typ == VChar {
+						runes[i] = newVal.ch
+					} else if newVal.typ == VStr && len(newVal.str) == 1 {
+						runes[i] = rune(newVal.str[0])
+					}
+					replaced++
+				}
+			}
+		}
+		seq.str = string(runes)
+		return seq, nil
+	}
+
+	// Handle VArray: modify elements in-place
+	if seq.typ == VArray {
+		elems := seq.array.elements
+		seqLen := len(elems)
+		if end < 0 || end > seqLen {
+			end = seqLen
+		}
+		if start < 0 {
+			start = 0
+		}
+		replaced := 0
+		if fromEnd {
+			for i := end - 1; i >= start; i-- {
+				if count >= 0 && replaced >= count {
+					break
+				}
+				v := elems[i]
+				if !isNil(keyFn) {
+					v2, err2 := callFnOnSeq(keyFn, []*Value{elems[i]}, globalEnv)
+					if err2 != nil {
+						return nil, err2
+					}
+					v = v2
+				}
+				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
+				if perr == nil && !isTruthy(predVal) {
+					elems[i] = newVal
+					replaced++
+				}
+			}
+		} else {
+			for i := start; i < end; i++ {
+				if count >= 0 && replaced >= count {
+					break
+				}
+				v := elems[i]
+				if !isNil(keyFn) {
+					v2, err2 := callFnOnSeq(keyFn, []*Value{elems[i]}, globalEnv)
+					if err2 != nil {
+						return nil, err2
+					}
+					v = v2
+				}
+				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
+				if perr == nil && !isTruthy(predVal) {
+					elems[i] = newVal
+					replaced++
+				}
+			}
+		}
+		return seq, nil
+	}
+
+	// Handle lists: modify cons cells in-place
+	if end < 0 {
+		seen := make(map[*Value]bool)
+		length := 0
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			if seen[cur] {
+				break
+			}
+			seen[cur] = true
+			length++
+			cur = cur.cdr
+		}
+		end = length
+	}
+	if start < 0 {
+		start = 0
+	}
+	replaced := 0
+	if fromEnd {
+		var elements []*Value
+		var cellPtrs []*Value
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			elements = append(elements, cur.car)
+			cellPtrs = append(cellPtrs, cur)
+			cur = cur.cdr
+		}
+		for i := end - 1; i >= start; i-- {
+			if count >= 0 && replaced >= count {
+				break
+			}
+			v := elements[i]
+			if !isNil(keyFn) {
+				var err2 error
+				v, err2 = callFnOnSeq(keyFn, []*Value{elements[i]}, globalEnv)
+				if err2 != nil {
+					return nil, err2
+				}
+			}
+			predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
+			if perr == nil && !isTruthy(predVal) {
+				cellPtrs[i].car = newVal
+				replaced++
+			}
+		}
+	} else {
+		i := 0
+		for cur := seq; !isNil(cur) && cur.typ == VPair; {
+			if i >= start && i < end && (count < 0 || replaced < count) {
+				v := cur.car
+				if !isNil(keyFn) {
+					var err2 error
+					v, err2 = callFnOnSeq(keyFn, []*Value{cur.car}, globalEnv)
+					if err2 != nil {
+						return nil, err2
+					}
+				}
+				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
+				if perr == nil && !isTruthy(predVal) {
 					cur.car = newVal
 					replaced++
 				}
@@ -24280,12 +24505,24 @@ func formatDispatch(fs *fmtState) {
 			fs.argIdx += n
 		}
 	case '?':
-		newCtrl := fs.popArg()
-		newArgs := fs.popArg()
-		if newCtrl.typ == VStr {
-			subFs := &fmtState{ctrl: newCtrl.str, args: seqToList(newArgs)}
-			formatRun(subFs)
-			fs.buf.WriteString(subFs.buf.String())
+		if at {
+			// ~@?: pop control string from args, use remaining args for recursive format
+			newCtrl := fs.popArg()
+			if newCtrl.typ == VStr {
+				subFs := &fmtState{ctrl: newCtrl.str, args: fs.args, argIdx: fs.argIdx}
+				formatRun(subFs)
+				fs.buf.WriteString(subFs.buf.String())
+				fs.argIdx = subFs.argIdx
+			}
+		} else {
+			// ~?: pop control string and argument list
+			newCtrl := fs.popArg()
+			newArgs := fs.popArg()
+			if newCtrl.typ == VStr {
+				subFs := &fmtState{ctrl: newCtrl.str, args: seqToList(newArgs)}
+				formatRun(subFs)
+				fs.buf.WriteString(subFs.buf.String())
+			}
 		}
 	case '(':
 		// ~( ... ~) - case conversion
