@@ -6681,6 +6681,7 @@ var builtins = []builtinDef{
 	{"print", builtinPrint},
 	{"prin1", builtinPrin1},
 	{"princ", builtinPrincl},
+	{"write", builtinWrite},
 	{"terpri", builtinTerpri},
 	{"fresh-line", builtinFreshLine},
 	{"write-to-string", builtinWriteToString},
@@ -7072,6 +7073,12 @@ var builtins = []builtinDef{
 	{"string-equal", builtinStrEqualCI},
 	{"string<", builtinStrLess},
 	{"isqrt", builtinIsqrt},
+	{"decode-float", builtinDecodeFloat},
+	{"integer-decode-float", builtinIntegerDecodeFloat},
+	{"scale-float", builtinScaleFloat},
+	{"float-radix", builtinFloatRadix},
+	{"float-digits", builtinFloatDigits},
+	{"float-precision", builtinFloatPrecision},
 	{"format", builtinFormat},
 	{"make-thread", builtinMakeThread},
 	{"join-thread", builtinJoinThread},
@@ -22385,6 +22392,78 @@ func builtinIsqrt(args []*Value) (*Value, error) {
 	return vnum(float64(r)), nil
 }
 
+// -------- ANSI CL floating-point introspection --------
+
+func builtinDecodeFloat(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("decode-float: need a float")
+	}
+	f := toNum(args[0])
+	if f == 0 {
+		return multiVal(vfloat(0), vnum(0), vnum(1)), nil
+	}
+	sign := 1.0
+	if f < 0 {
+		sign = -1.0
+		f = -f
+	}
+	mantissa, exp := math.Frexp(f)
+	return multiVal(vfloat(mantissa*sign), vnum(float64(exp)), vnum(1.0)), nil
+}
+
+func builtinIntegerDecodeFloat(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("integer-decode-float: need a float")
+	}
+	f := toNum(args[0])
+	if f == 0 {
+		return multiVal(vnum(0), vnum(0), vnum(1)), nil
+	}
+	sign := float64(1)
+	if f < 0 {
+		sign = -1
+		f = -f
+	}
+	mantissa, exp := math.Frexp(f)
+	intSig := int64(mantissa * (1 << 53))
+	intExp := exp - 53
+	return multiVal(vnum(float64(intSig)), vnum(float64(intExp)), vnum(sign)), nil
+}
+
+func builtinScaleFloat(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("scale-float: need float and integer")
+	}
+	f := toNum(args[0])
+	n := toNum(args[1])
+	return vfloat(f * math.Pow(2, n)), nil
+}
+
+func builtinFloatRadix(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("float-radix: need a float")
+	}
+	return vnum(2), nil
+}
+
+func builtinFloatDigits(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("float-digits: need a float")
+	}
+	return vnum(53), nil
+}
+
+func builtinFloatPrecision(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("float-precision: need a float")
+	}
+	f := toNum(args[0])
+	if f == 0 {
+		return vnum(0), nil
+	}
+	return vnum(53), nil
+}
+
 // -------- Advanced format --------
 
 type fmtState struct {
@@ -23025,12 +23104,39 @@ func formatDispatch(fs *fmtState) {
 		fs.buf.WriteString("~")
 	case 'T':
 		colnum := fs.getParam(params, 0, 1)
+		colinc := fs.getParam(params, 1, 1)
 		current := fs.buf.Len()
-		if colnum <= current {
-			colnum = current + 1
-		}
-		for i := current; i < colnum; i++ {
-			fs.buf.WriteByte(' ')
+		if at {
+			// ~@T: output colnum spaces, then enough to reach next multiple of colinc
+			for i := 0; i < int(colnum); i++ {
+				fs.buf.WriteByte(' ')
+			}
+			current = fs.buf.Len()
+			if int(colinc) > 0 {
+				rem := current % int(colinc)
+				if rem != 0 {
+					for i := 0; i < int(colinc)-rem; i++ {
+						fs.buf.WriteByte(' ')
+					}
+				}
+			}
+		} else {
+			// ~T: advance to column colnum, or if already past, advance by colinc
+			if current < int(colnum) {
+				for i := current; i < int(colnum); i++ {
+					fs.buf.WriteByte(' ')
+				}
+			} else if int(colinc) > 0 {
+				target := current
+				if target%int(colinc) != 0 {
+					target = ((target / int(colinc)) + 1) * int(colinc)
+				} else {
+					target = current + int(colinc)
+				}
+				for i := current; i < target; i++ {
+					fs.buf.WriteByte(' ')
+				}
+			}
 		}
 	case '*':
 		n := fs.getParam(params, 0, 1)
@@ -23419,8 +23525,20 @@ func formatDispatch(fs *fmtState) {
 			}
 		}
 	case 'W':
-		// Write format: use toString for canonical output
-		fs.buf.WriteString(toString(fs.popArg()))
+		// ~W: write format - use writeToString for canonical output with escape
+		// ~:W uses princ output (no escape), ~@W uses print (with newline), ~:@W uses princ + newline
+		arg := fs.popArg()
+		if colon && at {
+			fs.buf.WriteString(princToString(arg))
+			fs.buf.WriteByte('\n')
+		} else if colon {
+			fs.buf.WriteString(princToString(arg))
+		} else if at {
+			fs.buf.WriteString(writeToString(arg))
+			fs.buf.WriteByte('\n')
+		} else {
+			fs.buf.WriteString(writeToString(arg))
+		}
 	case '_':
 		// Conditional newline: output a newline (simplified)
 		fs.buf.WriteByte('\n')
@@ -23429,6 +23547,37 @@ func formatDispatch(fs *fmtState) {
 		n := fs.getParam(params, 0, 0)
 		for i := 0; i < n; i++ {
 			fs.buf.WriteByte(' ')
+		}
+	case '/':
+		// ~/function-name/ — call a user-defined function to format
+		var fnName strings.Builder
+		for !fs.done() {
+			c := fs.next()
+			if c == '/' {
+				break
+			}
+			fnName.WriteByte(c)
+		}
+		name := fnName.String()
+		fnVal, fnErr := globalEnv.Get(strings.ToUpper(name))
+		if fnErr != nil || fnVal == nil || (fnVal.typ != VPrim && fnVal.typ != VFunc && fnVal.typ != VGeneric) {
+			fs.buf.WriteString("?")
+		} else {
+			arg := fs.popArg()
+			colVal := vbool(colon)
+			atVal := vbool(at)
+			callArgs := []*Value{arg, colVal, atVal}
+			for _, p := range params {
+				if f64, ok := p.(float64); ok {
+					callArgs = append(callArgs, vnum(f64))
+				} else {
+					callArgs = append(callArgs, vnum(0))
+				}
+			}
+			result, _ := callFnOnSeq(fnVal, callArgs, nil)
+			if result != nil {
+				fs.buf.WriteString(princToString(result))
+			}
 		}
 	}
 }

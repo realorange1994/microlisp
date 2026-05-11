@@ -394,3 +394,15 @@
 205. ANSI CL 位运算函数缺失（`lognand`、`lognor`、`logandc1`、`logandc2`、`logorc1`、`logorc2`）— 已修复（添加 `logAndInts` 辅助函数支持 int64/big.Int 双路径，实现 6 个函数：lognand=NOT(AND), lognor=NOT(IOR), logandc1=AND(NOT a, b), logandc2=AND(a, NOT b), logorc1=IOR(NOT a, b), logorc2=IOR(a, NOT b)）
 
 206. `array-element-type` 总是返回 `T`（ANSI CL 要求返回实际元素类型，如 `(array-element-type (make-array 5 :element-type 'character))` 应返回 `CHARACTER`，`(array-element-type "hello")` 应返回 `CHARACTER`）— 已修复（`LispArray` 添加 `elemType` 字段，`make-array` 解析 `:element-type` 关键字参数，`array-element-type` 对字符串返回 `CHARACTER`，`upgraded-array-element-type` 支持 CHARACTER/BIT/SINGLE-FLOAT/T 类型映射）
+
+## 新修复的 Bug（本次会话 — 第十轮）
+
+207. 缺少 ANSI CL 浮点内省函数（`decode-float`、`integer-decode-float`、`scale-float`、`float-radix`、`float-digits`、`float-precision`）— 已修复（添加 6 个 Go 函数实现，注册到 builtin table；decode-float 返回 multiVal(significand, exponent, sign)，integer-decode-float 返回 multiVal(integer-sig, int-exp, sign)，scale-float 使用 math.Pow(2, n)，float-radix 返回 2，float-digits/float-precision 返回 53）
+
+208. 缺少 ANSI CL `write` 函数（ANSI CL 标准输出函数，支持 `:stream`、`:escape` 等关键字参数）— 已修复（添加 builtinWrite Go 函数到 streams.go，注册到 builtin table；支持 :stream 和 :escape 关键字参数，escape=t 时使用 writeToString，escape=nil 时使用 princToString）
+
+209. `format ~T` 不支持 `colinc` 参数且语义错误（ANSI CL `~colnum,colincT` 应先跳到 colnum 列，若已过则跳到下一个 colinc 倍数列；`~@T` 先输出 colnum 空格再跳到 colinc 倍数列）— 已修复（重写 ~T 分支，支持 colnum/colinc 双参数、@ 修饰符，正确处理已过列和进位逻辑）
+
+210. `format ~W` 使用 `toString` 而非 `writeToString`（`~W` 应等同于 `write` 输出，带转义；`~:W` 应等同于 `princ`；`~@W` 应添加换行）— 已修复（改用 writeToString 输出，支持 :/@ 修饰符：~:W 使用 princToString，~@W 添加换行，~:@W 使用 princ + 换行）
+
+211. 缺少 `format ~/` 调用函数指令（ANSI CL `~/name/` 应调用用户定义函数格式化参数）— 已修复（添加 ~/ 分支，读取函数名，从 globalEnv 查找函数，构造 (arg colon-p at-p params...) 参数列表，使用 callFnOnSeq 直接调用避免重复求值，支持 VPrim/VFunc/VGeneric）

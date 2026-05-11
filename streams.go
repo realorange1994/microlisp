@@ -864,6 +864,45 @@ func builtinPrin1(args []*Value) (*Value, error) {
 	return primaryValue(args[0]), nil
 }
 
+// builtinWrite: ANSI CL write function with keyword args
+// (write object &key stream escape radix base circle pretty level length case array gensym readably)
+func builtinWrite(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("write: need an object")
+	}
+	obj := primaryValue(args[0])
+	stream := stdoutStream
+
+	// Parse keyword arguments
+	escape := true // default for write: *print-escape* which defaults to t
+	for i := 1; i < len(args)-1; i += 2 {
+		kw := args[i]
+		if kw.typ == VSym {
+			switch strings.ToUpper(kw.str) {
+			case "STREAM":
+				if args[i+1].typ == VStream {
+					stream = args[i+1]
+				}
+			case "ESCAPE":
+				escape = !isNil(args[i+1])
+			}
+		}
+	}
+
+	var output string
+	if escape {
+		output = writeToString(obj)
+	} else {
+		output = princToString(obj)
+	}
+	if err := stream.stream.writeString(output); err != nil {
+		return nil, err
+	}
+	stream.stream.flush()
+	// CL: write returns the object
+	return obj, nil
+}
+
 func builtinFinishOutput(args []*Value) (*Value, error) {
 	stream := stdoutStream
 	if len(args) > 0 {
