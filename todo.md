@@ -418,3 +418,13 @@
 215. `fill` 对向量输入返回列表而非就地修改向量（ANSI CL `fill` 应原地修改序列并返回，对向量应修改 arr.elements）— 已修复（添加 VArray 分支，直接修改 seq.array.elements 并返回 seq）
 
 216. `lispToReflect` 不处理 VRat/VBigInt/VComplex/VChar 类型导致 FFI 调用 panic（`ffi "math/floor"` 对有理数参数报 "reflect: Call using string as type float64"，因为 default 分支使用 `v.str`）— 已修复（添加 VRat 分支转 float64、VBigInt 分支使用 big.Float、VComplex 返回实部、VChar 转字符串，default 分支改用 `toString(v)`）
+
+## 新修复的 Bug（本次会话 — 第十一轮）
+
+217. 缺少 ANSI CL 浮点截断函数 `ffloor`/`fceiling`/`ftruncate`/`fround`（与 `floor`/`ceiling`/`truncate`/`round` 相同但第一个返回值为浮点数而非整数）— 已修复（添加 builtinFfloor/builtinFceiling/builtinFtruncate/builtinFround，使用 vfloat 创建返回值）
+
+218. 缺少 ANSI CL 条件系统函数 `restart-name`（返回重启对象的名称符号）— 已修复（添加 builtinRestartName，接受符号参数返回名称符号）
+
+219. 缺少 ANSI CL CLOS 内省函数 `compute-applicable-methods`/`method-qualifiers`/`generic-function-p`（`compute-applicable-methods` 返回适用于给定参数的方法列表按特化性排序；`method-qualifiers` 返回方法限定符列表；`generic-function-p` 判断对象是否为泛函）— 已修复（添加 builtinComputeApplicableMethods 使用 methodApplicable/methodSpecificity 排序、builtinMethodQualifiers 返回限定符列表、builtinGenericFunctionP 判断 VGeneric 类型）
+
+220. 缺少 ANSI CL 类型函数 `upgraded-complex-part-type`（返回复数部分的升级元素类型）— 已修复（添加 builtinUpgradedComplexPartType，float 类型升级为 SINGLE-FLOAT，integer/rational 升级为 RATIONAL，real/number 升级为 REAL）

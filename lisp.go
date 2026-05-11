@@ -6825,6 +6825,7 @@ var builtins = []builtinDef{
 	{"array-rank", builtinArrayRank},
 	{"array-element-type", builtinArrayElementType},
 	{"upgraded-array-element-type", builtinUpgradedArrayElementType},
+	{"upgraded-complex-part-type", builtinUpgradedComplexPartType},
 	{"fill-pointer", builtinFillPointer},
 	{"fill-pointer-setf", builtinFillPointerSetf},
 	{"set-fill-pointer", builtinSetFillPointer},
@@ -6895,6 +6896,9 @@ var builtins = []builtinDef{
 	{"instance?", builtinInstanceP},
 	{"find-method", builtinFindMethod},
 	{"remove-method", builtinRemoveMethod},
+	{"compute-applicable-methods", builtinComputeApplicableMethods},
+	{"method-qualifiers", builtinMethodQualifiers},
+	{"generic-function-p", builtinGenericFunctionP},
 	{"set-method-combination", builtinSetMethodCombination},
 	{"make-hash-table", builtinMakeHashTable},
 	{"hash-table-p", builtinHashTableP},
@@ -7109,6 +7113,7 @@ var builtins = []builtinDef{
 	{"use-value", builtinUseValue},
 	{"compute-restarts", builtinComputeRestarts},
 	{"find-restart", builtinFindRestart},
+	{"restart-name", builtinRestartName},
 	{"make-condvar", builtinMakeCondVar},
 	{"thread?", builtinThreadP},
 	{"lock?", builtinLockP},
@@ -7157,6 +7162,10 @@ var builtins = []builtinDef{
 	{"ceiling", builtinCeiling},
 	{"truncate", builtinTruncate},
 	{"round", builtinRound},
+	{"ffloor", builtinFfloor},
+	{"fceiling", builtinFceiling},
+	{"ftruncate", builtinFtruncate},
+	{"fround", builtinFround},
 	{"signum", builtinSignum},
 	{"gcd", builtinGCD},
 	{"lcm", builtinLCM},
@@ -12244,6 +12253,28 @@ func builtinUpgradedArrayElementType(args []*Value) (*Value, error) {
 	}
 }
 
+// builtinUpgradedComplexPartType implements CL: UPGRADED-COMPLEX-PART-TYPE
+// (upgraded-complex-part-type typespec)
+// Returns the element type of the parts of a complex number created with the given typespec.
+// In our implementation, float types upgrade to SINGLE-FLOAT; others remain as-is.
+func builtinUpgradedComplexPartType(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("upgraded-complex-part-type: need a type specifier")
+	}
+	typeArg := args[0]
+	typeName := strings.ToUpper(toString(typeArg))
+	switch typeName {
+	case "SINGLE-FLOAT", "DOUBLE-FLOAT", "SHORT-FLOAT", "LONG-FLOAT", "FLOAT":
+		return vsym("SINGLE-FLOAT"), nil
+	case "RATIONAL", "RATIO", "INTEGER", "FIXNUM", "BIGNUM":
+		return vsym("RATIONAL"), nil
+	case "REAL", "NUMBER":
+		return vsym("REAL"), nil
+	default:
+		return vsym(typeName), nil
+	}
+}
+
 func builtinAdjustArray(args []*Value) (*Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("adjust-array: need array and new dimensions")
@@ -14414,6 +14445,78 @@ func builtinRemoveMethod(args []*Value) (*Value, error) {
 		}
 	}
 	return nil, fmt.Errorf("remove-method: method not found in generic function")
+}
+
+// builtinComputeApplicableMethods implements CL: COMPUTE-APPLICABLE-METHODS
+// (compute-applicable-methods generic-function arguments-list)
+// Returns a list of applicable methods in order of decreasing precedence.
+func builtinComputeApplicableMethods(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("compute-applicable-methods: need generic-function and arguments-list")
+	}
+	gf := primaryValue(args[0])
+	if gf.typ != VGeneric {
+		return nil, fmt.Errorf("compute-applicable-methods: first argument must be a generic function")
+	}
+	argList := args[1]
+	evArgs := toSlice(argList)
+	// Filter applicable methods
+	var applicable []genMethod
+	for _, m := range gf.genMethods {
+		if methodApplicable(m, evArgs) {
+			applicable = append(applicable, m)
+		}
+	}
+	// Sort by specificity (lower score = more specific = comes first)
+	sort.SliceStable(applicable, func(i, j int) bool {
+		return methodSpecificity(applicable[i], evArgs) < methodSpecificity(applicable[j], evArgs)
+	})
+	// Convert to VMethod list
+	result := vnil()
+	for i := len(applicable) - 1; i >= 0; i-- {
+		m := &applicable[i]
+		mv := gcv()
+		mv.typ = VMethod
+		mv.str = m.qualifier
+		mv.methodGF = gf
+		mv.methodIdx = -1
+		result = cons(mv, result)
+	}
+	return result, nil
+}
+
+// builtinMethodQualifiers implements CL: METHOD-QUALIFIERS
+// (method-qualifiers method)
+// Returns a list of qualifiers for the method.
+func builtinMethodQualifiers(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("method-qualifiers: need a method")
+	}
+	m := primaryValue(args[0])
+	if m.typ != VMethod {
+		return nil, fmt.Errorf("method-qualifiers: argument must be a method")
+	}
+	if m.methodGF != nil && m.methodIdx >= 0 && m.methodIdx < len(m.methodGF.genMethods) {
+		qual := m.methodGF.genMethods[m.methodIdx].qualifier
+		if qual == "" {
+			return vnil(), nil
+		}
+		return cons(vsym(qual), vnil()), nil
+	}
+	// Fallback: use the stored qualifier string
+	if m.str == "" {
+		return vnil(), nil
+	}
+	return cons(vsym(m.str), vnil()), nil
+}
+
+// generic-function-p is a type predicate
+func builtinGenericFunctionP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("generic-function-p: need an object")
+	}
+	v := primaryValue(args[0])
+	return vbool(v.typ == VGeneric), nil
 }
 
 func builtinSetMethodCombination(args []*Value) (*Value, error) {
@@ -20473,6 +20576,104 @@ func builtinRound(args []*Value) (*Value, error) {
 		return multiVal(vnum(q), vnum(rem)), nil
 	}
 	return multiVal(vnum(r), vnum(n-r)), nil
+}
+
+// -------- ffloor, fceiling, ftruncate, fround --------
+// Same as floor/ceiling/truncate/round but the first return value is a float.
+
+func builtinFfloor(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("ffloor: need a number")
+	}
+	n := toNum(args[0])
+	f := math.Floor(n)
+	if len(args) >= 2 {
+		div := toNum(args[1])
+		if div == 0 {
+			return nil, fmt.Errorf("ffloor: division by zero")
+		}
+		q := math.Floor(n / div)
+		r := n - q*div
+		if r != 0 && (r > 0) != (div > 0) {
+			r += div
+		}
+		return multiVal(vfloat(q), vnum(r)), nil
+	}
+	return multiVal(vfloat(f), vnum(n-f)), nil
+}
+
+func builtinFceiling(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("fceiling: need a number")
+	}
+	n := toNum(args[0])
+	c := math.Ceil(n)
+	if len(args) >= 2 {
+		div := toNum(args[1])
+		if div == 0 {
+			return nil, fmt.Errorf("fceiling: division by zero")
+		}
+		q := math.Ceil(n / div)
+		r := n - q*div
+		return multiVal(vfloat(q), vnum(r)), nil
+	}
+	return multiVal(vfloat(c), vnum(n-c)), nil
+}
+
+func builtinFtruncate(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("ftruncate: need a number")
+	}
+	n := toNum(args[0])
+	t := math.Trunc(n)
+	if len(args) >= 2 {
+		div := toNum(args[1])
+		if div == 0 {
+			return nil, fmt.Errorf("ftruncate: division by zero")
+		}
+		q := math.Trunc(n / div)
+		r := n - q*div
+		return multiVal(vfloat(q), vnum(r)), nil
+	}
+	return multiVal(vfloat(t), vnum(n-t)), nil
+}
+
+func builtinFround(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("fround: need a number")
+	}
+	n := toNum(args[0])
+	r := math.Round(n)
+	// Round half to even
+	if diff := math.Abs(n - r); diff == 0.5 {
+		if math.Mod(r, 2) != 0 {
+			if n > 0 {
+				r--
+			} else {
+				r++
+			}
+		}
+	}
+	if len(args) >= 2 {
+		div := toNum(args[1])
+		if div == 0 {
+			return nil, fmt.Errorf("fround: division by zero")
+		}
+		q := math.Round(n / div)
+		// Round half to even
+		if diff := math.Abs(n/div - q); diff == 0.5 {
+			if math.Mod(q, 2) != 0 {
+				if n/div > 0 {
+					q--
+				} else {
+					q++
+				}
+			}
+		}
+		rem := n - q*div
+		return multiVal(vfloat(q), vnum(rem)), nil
+	}
+	return multiVal(vfloat(r), vnum(n-r)), nil
 }
 
 // -------- signum --------

@@ -555,6 +555,17 @@ func builtinComputeRestarts(args []*Value) (*Value, error) {
 	return result, nil
 }
 
+func builtinRestartName(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("restart-name: need a restart")
+	}
+	v := primaryValue(args[0])
+	if v == nil || v.typ != VSym {
+		return nil, fmt.Errorf("restart-name: argument must be a restart identifier (symbol)")
+	}
+	return vsym(v.str), nil
+}
+
 func builtinFindRestart(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("find-restart: need restart name")
