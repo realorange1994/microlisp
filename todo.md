@@ -406,3 +406,15 @@
 210. `format ~W` 使用 `toString` 而非 `writeToString`（`~W` 应等同于 `write` 输出，带转义；`~:W` 应等同于 `princ`；`~@W` 应添加换行）— 已修复（改用 writeToString 输出，支持 :/@ 修饰符：~:W 使用 princToString，~@W 添加换行，~:@W 使用 princ + 换行）
 
 211. 缺少 `format ~/` 调用函数指令（ANSI CL `~/name/` 应调用用户定义函数格式化参数）— 已修复（添加 ~/ 分支，读取函数名，从 globalEnv 查找函数，构造 (arg colon-p at-p params...) 参数列表，使用 callFnOnSeq 直接调用避免重复求值，支持 VPrim/VFunc/VGeneric）
+
+## 新修复的 Bug（本次会话 — Bug 猎杀）
+
+212. `butlast` 对点状列表错误保留尾部（`(butlast '(1 2 3 . 4) 1)` 返回 `(1 2 . 4)` 而非 `(1 2)`，点尾属于被移除的最后一个 cons 单元，n > 0 时不应保留）— 已修复（移除 n > 0 路径中保留 dottedTail 的逻辑，始终返回正规列表）
+
+213. `remove-duplicates`/`delete-duplicates` 对向量输入返回列表而非向量（ANSI CL 要求返回与输入相同类型的序列）— 已修复（`builtinSeqRemoveDuplicates` 添加 VArray/VStr 分支，VArray 返回带正确 dims 的新数组，VStr 返回新字符串）
+
+214. `get-properties` 返回值顺序错误且返回列表而非多值（返回 `(value indicator tail)` 而非 ANSI CL 要求的 `(values indicator value tail)`）— 已修复（改用 `multiVal(key, val, cur)` 返回三个值，顺序为 indicator/value/tail）
+
+215. `fill` 对向量输入返回列表而非就地修改向量（ANSI CL `fill` 应原地修改序列并返回，对向量应修改 arr.elements）— 已修复（添加 VArray 分支，直接修改 seq.array.elements 并返回 seq）
+
+216. `lispToReflect` 不处理 VRat/VBigInt/VComplex/VChar 类型导致 FFI 调用 panic（`ffi "math/floor"` 对有理数参数报 "reflect: Call using string as type float64"，因为 default 分支使用 `v.str`）— 已修复（添加 VRat 分支转 float64、VBigInt 分支使用 big.Float、VComplex 返回实部、VChar 转字符串，default 分支改用 `toString(v)`）

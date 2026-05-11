@@ -17188,45 +17188,23 @@ func builtinButlast(args []*Value) (*Value, error) {
 		}
 		return result, nil
 	}
-	// n > 0: walk list counting elements, preserving dotted tail
+	// n > 0: walk list counting elements
+	// When n > 0, the dotted tail is part of the last cons cells being removed,
+	// so we should NOT preserve it in the result.
 	cur := list
 	var elems []*Value
-	var cdrs []*Value
 	for cur.typ == VPair {
 		elems = append(elems, cur.car)
-		cdrs = append(cdrs, cur.cdr)
 		cur = cur.cdr
 	}
 	if n >= len(elems) {
 		return vnil(), nil
 	}
 	keep := len(elems) - n
-	// Find the original non-pair tail of the dotted list
-	dottedTail := vnil()
-	if len(cdrs) > 0 {
-		lastCdr := cdrs[len(cdrs)-1]
-		if lastCdr.typ != VPair {
-			dottedTail = lastCdr
-		}
-	}
-	if keep == 0 {
-		if dottedTail.typ == VPair {
-			return dottedTail, nil
-		}
-		return vnil(), nil
-	}
-	// Rebuild with first 'keep' elements
+	// Rebuild with first 'keep' elements as a proper list
 	result := vnil()
 	for i := keep - 1; i >= 0; i-- {
 		result = cons(elems[i], result)
-	}
-	// Set the final cdr (dotted tail or nil)
-	if !isNil(dottedTail) {
-		last := result
-		for last.cdr.typ == VPair {
-			last = last.cdr
-		}
-		last.cdr = dottedTail
 	}
 	return result, nil
 }
@@ -18164,6 +18142,24 @@ func builtinSeqRemoveDuplicates(args []*Value) (*Value, error) {
 			result = append(result, el)
 		}
 	}
+	// Return same type as input
+	if seq.typ == VArray && seq.array != nil {
+		arr := &LispArray{
+			dims:     []int{len(result)},
+			elements: result,
+			fillPtr:  -1, // no fill-pointer for result
+		}
+		return &Value{typ: VArray, array: arr}, nil
+	}
+	if seq.typ == VStr {
+		var b strings.Builder
+		for _, el := range result {
+			if el != nil && el.typ == VChar {
+				b.WriteRune(el.ch)
+			}
+		}
+		return vstr(b.String()), nil
+	}
 	return listFromSlice(result), nil
 }
 
@@ -18589,6 +18585,24 @@ func builtinSeqFill(args []*Value) (*Value, error) {
 		}
 		result := s[:start] + strings.Repeat(c, end-start) + s[end:]
 		return vstr(result), nil
+	}
+	// For vectors, modify in place
+	if seq.typ == VArray && seq.array != nil {
+		elements := seq.array.elements
+		n := len(elements)
+		if seq.array.fillPtr >= 0 && seq.array.fillPtr < n {
+			n = seq.array.fillPtr
+		}
+		if end < 0 || end > n {
+			end = n
+		}
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < end; i++ {
+			elements[i] = item
+		}
+		return seq, nil
 	}
 	elements := seqToList(seq)
 	if end < 0 || end > len(elements) {
@@ -19217,7 +19231,8 @@ func builtinGetProperties(args []*Value) (*Value, error) {
 			val := cur.cdr.car
 			for _, ind := range indicators {
 				if eqVal(key, ind) {
-					return list(val, key, cur), nil
+					// ANSI CL: returns (values indicator value tail)
+					return multiVal(key, val, cur), nil
 				}
 			}
 			cur = cur.cdr.cdr
@@ -19225,7 +19240,7 @@ func builtinGetProperties(args []*Value) (*Value, error) {
 			break
 		}
 	}
-	return list(vnil(), vnil(), vnil()), nil
+	return multiVal(vnil(), vnil(), vnil()), nil
 }
 
 // -------- remf --------
@@ -23872,12 +23887,36 @@ func lispToReflect(v *Value, t reflect.Type) reflect.Value {
 		default:
 			return reflect.ValueOf(v.num)
 		}
+	case VRat:
+		f := float64(v.irat) / float64(v.iden)
+		switch t.Kind() {
+		case reflect.Float64:
+			return reflect.ValueOf(f)
+		case reflect.Float32:
+			return reflect.ValueOf(float32(f))
+		case reflect.Int:
+			return reflect.ValueOf(int(f))
+		case reflect.Int64:
+			return reflect.ValueOf(int64(f))
+		default:
+			return reflect.ValueOf(f)
+		}
+	case VBigInt:
+		if v.bigInt != nil {
+			f, _ := new(big.Float).SetInt(v.bigInt).Float64()
+			return reflect.ValueOf(f)
+		}
+		return reflect.ValueOf(0.0)
+	case VComplex:
+		return reflect.ValueOf(v.num)
+	case VChar:
+		return reflect.ValueOf(string(v.ch))
 	case VStr:
 		return reflect.ValueOf(v.str)
 	case VBool:
 		return reflect.ValueOf(v == globalEnv.bindings["#t"])
 	default:
-		return reflect.ValueOf(v.str)
+		return reflect.ValueOf(toString(v))
 	}
 }
 
