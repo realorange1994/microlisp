@@ -100,6 +100,9 @@ type LispPathname struct {
 	version   string // "newest", "", or version number
 }
 
+// Logical pathname translation table: host -> list of (from-pattern to-pattern)
+var logicalPathnameTranslations = map[string]*Value{}
+
 // LispArray represents a multi-dimensional array
 type LispArray struct {
 	dims       []int    // dimensions
@@ -7184,6 +7187,9 @@ var builtins = []builtinDef{
 	{"sinh", builtinSinh},
 	{"cosh", builtinCosh},
 	{"tanh", builtinTanh},
+	{"asinh", builtinAsinh},
+	{"acosh", builtinAcosh},
+	{"atanh", builtinAtanh},
 	{"evenp", builtinEvenp},
 	{"oddp", builtinOddp},
 	{"plusp", builtinPlusp},
@@ -7283,12 +7289,19 @@ var builtins = []builtinDef{
 	{"wild-pathname-p", builtinWildPathnameP},
 	{"pathname-match-p", builtinPathnameMatchP},
 	{"logical-pathname", builtinLogicalPathname},
+	{"translate-pathname", builtinTranslatePathname},
+	{"translate-logical-pathname", builtinTranslateLogicalPathname},
+	{"logical-pathname-translations", builtinLogicalPathnameTranslations},
+	{"logical-pathname-translations-setf", builtinLogicalPathnameTranslationsSetf},
 	{"directory", builtinDirectory},
 	{"file-length", builtinFileLength},
 	{"file-position", builtinFilePosition},
 	{"truename", builtinTruename},
 	{"character", builtinCharacter},
 	{"constantp", builtinConstantp},
+	{"variable-information", builtinVariableInformation},
+	{"function-information", builtinFunctionInformation},
+	{"declaration-information", builtinDeclarationInformation},
 }
 
 // -------- Pathname helpers --------
@@ -7367,6 +7380,59 @@ func builtinParseNamestring(args []*Value) (*Value, error) {
 
 func parsePathnameString(s string) *LispPathname {
 	p := &LispPathname{version: "newest"}
+	// Handle logical pathname (e.g., "SYS:FOO;BAR.LISP")
+	// A logical host has multiple alphabetic characters before a colon,
+	// unlike a Windows drive letter which is a single character.
+	if colonIdx := strings.Index(s, ":"); colonIdx > 1 {
+		// Multi-char host: treat as logical pathname
+		p.host = strings.ToUpper(s[:colonIdx])
+		s = s[colonIdx+1:]
+		// Logical pathnames use semicolons as directory separators
+		if len(s) > 0 && s[0] == ';' {
+			p.directory = list(vsym(":absolute"))
+			s = s[1:]
+		} else {
+			p.directory = list(vsym(":relative"))
+		}
+		// Split on semicolons (logical pathname directory separator)
+		parts := []string{}
+		start := 0
+		for i := 0; i < len(s); i++ {
+			if s[i] == ';' {
+				if i > start {
+					parts = append(parts, s[start:i])
+				}
+				start = i + 1
+			}
+		}
+		// Last part may contain name.type
+		last := s[start:]
+		if len(parts) > 0 || len(last) > 0 {
+			// Check if last part has a dot (extension separator)
+			dotIdx := -1
+			for j := len(last) - 1; j >= 0; j-- {
+				if last[j] == '.' {
+					dotIdx = j
+					break
+				}
+			}
+			if dotIdx > 0 {
+				p.name = strings.ToUpper(last[:dotIdx])
+				p.ftype = strings.ToUpper(last[dotIdx+1:])
+			} else if dotIdx == 0 {
+				p.ftype = strings.ToUpper(last[1:])
+			} else {
+				p.name = strings.ToUpper(last)
+			}
+		}
+		// Build directory list
+		dirList := p.directory
+		for _, part := range parts {
+			dirList = appendToList(dirList, vsym(strings.ToUpper(part)))
+		}
+		p.directory = dirList
+		return p
+	}
 	// Handle Windows paths (e.g., C:/)
 	if len(s) >= 2 && s[1] == ':' {
 		p.device = s[:2]
@@ -8021,6 +8087,129 @@ func builtinLogicalPathname(args []*Value) (*Value, error) {
 	}
 	// Treat as physical and return as-is for now
 	return vpathname(parsePathnameString(pathStr)), nil
+}
+
+func builtinTranslatePathname(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("translate-pathname: need source from-wildcard to-wildcard")
+	}
+	source := getPathname(args[0])
+	fromP := getPathname(args[1])
+	toP := getPathname(args[2])
+	if source == nil || fromP == nil || toP == nil {
+		return nil, fmt.Errorf("translate-pathname: all arguments must be pathnames")
+	}
+	// Translate each component: substitute from-wildcard matches into to-wildcard template
+	result := &LispPathname{version: "newest"}
+	result.host = translateComponent(source.host, fromP.host, toP.host)
+	result.device = translateComponent(source.device, fromP.device, toP.device)
+	result.name = translateComponent(source.name, fromP.name, toP.name)
+	result.ftype = translateComponent(source.ftype, fromP.ftype, toP.ftype)
+	// For directory, just copy from source if from matches
+	result.directory = source.directory
+	return vpathname(result), nil
+}
+
+func translateComponent(source, from, to string) string {
+	if from == "*" || from == "" {
+		if to == "*" {
+			return source
+		}
+		return to
+	}
+	if source == from {
+		return to
+	}
+	// Simple wildcard matching: if from is "*", replace with source in to
+	if strings.Contains(from, "*") && to != "" {
+		// Replace first wildcard in 'to' with the matched portion of source
+		parts := strings.SplitN(from, "*", 2)
+		if strings.HasPrefix(source, parts[0]) {
+			matched := strings.TrimPrefix(source, parts[0])
+			if len(parts) > 1 && parts[1] != "" {
+				matched = strings.TrimSuffix(matched, parts[1])
+			}
+			return strings.Replace(to, "*", matched, 1)
+		}
+	}
+	if to == "" {
+		return source
+	}
+	return to
+}
+
+func builtinTranslateLogicalPathname(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("translate-logical-pathname: need a pathname")
+	}
+	p := getPathname(args[0])
+	if p == nil {
+		return nil, fmt.Errorf("translate-logical-pathname: need a pathname")
+	}
+	// If the pathname has a logical host, look up translations
+	if p.host != "" {
+		translations := logicalPathnameTranslations[strings.ToUpper(p.host)]
+		if translations != nil && !isNil(translations) {
+			// Apply each translation rule
+			cur := translations
+			for !isNil(cur) && cur.typ == VPair {
+				rule := cur.car
+				if rule.typ == VPair && !isNil(rule) {
+					fromP := getPathname(rule.car)
+					toP := getPathname(rule.cdr.car)
+					if fromP != nil && toP != nil {
+						// Check if source matches from pattern
+						if pathnameMatchesPattern(p, fromP) {
+							return builtinTranslatePathname([]*Value{vpathname(p), vpathname(fromP), vpathname(toP)})
+						}
+					}
+				}
+				cur = cur.cdr
+			}
+		}
+	}
+	// Not a logical pathname or no translation found; return as-is
+	return vpathname(p), nil
+}
+
+func pathnameMatchesPattern(source, pattern *LispPathname) bool {
+	if pattern.host != "" && pattern.host != "*" && pattern.host != source.host {
+		return false
+	}
+	if pattern.name != "" && pattern.name != "*" && pattern.name != source.name {
+		return false
+	}
+	if pattern.ftype != "" && pattern.ftype != "*" && pattern.ftype != source.ftype {
+		return false
+	}
+	return true
+}
+
+func builtinLogicalPathnameTranslations(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("logical-pathname-translations: need a host")
+	}
+	host := strings.ToUpper(toString(args[0]))
+	if len(args) >= 2 {
+		// SETF form: set the translations
+		logicalPathnameTranslations[host] = args[1]
+		return args[1], nil
+	}
+	// Get the translations
+	t, ok := logicalPathnameTranslations[host]
+	if !ok {
+		return vnil(), nil
+	}
+	return t, nil
+}
+
+func builtinLogicalPathnameTranslationsSetf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("logical-pathname-translations-setf: need new-value and host")
+	}
+	host := strings.ToUpper(toString(args[1]))
+	logicalPathnameTranslations[host] = args[0]
+	return args[0], nil
 }
 
 func toNum(v *Value) float64 {
@@ -20999,6 +21188,58 @@ func builtinTanh(args []*Value) (*Value, error) {
 	return vnum(float64(math.Tanh(n))), nil
 }
 
+// -------- asinh / acosh / atanh (ANSI CL inverse hyperbolic) --------
+func builtinAsinh(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("asinh: need a number")
+	}
+	n := toNum(args[0])
+	// asinh(x) = log(x + sqrt(x*x + 1))
+	return vnum(math.Log(n + math.Sqrt(n*n+1))), nil
+}
+
+func builtinAcosh(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("acosh: need a number")
+	}
+	n := toNum(args[0])
+	if n < 1 {
+		// acosh undefined for x < 1, return complex result
+		// acosh(x) = log(x + sqrt(x-1)*sqrt(x+1)) but for x<1 we compute:
+		// acosh(x) = i*acos(x)  => complex result
+		ac := math.Acos(n)
+		return vcomplex(0, ac), nil
+	}
+	// acosh(x) = log(x + sqrt(x-1)*sqrt(x+1))
+	return vnum(math.Log(n + math.Sqrt(n-1)*math.Sqrt(n+1))), nil
+}
+
+func builtinAtanh(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("atanh: need a number")
+	}
+	n := toNum(args[0])
+	if n <= -1 || n >= 1 {
+		// atanh undefined for |x| >= 1, return complex result
+		// atanh(x) = 0.5*log((1+x)/(1-x)) => complex when |x|>=1
+		// For x=1: pi/2, for x=-1: -pi/2, both imaginary part infinity
+		// We compute the principal value using log of complex numbers
+		// atanh(x) = 0.5 * (log(1+x) - log(1-x))
+		// When x>1: log(1+x) real, log(1-x) = log(-(x-1)) = log(x-1) + i*pi
+		// => atanh(x) = 0.5*(log(1+x) - log(x-1)) - i*pi/2
+		if n == 1 || n == -1 {
+			return nil, fmt.Errorf("atanh: argument %v is out of domain", args[0])
+		}
+		if n > 1 {
+			return vcomplex(0.5*(math.Log(1+n)-math.Log(n-1)), -math.Pi/2), nil
+		}
+		// n < -1
+		return vcomplex(0.5*(math.Log(1-n)-math.Log(-1-n)), math.Pi/2), nil
+	}
+	// atanh(x) = 0.5*log((1+x)/(1-x)) for |x| < 1
+	return vnum(0.5 * math.Log((1+n)/(1-n))), nil
+}
+
 // -------- evenp / oddp --------
 func builtinEvenp(args []*Value) (*Value, error) {
 	if len(args) < 1 {
@@ -22364,6 +22605,9 @@ func builtinCoerce(args []*Value) (*Value, error) {
 		}
 		return listFromSlice(seqToList(obj)), nil
 	case "float", ":float", "single-float", "double-float":
+		if obj.typ != VNum && obj.typ != VRat && obj.typ != VBigInt && obj.typ != VComplex {
+			return nil, fmt.Errorf("coerce: %v cannot be coerced to type %s", toString(obj), typeStr)
+		}
 		return vfloat(toNum(obj)), nil
 	case "rational", "ratio", ":rational", ":ratio":
 		if obj.typ == VRat {
@@ -22460,6 +22704,9 @@ func builtinCoerce(args []*Value) (*Value, error) {
 		}
 		return nil, fmt.Errorf("coerce: cannot coerce to function")
 	case "integer", ":integer":
+		if obj.typ != VNum && obj.typ != VRat && obj.typ != VBigInt {
+			return nil, fmt.Errorf("coerce: %v cannot be coerced to type INTEGER", toString(obj))
+		}
 		n := toNum(obj)
 		return vnum(math.Floor(n)), nil
 	case "sequence", ":sequence":
@@ -22528,6 +22775,37 @@ func builtinCoerce(args []*Value) (*Value, error) {
 		v.typ = VArray
 		v.array = arr
 		return v, nil
+	case "simple-array":
+		// (coerce obj '(simple-array type (dim))) or (coerce obj 'simple-array)
+		if obj.typ == VArray {
+			return obj, nil
+		}
+		var elems []*Value
+		if obj.typ == VStr {
+			elems = stringToCharList(obj.str)
+		} else {
+			elems = seqToList(obj)
+		}
+		arr := &LispArray{dims: []int{len(elems)}, elements: elems, fillPtr: -1, adjustable: false}
+		v := gcv()
+		v.typ = VArray
+		v.array = arr
+		return v, nil
+	case "real":
+		if obj.typ == VComplex {
+			return nil, fmt.Errorf("coerce: cannot coerce complex to type REAL")
+		}
+		return obj, nil
+	case "number":
+		return obj, nil
+	case "symbol":
+		if obj.typ == VSym {
+			return obj, nil
+		}
+		if obj.typ == VStr {
+			return vsym(obj.str), nil
+		}
+		return nil, fmt.Errorf("coerce: cannot coerce to symbol")
 	default:
 		return nil, fmt.Errorf("coerce: unsupported result-type %s", typeStr)
 	}
@@ -22594,6 +22872,111 @@ func isConstant(v *Value) bool {
 		}
 	}
 	return false
+}
+
+// -------- ANSI CL Environment Inquiry Functions --------
+
+// variable-information returns information about a variable binding.
+// Returns (values binding-type local-p decls), where binding-type is
+// :SPECIAL, :LEXICAL, :SYMBOL-MACRO, :CONSTANT, or NIL.
+func builtinVariableInformation(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("variable-information: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("variable-information: need a symbol")
+	}
+	name := sym.str
+	// Check if it's a constant (like T, NIL, PI, etc.)
+	constants := map[string]bool{
+		"T": true, "NIL": true, "PI": true,
+		"MOST-POSITIVE-FIXNUM": true, "MOST-NEGATIVE-FIXNUM": true,
+		"CHAR-CODE-LIMIT": true,
+	}
+	if constants[name] {
+		return multiVal(vsym(":CONSTANT"), vbool(false), vnil()), nil
+	}
+	// Check if it's a special variable (*var* pattern)
+	if strings.HasPrefix(name, "*") && strings.HasSuffix(name, "*") && len(name) > 1 {
+		return multiVal(vsym(":SPECIAL"), vbool(false), vnil()), nil
+	}
+	// Check global environment
+	_, err := globalEnv.Get(name)
+	if err != nil {
+		// Not bound at all
+		return multiVal(vnil(), vbool(false), vnil()), nil
+	}
+	// Default: treat as special (global) binding
+	return multiVal(vsym(":SPECIAL"), vbool(false), vnil()), nil
+}
+
+// function-information returns information about a function binding.
+// Returns (values binding-type local-p decls), where binding-type is
+// :FUNCTION, :MACRO, :SPECIAL-FORM, or NIL.
+func builtinFunctionInformation(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("function-information: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("function-information: need a symbol")
+	}
+	name := sym.str
+	// Check if it's a special operator
+	specialOps := map[string]bool{
+		"IF": true, "QUOTE": true, "SETQ": true, "BLOCK": true, "RETURN-FROM": true,
+		"LET": true, "LET*": true, "PROGN": true, "TAGBODY": true, "GO": true,
+		"FLET": true, "LABELS": true, "MACROLET": true, "FUNCTION": true,
+		"MULTIPLE-VALUE-BIND": true, "MULTIPLE-VALUE-PROG1": true,
+		"CATCH": true, "THROW": true, "UNWIND-PROTECT": true,
+		"THE": true, "LOCALLY": true, "EVAL-WHEN": true,
+		"SYMBOL-MACROLET": true, "LOAD-TIME-VALUE": true,
+	}
+	if specialOps[name] {
+		return multiVal(vsym(":SPECIAL-FORM"), vbool(false), vnil()), nil
+	}
+	// Check global environment for function/macro
+	fn, err := globalEnv.Get(name)
+	if err != nil {
+		return multiVal(vnil(), vbool(false), vnil()), nil
+	}
+	if fn.typ == VMacro {
+		return multiVal(vsym(":MACRO"), vbool(false), vnil()), nil
+	}
+	if fn.typ == VPrim || fn.typ == VFunc || fn.typ == VGeneric {
+		return multiVal(vsym(":FUNCTION"), vbool(false), vnil()), nil
+	}
+	return multiVal(vnil(), vbool(false), vnil()), nil
+}
+
+// declaration-information returns information about a declaration.
+// Returns (values info), where info is declaration-specific.
+func builtinDeclarationInformation(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("declaration-information: need a declaration specifier")
+	}
+	spec := args[0]
+	if spec.typ != VSym {
+		return multiVal(vnil(), vbool(false)), nil
+	}
+	name := strings.ToUpper(spec.str)
+	switch name {
+	case "OPTIMIZE":
+		// Return default optimization qualities
+		return multiVal(list(
+			list(vsym("SPEED"), vnum(1)),
+			list(vsym("SAFETY"), vnum(1)),
+			list(vsym("DEBUG"), vnum(1)),
+			list(vsym("SPACE"), vnum(1)),
+			list(vsym("COMPILATION-SPEED"), vnum(1)),
+		), vbool(false)), nil
+	case "DECLARATION":
+		// Return known declaration names
+		return multiVal(list(vsym("OPTIMIZE"), vsym("DECLARATION"), vsym("DYNAMIC-EXTENT"), vsym("TYPE"), vsym("FTYPE"), vsym("NOTINLINE"), vsym("INLINE"), vsym("SPECIAL")), vbool(false)), nil
+	default:
+		return multiVal(vnil(), vbool(false)), nil
+	}
 }
 
 func builtinIsqrt(args []*Value) (*Value, error) {

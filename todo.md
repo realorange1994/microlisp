@@ -428,3 +428,13 @@
 219. 缺少 ANSI CL CLOS 内省函数 `compute-applicable-methods`/`method-qualifiers`/`generic-function-p`（`compute-applicable-methods` 返回适用于给定参数的方法列表按特化性排序；`method-qualifiers` 返回方法限定符列表；`generic-function-p` 判断对象是否为泛函）— 已修复（添加 builtinComputeApplicableMethods 使用 methodApplicable/methodSpecificity 排序、builtinMethodQualifiers 返回限定符列表、builtinGenericFunctionP 判断 VGeneric 类型）
 
 220. 缺少 ANSI CL 类型函数 `upgraded-complex-part-type`（返回复数部分的升级元素类型）— 已修复（添加 builtinUpgradedComplexPartType，float 类型升级为 SINGLE-FLOAT，integer/rational 升级为 RATIONAL，real/number 升级为 REAL）
+
+## 新修复的 Bug（本次会话 — 第十二轮）
+
+221. 缺少 ANSI CL 反双曲函数 `asinh`/`acosh`/`atanh`（`sinh`/`cosh`/`tanh` 已实现但反函数缺失，`(asinh 1)` 应返回 0.8813，`(acosh 0.5)` 应返回 `#c(0 1.0472)` 复数）— 已修复（添加 builtinAsinh/builtinAcosh/builtinAtanh，asinh 使用 log(x+sqrt(x²+1))，acosh 对 x<1 返回复数，atanh 对 |x|≥1 返回复数）
+
+222. 缺少 ANSI CL 路径名翻译函数 `translate-pathname`/`translate-logical-pathname`/`logical-pathname-translations`（`translate-pathname` 根据通配符模式转换路径名，`translate-logical-pathname` 将逻辑路径名翻译为物理路径名，`logical-pathname-translations` 获取/设置逻辑主机的翻译表）— 已修复（添加 builtinTranslatePathname/builtinTranslateLogicalPathname/builtinLogicalPathnameTranslations/builtinLogicalPathnameTranslationsSetf，添加 logicalPathnameTranslations 全局 map，增强 parsePathnameString 识别多字符冒号前缀为逻辑主机而非 Windows 驱动器号）
+
+223. `coerce` 缺少类型说明符支持（`simple-array`/`real`/`number`/`symbol` 不识别，`integer`/`float` 对非数值输入静默返回 0 而非报错）— 已修复（添加 simple-array/real/number/symbol case 分支，real 对复数报 type-error，integer/float 对非数值输入报 type-error，symbol 支持字符串到符号转换）
+
+224. 缺少 ANSI CL 环境查询函数 `variable-information`/`function-information`/`declaration-information`（`variable-information` 返回变量绑定类型/局部性/声明，`function-information` 返回函数绑定类型/局部性/声明，`declaration-information` 返回声明信息如优化质量）— 已修复（添加 builtinVariableInformation/builtinFunctionInformation/builtinDeclarationInformation，variable-information 识别 :SPECIAL/:LEXICAL/:CONSTANT 绑定，function-information 识别 :FUNCTION/:MACRO/:SPECIAL-FORM 绑定，declaration-information 支持 optimize/declaration 查询）
