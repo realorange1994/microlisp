@@ -67,7 +67,7 @@
 22. `make-sequence` 不接受 `:initial-element` 关键字 — 已修复（实现 `builtinMakeSequence`，支持 list/vector/string/bit-vector 类型及 `:initial-element` 关键字）
 23. `subseq` 对字符串返回 nil 而非子字符串
 24. `nreverse` 对列表原地修改但返回错误结果
-25. `defmacro` 的 `&optional`/`&key`/`&aux` 参数默认值未求值（参数名被提取，但无参数时使用 nil 而非默认值）
+25. `defmacro` 的 `&optional`/`&key`/`&aux` 参数默认值未求值（参数名被提取，但无参数时使用 nil 而非默认值）— 已修复（parseMacroParams 返回 optDefaults/keySpecs，expandMacro 绑定可选/关键字参数时评估默认值表达式，defmacro/define-macro/macrolet 均存储 optDefaults 和 keySpecs）— 已修复（parseMacroParams 返回 optDefaults/keySpecs，expandMacro 绑定可选/关键字参数时评估默认值表达式）
 26. `copy-seq` 在向量上调用 Lisp 定义覆盖了 Go 内置函数
 27. `assoc` 找不到时返回 `#f` 而非 `nil`
 28. `loop` 的 `for x on ...` 无限循环
@@ -78,7 +78,7 @@
 33. `subtypep` 返回 list 而非 VMultiVal（导致 `not` 接收整个列表）
 34. 浮点数指数标记（d/D/f/F/s/S/l/L）不被 `parseFloatStr` 支持
 35. `ignore-errors` 出错时返回 `(nil . condition)` 而非 `nil`
-36. `destructuring-bind` 不支持 `&rest`/`&body`/`&optional`/`&key`（`&rest` 被当作普通变量绑定到错误值）
+36. `destructuring-bind` 不支持 `&rest`/`&body`/`&optional`/`&key`（`&rest` 被当作普通变量绑定到错误值）— 已修复（在 &optional 内部循环中添加 lambda-list 关键字检测，遇到 &rest/&key/&aux 时 break；将 &optional 循环后的 return nil 替换为 continue 让外层循环处理 &rest）
 
 37. Go 词法分析器对超出 float64 尾数精度的大整数（>2^53）丢失精度 — 已修复（`compareNumeric` 添加 `toBigIntExact` 和 `toBigRat` 辅助函数，使用 `big.Int.Cmp` 和 `big.Rat.Cmp` 进行精确比较）
 38. setf 对未绑定变量报错而非创建全局绑定（ANSI CL 语义）
@@ -296,3 +296,15 @@
 160. 缺少 ANSI CL 标准函数：`char-int`、`special-operator-p`、`parse-namestring`、`gentemp` — 已修复（添加 Go 实现，special-operator-p 使用硬编码的特殊操作符集合，gentemp 使用 internSymbol 驻留符号）
 
 161. 缺少 ANSI CL 数组函数：`array-dimension`、`array-in-bounds-p`、`array-row-major-index`、`bit`、`sbit` — 已修复（添加 Go 实现，bit/sbit 检查输入为位向量）
+
+## 新修复的 Bug（本次会话）
+
+162. `defmacro` 的 `&optional`/`&key` 参数默认值不生效 — 已修复（重写 parseMacroParams 返回 optDefaults 和 keySpecs，更新 defmacro/define-macro/macrolet 存储这些字段，重写 expandMacro 在参数缺失时评估默认值表达式，支持关键字参数匹配）
+
+163. `destructuring-bind` 中 `&rest` 在 `&optional` 之后不被处理（`&optional` 内部循环吞噬了 `&rest` 关键字）— 已修复（在 &optional 循环中添加 lambda-list 关键字检测，遇到 &rest/&key/&aux/&allow-other-keys 时 break；将循环后的 return nil 替换为 continue 让外层循环处理后续关键字）
+
+164. `float` 函数不设置 isFloat 标志（`(float 1)` 返回 `1` 而非 `1.0`）— 已修复（改用 vfloat 创建返回值）
+
+165. `format ~g` 精度计算错误（使用固定小数位数而非有效位数）— 已修复（根据指数值计算固定格式的小数位数：decPlaces = digits - 1 - exp）
+
+166. `upgraded-array-element-type` 标准函数缺失 — 已修复（添加 builtinUpgradedArrayElementType 内置函数）

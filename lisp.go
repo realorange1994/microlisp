@@ -2854,7 +2854,7 @@ evalLoop:
 				}
 				lambdaList := v.cdr.cdr.car
 				macroBody := v.cdr.cdr.cdr
-				params, rest, whole, envSym, e := parseMacroParams(lambdaList)
+				params, rest, whole, envSym, optDefaults, keySpecs, e := parseMacroParams(lambdaList)
 				if e != nil {
 					return nil, fmt.Errorf("defmacro: %v", e)
 				}
@@ -2866,6 +2866,8 @@ evalLoop:
 				m.whole = whole
 				m.body = macroBody
 				m.env = env
+				m.optDefaults = optDefaults
+				m.keySpecs = keySpecs
 				_ = envSym
 				env.Set(name, m)
 				return vsym(name), nil
@@ -3032,7 +3034,7 @@ evalLoop:
 					return nil, fmt.Errorf("define-macro: name must be a symbol")
 				}
 				name := head.car.str
-				params, rest, whole, envSym, e := parseMacroParams(head.cdr)
+				params, rest, whole, envSym, optDefaults, keySpecs, e := parseMacroParams(head.cdr)
 				if e != nil {
 					return nil, e
 				}
@@ -3044,6 +3046,8 @@ evalLoop:
 				m.whole = whole
 				m.body = v.cdr.cdr
 				m.env = env
+				m.optDefaults = optDefaults
+				m.keySpecs = keySpecs
 				_ = envSym // stored in envSym field via macro env
 				env.Set(name, m)
 				return vsym(name), nil
@@ -4347,7 +4351,7 @@ evalLoop:
 					mname := binding.car.str
 					macroParams := binding.cdr.car
 					macroBody := binding.cdr.cdr
-					params, rest, _, _, e := parseMacroParams(macroParams)
+					params, rest, _, _, optDefaults, keySpecs, e := parseMacroParams(macroParams)
 					if e != nil {
 						return nil, e
 					}
@@ -4357,6 +4361,8 @@ evalLoop:
 					m.rest = rest
 					m.body = macroBody
 					m.env = newEnv
+					m.optDefaults = optDefaults
+					m.keySpecs = keySpecs
 					newEnv.Set(mname, m)
 					bindings = bindings.cdr
 				}
@@ -5865,24 +5871,147 @@ func expandMacro(m *Value, args *Value, env *Env) (*Value, error) {
 		wholeForm := cons(vsym(m.str), args)
 		newEnv.Set(m.whole, wholeForm)
 	}
+
+	// Calculate number of required params (exclude optional and key)
+	numRequired := len(m.params) - len(m.optDefaults) - len(m.keySpecs)
+	if numRequired < 0 {
+		numRequired = 0
+	}
+
+	// Extract keyword args if macro has key specs
+	keyVals := make(map[string]*Value)
+	positionalArgs := argSlice
+	if len(m.keySpecs) > 0 {
+		var nonKeyword []*Value
+		i := 0
+		for i < len(argSlice) {
+			if argSlice[i] != nil && argSlice[i].typ == VSym && len(argSlice[i].str) > 0 && argSlice[i].str[0] == ':' {
+				keyName := argSlice[i].str[1:]
+				if i+1 < len(argSlice) {
+					keyVals[keyName] = argSlice[i+1]
+					i += 2
+				} else {
+					nonKeyword = append(nonKeyword, argSlice[i])
+					i++
+				}
+			} else {
+				nonKeyword = append(nonKeyword, argSlice[i])
+				i++
+			}
+		}
+		positionalArgs = nonKeyword
+	}
+
 	if m.rest != "" {
-		for i, p := range m.params {
-			if i < len(argSlice) {
-				newEnv.Set(p, argSlice[i])
+		// Bind required params
+		for i := 0; i < numRequired && i < len(positionalArgs); i++ {
+			newEnv.Set(m.params[i], positionalArgs[i])
+		}
+		// Bind optional params with defaults
+		for i := 0; i < len(m.optDefaults); i++ {
+			p := m.params[numRequired+i]
+			if numRequired+i < len(positionalArgs) {
+				newEnv.Set(p, positionalArgs[numRequired+i])
+			} else if m.optDefaults[i] != nil {
+				defVal, err := eval(m.optDefaults[i], newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(p, defVal)
 			} else {
 				newEnv.Set(p, vnil())
 			}
 		}
-		newEnv.Set(m.rest, listFromSlice(argSlice[len(m.params):]))
+		// Bind key params
+		paramIdx := numRequired + len(m.optDefaults)
+		for _, spec := range m.keySpecs {
+			if spec == nil || spec.typ != VPair || spec.car == nil || spec.cdr == nil || spec.cdr.typ != VPair || spec.cdr.cdr == nil || spec.cdr.cdr.typ != VPair {
+				paramIdx++
+				continue
+			}
+			keyName := spec.car.str
+			if len(keyName) > 0 && keyName[0] == ':' {
+				keyName = keyName[1:]
+			}
+			paramName := spec.cdr.car.str
+			defaultExpr := spec.cdr.cdr.car
+			if val, ok := keyVals[keyName]; ok {
+				newEnv.Set(paramName, val)
+			} else if defaultExpr != nil && !isNil(defaultExpr) {
+				defVal, err := eval(defaultExpr, newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(paramName, defVal)
+			} else {
+				newEnv.Set(paramName, vnil())
+			}
+			paramIdx++
+		}
+		// Bind rest param
+		var restElems []*Value
+		restIdx := numRequired + len(m.optDefaults)
+		if len(m.keySpecs) > 0 {
+			// rest gets everything after required+optional that isn't keywords
+			if paramIdx < len(positionalArgs) {
+				restElems = positionalArgs[paramIdx:]
+			}
+		} else if restIdx < len(positionalArgs) {
+			restElems = positionalArgs[restIdx:]
+		}
+		newEnv.Set(m.rest, listFromSlice(restElems))
 	} else {
-		for i, p := range m.params {
-			if i < len(argSlice) {
-				newEnv.Set(p, argSlice[i])
+		// No rest param - bind required params
+		for i := 0; i < numRequired; i++ {
+			if i < len(positionalArgs) {
+				newEnv.Set(m.params[i], positionalArgs[i])
+			} else {
+				newEnv.Set(m.params[i], vnil())
+			}
+		}
+		// Bind optional params with defaults
+		for i := 0; i < len(m.optDefaults); i++ {
+			p := m.params[numRequired+i]
+			if numRequired+i < len(positionalArgs) {
+				newEnv.Set(p, positionalArgs[numRequired+i])
+			} else if m.optDefaults[i] != nil {
+				defVal, err := eval(m.optDefaults[i], newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(p, defVal)
 			} else {
 				newEnv.Set(p, vnil())
 			}
+		}
+		// Bind key params
+		paramIdx := numRequired + len(m.optDefaults)
+		for _, spec := range m.keySpecs {
+			if spec == nil || spec.typ != VPair || spec.car == nil || spec.cdr == nil || spec.cdr.typ != VPair || spec.cdr.cdr == nil || spec.cdr.cdr.typ != VPair {
+				paramIdx++
+				continue
+			}
+			keyName := spec.car.str
+			if len(keyName) > 0 && keyName[0] == ':' {
+				keyName = keyName[1:]
+			}
+			paramName := spec.cdr.car.str
+			defaultExpr := spec.cdr.cdr.car
+			if val, ok := keyVals[keyName]; ok {
+				newEnv.Set(paramName, val)
+			} else if defaultExpr != nil && !isNil(defaultExpr) {
+				defVal, err := eval(defaultExpr, newEnv)
+				if err != nil {
+					return nil, err
+				}
+				newEnv.Set(paramName, defVal)
+			} else {
+				newEnv.Set(paramName, vnil())
+			}
+			paramIdx++
 		}
 	}
+
 	body := m.body
 	if isNil(body) {
 		return vnil(), nil
@@ -6178,22 +6307,24 @@ func parseParams(v *Value) ([]string, string, []*Value, []*Value, error) {
 }
 
 
-func parseMacroParams(v *Value) (params []string, rest string, whole string, envSym string, err error) {
+func parseMacroParams(v *Value) (params []string, rest string, whole string, envSym string, optDefaults []*Value, keySpecs []*Value, err error) {
 	// Check for &whole at the beginning
 	if v.typ == VPair && v.car != nil && v.car.typ == VSym && (v.car.str == "&whole" || v.car.str == "&WHOLE") {
-		rest := v.cdr
-		if !isNil(rest) && rest.typ == VPair && rest.car != nil && rest.car.typ == VSym {
-			whole = rest.car.str
-			v = rest.cdr
-		} else if !isNil(rest) && rest.typ == VSym {
-			whole = rest.str
+		restV := v.cdr
+		if !isNil(restV) && restV.typ == VPair && restV.car != nil && restV.car.typ == VSym {
+			whole = restV.car.str
+			v = restV.cdr
+		} else if !isNil(restV) && restV.typ == VSym {
+			whole = restV.str
 			v = vnil()
 		}
 	}
+	inOptional := false
+	inKey := false
 	seen := make(map[*Value]bool)
 	for !isNil(v) {
 		if seen[v] {
-			return nil, "", whole, envSym, fmt.Errorf("bad macro parameter list: circular")
+			return nil, "", whole, envSym, nil, nil, fmt.Errorf("bad macro parameter list: circular")
 		}
 		seen[v] = true
 		if v.car != nil && v.car.typ == VSym {
@@ -6207,7 +6338,7 @@ func parseMacroParams(v *Value) (params []string, rest string, whole string, env
 					rest = restV.str
 					v = vnil()
 				} else {
-					return nil, "", whole, envSym, fmt.Errorf("macro: need name after %s", s)
+					return nil, "", whole, envSym, nil, nil, fmt.Errorf("macro: need name after %s", s)
 				}
 				continue
 			}
@@ -6222,16 +6353,75 @@ func parseMacroParams(v *Value) (params []string, rest string, whole string, env
 				}
 				continue
 			}
-			// Skip &optional, &key, &aux sections - they're handled by the generated function
-			if s == "&optional" || s == "&OPTIONAL" || s == "&key" || s == "&KEY" || s == "&aux" || s == "&AUX" {
+			if s == "&optional" || s == "&OPTIONAL" {
+				inOptional = true
+				inKey = false
+				v = v.cdr
+				continue
+			}
+			if s == "&key" || s == "&KEY" {
+				inOptional = false
+				inKey = true
+				v = v.cdr
+				continue
+			}
+			if s == "&allow-other-keys" || s == "&AUX" || s == "&aux" || s == "&whole" || s == "&WHOLE" {
+				v = v.cdr
+				continue
+			}
+			if inKey {
+				keyword := ":" + s
+				params = append(params, s)
+				keySpecs = append(keySpecs, list3(vsym(keyword), vsym(s), vnil()))
+				v = v.cdr
+				continue
+			}
+			if inOptional {
+				params = append(params, s)
+				optDefaults = append(optDefaults, nil)
 				v = v.cdr
 				continue
 			}
 			params = append(params, s)
 		} else if v.car != nil && v.car.typ == VPair {
-			// Handle (name default) or (name default supplied-p) optional/key params
 			car := v.car.car
 			if car != nil && car.typ == VSym {
+				if inKey {
+					var keyword, paramName string
+					var defaultExpr *Value = vnil()
+					elem := v.car
+					if elem.car.typ == VPair && elem.car.car != nil && elem.car.car.typ == VSym {
+						keyword = ":" + elem.car.car.str
+						if elem.car.cdr != nil && elem.car.cdr.typ == VPair && elem.car.cdr.car != nil && elem.car.cdr.car.typ == VSym {
+							paramName = elem.car.cdr.car.str
+						}
+						if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
+							defaultExpr = elem.cdr.car
+						}
+					} else {
+						keyword = ":" + elem.car.str
+						paramName = elem.car.str
+						if elem.cdr != nil && elem.cdr.typ == VPair && elem.cdr.car != nil {
+							defaultExpr = elem.cdr.car
+						}
+					}
+					if paramName != "" {
+						params = append(params, paramName)
+						keySpecs = append(keySpecs, list3(vsym(keyword), vsym(paramName), defaultExpr))
+					}
+					v = v.cdr
+					continue
+				}
+				if inOptional {
+					params = append(params, car.str)
+					var defaultExpr *Value = vnil()
+					if v.car.cdr != nil && v.car.cdr.typ == VPair && v.car.cdr.car != nil {
+						defaultExpr = v.car.cdr.car
+					}
+					optDefaults = append(optDefaults, defaultExpr)
+					v = v.cdr
+					continue
+				}
 				params = append(params, car.str)
 			} else {
 				break
@@ -6242,12 +6432,12 @@ func parseMacroParams(v *Value) (params []string, rest string, whole string, env
 		v = v.cdr
 	}
 	if !isNil(v) && v.typ == VSym {
-		return params, v.str, whole, envSym, nil
+		return params, v.str, whole, envSym, optDefaults, keySpecs, nil
 	}
 	if !isNil(v) {
-		return nil, "", whole, envSym, fmt.Errorf("bad macro parameter list")
+		return nil, "", whole, envSym, nil, nil, fmt.Errorf("bad macro parameter list")
 	}
-	return params, rest, whole, envSym, nil
+	return params, rest, whole, envSym, optDefaults, keySpecs, nil
 }
 
 func typeStr(v *Value) string {
@@ -6542,6 +6732,7 @@ var builtins = []builtinDef{
 	{"array-total-size", builtinArrayTotalSize},
 	{"array-rank", builtinArrayRank},
 	{"array-element-type", builtinArrayElementType},
+	{"upgraded-array-element-type", builtinUpgradedArrayElementType},
 	{"fill-pointer", builtinFillPointer},
 	{"fill-pointer-setf", builtinFillPointerSetf},
 	{"set-fill-pointer", builtinSetFillPointer},
@@ -9111,6 +9302,13 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 							break
 						}
 						elem := vp.car
+						// Check if we've hit another lambda-list keyword
+						if elem != nil && elem.typ == VSym {
+							elemUpper := strings.ToUpper(elem.str)
+							if elemUpper == "&REST" || elemUpper == "&BODY" || elemUpper == "&KEY" || elemUpper == "&AUX" || elemUpper == "&ALLOW-OTHER-KEYS" || elemUpper == "&ENVIRONMENT" || elemUpper == "&WHOLE" {
+								break // let outer loop handle it
+							}
+						}
 						if elem == nil || elem.typ == VNil {
 							// nil element, skip
 						} else if elem.typ == VSym {
@@ -9164,7 +9362,8 @@ func bindPatternRec(pattern *Value, val *Value, env *Env, seen map[*Value]bool) 
 						}
 						vp = vp.cdr
 					}
-					return nil
+					// Don't return - continue outer loop to handle &rest/&key/&aux
+					continue
 				}
 				// Process &key vars: keyword-based binding
 				// Build a keyword-to-index map from the value list
@@ -11785,6 +11984,11 @@ func builtinVectorPop(args []*Value) (*Value, error) {
 
 func builtinArrayElementType(args []*Value) (*Value, error) {
 	// Simplified: always return T since we don't track element types
+	return vsym("T"), nil
+}
+
+func builtinUpgradedArrayElementType(args []*Value) (*Value, error) {
+	// Simplified: always return T since we don't have specialized array types
 	return vsym("T"), nil
 }
 
@@ -20603,7 +20807,8 @@ func builtinFloat(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("float: need a number")
 	}
-	return vnum(toNum(args[0])), nil
+	n := toNum(args[0])
+	return vfloat(n), nil
 }
 
 func builtinRational(args []*Value) (*Value, error) {
@@ -22346,16 +22551,28 @@ func formatDispatch(fs *fmtState) {
 	case 'G':
 		// General format: scientific for very large/small, fixed otherwise
 		digits := fs.getParam(params, 0, 6)
+		if digits < 1 {
+			digits = 1
+		}
 		arg := fs.popArg()
 		f := toNum(arg)
 		if f == 0 {
 			fs.buf.WriteString("0.0")
 		} else {
 			absF := math.Abs(f)
-			if absF >= 1e16 || (absF < 1e-3 && absF > 0) {
-				fs.buf.WriteString(strconv.FormatFloat(f, 'g', digits, 64))
+			// Calculate exponent for determining format
+			exp := int(math.Floor(math.Log10(absF)))
+			// CL ~g: use fixed-point when -4 <= exp < digits
+			if absF >= 1e16 || (absF < 1e-3 && absF > 0) || exp >= digits || exp < -4 {
+				// Use exponential format
+				fs.buf.WriteString(strconv.FormatFloat(f, 'e', digits-1, 64))
 			} else {
-				fs.buf.WriteString(strconv.FormatFloat(f, 'f', digits, 64))
+				// Use fixed-point format with appropriate decimal places
+				decPlaces := digits - 1 - exp
+				if decPlaces < 0 {
+					decPlaces = 0
+				}
+				fs.buf.WriteString(strconv.FormatFloat(f, 'f', decPlaces, 64))
 			}
 		}
 	case 'W':
