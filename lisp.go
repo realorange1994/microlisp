@@ -6989,6 +6989,8 @@ var builtins = []builtinDef{
 	{"bit-nor", builtinBitNor},
 	{"bit-orc1", builtinBitOrc1},
 	{"bit-orc2", builtinBitOrc2},
+	{"bit-andc1", builtinBitAndc1},
+	{"bit-andc2", builtinBitAndc2},
 	{"seq-map", builtinSeqMap},
 	{"seq-reduce", builtinSeqReduce},
 	{"seq-sort", builtinSeqSort},
@@ -7145,7 +7147,6 @@ var builtins = []builtinDef{
 	{"princ-to-string", builtinPrincToString},
 	{"string-elt", builtinStringElt},
 	{"reverse", builtinReverse},
-	{"replace", builtinReplace},
 	{"assoc", builtinAssoc},
 	{"acons", builtinAcons},
 	{"rassoc", builtinRassoc},
@@ -10226,7 +10227,7 @@ func builtinStrSym(args []*Value) (*Value, error) {
 	if args[0].typ != VStr {
 		return nil, fmt.Errorf("string->symbol: expected string")
 	}
-	return vsym(args[0].str), nil
+	return vsym(strings.ToUpper(args[0].str)), nil
 }
 
 func builtinErr(args []*Value) (*Value, error) {
@@ -15509,6 +15510,14 @@ func bitArrayOp(args []*Value, op string) (*Value, error) {
 			if av != 0 || !(bv != 0) {
 				rv = 1
 			}
+		case "andc1":
+			if !(av != 0) && bv != 0 {
+				rv = 1
+			}
+		case "andc2":
+			if av != 0 && !(bv != 0) {
+				rv = 1
+			}
 		}
 		result[i] = vnum(rv)
 	}
@@ -15530,6 +15539,8 @@ func builtinBitNand(args []*Value) (*Value, error)   { return bitArrayOp(args, "
 func builtinBitNor(args []*Value) (*Value, error)    { return bitArrayOp(args, "nor") }
 func builtinBitOrc1(args []*Value) (*Value, error)   { return bitArrayOp(args, "orc1") }
 func builtinBitOrc2(args []*Value) (*Value, error)   { return bitArrayOp(args, "orc2") }
+func builtinBitAndc1(args []*Value) (*Value, error) { return bitArrayOp(args, "andc1") }
+func builtinBitAndc2(args []*Value) (*Value, error) { return bitArrayOp(args, "andc2") }
 
 func builtinBitNot(args []*Value) (*Value, error) {
 	if len(args) < 1 {
@@ -16258,6 +16269,10 @@ func builtinSeqSubseq(args []*Value) (*Value, error) {
 		}
 		return vstr(string(runes[start:end])), nil
 	}
+	// Handle VArray specially: return a vector, not a list
+	if seq.typ == VArray {
+		return builtinSeqSubseqArray(args)
+	}
 	end := len(seqToList(seq))
 	if len(args) >= 3 && args[2].typ != VNil {
 		end = int(primaryValue(args[2]).num)
@@ -16279,6 +16294,39 @@ func builtinSeqSubseq(args []*Value) (*Value, error) {
 		return vnil(), nil
 	}
 	return listFromSlice(elements[start:end]), nil
+}
+
+// subseq for VArray: return a new vector
+func builtinSeqSubseqArray(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("subseq: need sequence and start")
+	}
+	seq := args[0]
+	if seq.typ != VArray {
+		return nil, fmt.Errorf("subseq: need array for array subseq")
+	}
+	elements := seqToList(seq)
+	start := int(primaryValue(args[1]).num)
+	end := len(elements)
+	if len(args) >= 3 && args[2].typ != VNil {
+		end = int(primaryValue(args[2]).num)
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end < 0 {
+		end = len(elements)
+	}
+	if start > len(elements) {
+		start = len(elements)
+	}
+	if end > len(elements) {
+		end = len(elements)
+	}
+	if start >= end {
+		return vnil(), nil
+	}
+	return varray(elements[start:end]), nil
 }
 
 func builtinSubseqSetf(args []*Value) (*Value, error) {
@@ -16320,21 +16368,49 @@ func builtinSeqConcatenate(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("concatenate: need result-type and sequences")
 	}
-	resultType := args[0]
-	if resultType.typ == VSym && resultType.str == "STRING" {
-		var result string
-		for i := 1; i < len(args); i++ {
-			if args[i].typ == VStr {
-				result += args[i].str
-			}
-		}
-		return vstr(result), nil
+	resultType := primaryValue(args[0])
+	typeName := ""
+	if resultType.typ == VSym {
+		typeName = strings.ToUpper(resultType.str)
 	}
+	// Collect all elements from input sequences
 	var result []*Value
 	for i := 1; i < len(args); i++ {
 		result = append(result, seqToList(args[i])...)
 	}
-	return listFromSlice(result), nil
+	switch typeName {
+	case "STRING":
+		var sb strings.Builder
+		for _, v := range result {
+			if v.typ == VChar {
+				sb.WriteRune(v.ch)
+			} else {
+				sb.WriteString(toString(v))
+			}
+		}
+		return vstr(sb.String()), nil
+	case "VECTOR", "SIMPLE-VECTOR", "ARRAY", "SIMPLE-ARRAY":
+		return varray(result), nil
+	case "LIST", "CONS", "NULL":
+		return listFromSlice(result), nil
+	case "BIT-VECTOR", "SIMPLE-BIT-VECTOR":
+		bits := make([]*Value, len(result))
+		for i, v := range result {
+			if v.typ == VNum {
+				if int(v.num) != 0 {
+					bits[i] = vnum(1)
+				} else {
+					bits[i] = vnum(0)
+				}
+			} else {
+				bits[i] = vnum(0)
+			}
+		}
+		return varray(bits), nil
+	default:
+		// Default: return list
+		return listFromSlice(result), nil
+	}
 }
 
 // checkSequenceArg validates that v is a proper sequence for map functions.
@@ -16476,6 +16552,28 @@ func builtinMapInto(args []*Value) (*Value, error) {
 			sb.WriteString(toString(primaryValue(val)))
 		}
 		return vstr(sb.String()), nil
+	}
+	// Handle VArray: modify elements in place and return the original array
+	if resultSeq.typ == VArray && resultSeq.array != nil {
+		elements := resultSeq.array.elements
+		n := len(elements)
+		if resultSeq.array.fillPtr >= 0 && resultSeq.array.fillPtr < n {
+			n = resultSeq.array.fillPtr
+		}
+		for i := 0; i < maxLen && i < n; i++ {
+			callArgs := make([]*Value, 0, len(lists))
+			for _, l := range lists {
+				if i < len(l) {
+					callArgs = append(callArgs, l[i])
+				}
+			}
+			val, err := callFnOnSeq(fn, callArgs, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+			resultSeq.array.elements[i] = primaryValue(val)
+		}
+		return resultSeq, nil
 	}
 	result = seqToList(resultSeq)
 	if len(result) == 0 && maxLen > 0 {
@@ -18915,12 +19013,12 @@ func builtinSeqReplace(args []*Value) (*Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("replace: need destination and source sequences")
 	}
-	dest := seqToList(args[0])
-	src := seqToList(args[1])
+	dest := args[0]
+	src := args[1]
 	start1 := 0
-	end1 := len(dest)
+	end1 := -1
 	start2 := 0
-	end2 := len(src)
+	end2 := -1
 	for i := 2; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
@@ -18947,14 +19045,61 @@ func builtinSeqReplace(args []*Value) (*Value, error) {
 			}
 		}
 	}
-	result := make([]*Value, len(dest))
-	copy(result, dest)
-	j := start2
-	for i := start1; i < end1 && j < end2; i++ {
-		result[i] = src[j]
-		j++
+	// String destination: must create new string (strings are immutable)
+	if dest.typ == VStr {
+		destRunes := []rune(dest.str)
+		srcRunes := []rune(src.str)
+		if end1 < 0 || end1 > len(destRunes) {
+			end1 = len(destRunes)
+		}
+		if end2 < 0 || end2 > len(srcRunes) {
+			end2 = len(srcRunes)
+		}
+		result := make([]rune, len(destRunes))
+		copy(result, destRunes)
+		j := start2
+		for i := start1; i < end1 && j < end2; i++ {
+			result[i] = srcRunes[j]
+			j++
+		}
+		return vstr(string(result)), nil
 	}
-	return listFromSlice(result), nil
+	// Array/vector destination: modify in place
+	if dest.typ == VArray && dest.array != nil {
+		srcList := seqToList(src)
+		if end1 < 0 || end1 > len(dest.array.elements) {
+			end1 = len(dest.array.elements)
+		}
+		if end2 < 0 || end2 > len(srcList) {
+			end2 = len(srcList)
+		}
+		j := start2
+		for i := start1; i < end1 && j < end2; i++ {
+			dest.array.elements[i] = srcList[j]
+			j++
+		}
+		return dest, nil
+	}
+	// List destination: modify in place
+	destList := seqToList(dest)
+	srcList := seqToList(src)
+	if end1 < 0 || end1 > len(destList) {
+		end1 = len(destList)
+	}
+	if end2 < 0 || end2 > len(srcList) {
+		end2 = len(srcList)
+	}
+	// Modify the original list cons cells in place
+	cur := dest
+	j := start2
+	for i := 0; i < end1 && cur != nil && cur.typ == VPair; i++ {
+		if i >= start1 && j < end2 {
+			cur.car = srcList[j]
+			j++
+		}
+		cur = cur.cdr
+	}
+	return dest, nil
 }
 
 // -------- Additional CL sequence/string functions --------
@@ -18964,15 +19109,29 @@ func builtinSeqSearch(args []*Value) (*Value, error) {
 	}
 	seq1 := args[0]
 	seq2 := args[1]
-	pred := vnil()
+	var testFn, testNotFn, keyFn *Value
+	testFn = nil
+	testNotFn = nil
+	keyFn = nil
 	start1, end1, start2, end2 := 0, -1, 0, -1
+	fromEnd := false
 	for i := 2; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
 			case ":TEST":
 				if i+1 < len(args) {
 					i++
-					pred = args[i]
+					testFn = args[i]
+				}
+			case ":TEST-NOT":
+				if i+1 < len(args) {
+					i++
+					testNotFn = args[i]
+				}
+			case ":KEY":
+				if i+1 < len(args) {
+					i++
+					keyFn = args[i]
 				}
 			case ":START1":
 				if i+1 < len(args) {
@@ -18993,6 +19152,11 @@ func builtinSeqSearch(args []*Value) (*Value, error) {
 				if i+1 < len(args) {
 					i++
 					end2 = int(toNum(args[i]))
+				}
+			case ":FROM-END":
+				if i+1 < len(args) {
+					i++
+					fromEnd = isTruthy(args[i])
 				}
 			}
 		}
@@ -19005,24 +19169,62 @@ func builtinSeqSearch(args []*Value) (*Value, error) {
 	if end2 < 0 || end2 > len(s2) {
 		end2 = len(s2)
 	}
+	// Helper to apply :key function
+	applyKey := func(v *Value) *Value {
+		if keyFn != nil {
+			r, err := callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+			if err != nil {
+				return v
+			}
+			return r
+		}
+		return v
+	}
+	// Helper to compare two elements
+	elemsEqual := func(a, b *Value) bool {
+		ka := applyKey(a)
+		kb := applyKey(b)
+		if testNotFn != nil {
+			cmp, err := callFnOnSeq(testNotFn, []*Value{ka, kb}, globalEnv)
+			if err != nil {
+				return false
+			}
+			return !isTruthy(cmp)
+		}
+		if testFn != nil {
+			cmp, err := callFnOnSeq(testFn, []*Value{ka, kb}, globalEnv)
+			if err != nil {
+				return false
+			}
+			return isTruthy(cmp)
+		}
+		return eqVal(ka, kb)
+	}
 	slen := end1 - start1
 	if slen <= 0 {
+		return vnil(), nil
+	}
+	if fromEnd {
+		for i := end2 - slen; i >= start2; i-- {
+			match := true
+			for j := 0; j < slen; j++ {
+				if !elemsEqual(s1[start1+j], s2[i+j]) {
+					match = false
+					break
+				}
+			}
+			if match {
+				return vnum(float64(i)), nil
+			}
+		}
 		return vnil(), nil
 	}
 	for i := start2; i <= end2-slen; i++ {
 		match := true
 		for j := 0; j < slen; j++ {
-			if pred.typ != VNil {
-				cmp, err := callFnOnSeq(pred, []*Value{s1[start1+j], s2[i+j]}, globalEnv)
-				if err != nil || !isTruthy(cmp) {
-					match = false
-					break
-				}
-			} else {
-				if !eqVal(s1[start1+j], s2[i+j]) {
-					match = false
-					break
-				}
+			if !elemsEqual(s1[start1+j], s2[i+j]) {
+				match = false
+				break
 			}
 		}
 		if match {
@@ -22295,6 +22497,11 @@ func builtinMismatch(args []*Value) (*Value, error) {
 	s1 := seqToList(args[0])
 	s2 := seqToList(args[1])
 	start1, end1, start2, end2 := 0, -1, 0, -1
+	var testFn, testNotFn, keyFn *Value
+	testFn = nil
+	testNotFn = nil
+	keyFn = nil
+	fromEnd := false
 	for i := 2; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
@@ -22318,6 +22525,26 @@ func builtinMismatch(args []*Value) (*Value, error) {
 					i++
 					end2 = int(toNum(args[i]))
 				}
+			case ":TEST":
+				if i+1 < len(args) {
+					i++
+					testFn = args[i]
+				}
+			case ":TEST-NOT":
+				if i+1 < len(args) {
+					i++
+					testNotFn = args[i]
+				}
+			case ":KEY":
+				if i+1 < len(args) {
+					i++
+					keyFn = args[i]
+				}
+			case ":FROM-END":
+				if i+1 < len(args) {
+					i++
+					fromEnd = isTruthy(args[i])
+				}
 			}
 		}
 	}
@@ -22327,14 +22554,62 @@ func builtinMismatch(args []*Value) (*Value, error) {
 	if end2 < 0 || end2 > len(s2) {
 		end2 = len(s2)
 	}
+	// Helper to apply :key function
+	applyKey := func(v *Value) *Value {
+		if keyFn != nil {
+			r, err := callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+			if err != nil {
+				return v
+			}
+			return r
+		}
+		return v
+	}
+	// Helper to compare two elements using :test or :test-not or default eqVal
+	elemsEqual := func(a, b *Value) bool {
+		ka := applyKey(a)
+		kb := applyKey(b)
+		if testNotFn != nil {
+			cmp, err := callFnOnSeq(testNotFn, []*Value{ka, kb}, globalEnv)
+			if err != nil {
+				return false
+			}
+			return !isTruthy(cmp)
+		}
+		if testFn != nil {
+			cmp, err := callFnOnSeq(testFn, []*Value{ka, kb}, globalEnv)
+			if err != nil {
+				return false
+			}
+			return isTruthy(cmp)
+		}
+		return eqVal(ka, kb)
+	}
 	len1 := end1 - start1
 	len2 := end2 - start2
+	if fromEnd {
+		// from-end: find the rightmost mismatch
+		minLen := len1
+		if len2 < minLen {
+			minLen = len2
+		}
+		for i := minLen - 1; i >= 0; i-- {
+			if !elemsEqual(s1[start1+i], s2[start2+i]) {
+				return vnum(float64(i)), nil
+			}
+		}
+		if len1 != len2 {
+			return vnum(float64(minLen)), nil
+		}
+		return vnil(), nil
+	}
+	// Forward direction
 	minLen := len1
 	if len2 < minLen {
 		minLen = len2
 	}
 	for i := 0; i < minLen; i++ {
-		if !eqVal(s1[start1+i], s2[start2+i]) {
+		if !elemsEqual(s1[start1+i], s2[start2+i]) {
 			return vnum(float64(i)), nil
 		}
 	}
@@ -25638,6 +25913,7 @@ var initLib = `
      (constructor-name #f)
      (predicate-name #f)
      (copier-name #f)
+     (conc-prefix #f)
      (print-fn #f)
      (repr-type 'instance)
      (slot-defs '())
@@ -25654,6 +25930,11 @@ var initLib = `
                (set! predicate-name (cadar opts)))
              (if (and (pair? (car opts)) (eq? (caar opts) :copier))
                (set! copier-name (cadar opts)))
+             (if (and (pair? (car opts)) (eq? (caar opts) :conc-name))
+               (if (null? (cdar opts))
+                 (set! conc-prefix "")
+                 (set! conc-prefix (symbol->string (cadar opts))))
+               )
              (if (and (pair? (car opts)) (eq? (caar opts) :print-object))
                (set! print-fn (cadar opts)))
              (if (and (pair? (car opts)) (eq? (caar opts) :type))
@@ -25688,9 +25969,15 @@ var initLib = `
                  (list 'slot-set! 'obj (list 'quote (slot-name slot)) 'val)))))
      (accessor-name
        (lambda (slot)
-         (string->symbol
-           (string-append (symbol->string struct-name) "-"
-                          (symbol->string (slot-name slot))))))
+         (if (string? conc-prefix)
+           (if (eq? conc-prefix "")
+             (slot-name slot)
+             (string->symbol
+               (string-append conc-prefix
+                              (symbol->string (slot-name slot)))))
+           (string->symbol
+             (string-append (symbol->string struct-name) "-"
+                            (symbol->string (slot-name slot)))))))
      (slot-keyword
        (lambda (slot)
          (string->symbol

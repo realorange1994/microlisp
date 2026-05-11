@@ -73,7 +73,7 @@
 (assert-equal '(1 . a) (assoc 1 alist) "assoc: finds 1")
 (assert-equal '(2 . b) (assoc 2 alist) "assoc: finds 2")
 ;; Note: MicroLisp returns #f instead of () for not found
-(assert-false (assoc 4 alist) "assoc: not found returns false")
+(assert-nil (assoc 4 alist) "assoc: not found returns nil")
 
 ;; assoc with :test
 (assert-equal '(1 . a) (assoc 1.0 alist :test '=) "assoc: with :test ==")

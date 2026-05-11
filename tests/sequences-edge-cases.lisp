@@ -43,7 +43,7 @@
 (assert-nil (position 4 '(1 2 3)) "position: not found")
 
 ;; find with :key
-(assert-equal 4 (find 4 '(1 2 3 4 5) :key (lambda (x) (- x 1))) "find: with :key")
+(assert-equal 5 (find 4 '(1 2 3 4 5) :key (lambda (x) (- x 1))) "find: with :key")
 
 (end-suite)
 

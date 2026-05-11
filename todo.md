@@ -438,3 +438,26 @@
 223. `coerce` 缺少类型说明符支持（`simple-array`/`real`/`number`/`symbol` 不识别，`integer`/`float` 对非数值输入静默返回 0 而非报错）— 已修复（添加 simple-array/real/number/symbol case 分支，real 对复数报 type-error，integer/float 对非数值输入报 type-error，symbol 支持字符串到符号转换）
 
 224. 缺少 ANSI CL 环境查询函数 `variable-information`/`function-information`/`declaration-information`（`variable-information` 返回变量绑定类型/局部性/声明，`function-information` 返回函数绑定类型/局部性/声明，`declaration-information` 返回声明信息如优化质量）— 已修复（添加 builtinVariableInformation/builtinFunctionInformation/builtinDeclarationInformation，variable-information 识别 :SPECIAL/:LEXICAL/:CONSTANT 绑定，function-information 识别 :FUNCTION/:MACRO/:SPECIAL-FORM 绑定，declaration-information 支持 optimize/declaration 查询）
+
+## 新修复的 Bug（本次会话）
+
+225. `string->symbol` 不将字符串转为大写（ANSI CL 中 reader 默认大写化符号名，但 `string->symbol` 返回混合大小写符号，导致宏展开中通过 `string->symbol` 创建的符号无法通过 reader 引用找到）— 已修复（`builtinStrSym` 使用 `strings.ToUpper` 大写化字符串后再调用 `vsym`）
+
+226. `defstruct` 不支持 `:conc-name` 选项（ANSI CL 允许自定义访问器前缀，如 `(:conc-name p-)` 生成 `p-x`/`p-y` 而非 `point-x`/`point-y`）— 已修复（添加 `conc-prefix` 变量和 `:conc-name` 解析，支持自定义前缀和 `nil` 表示无前缀）
+
+227. `defstruct` 完全失效（由于 Bug #225 的 `string->symbol` 大小写问题，`defstruct` 生成的函数名无法在环境中注册）— 已修复（同 #225 修复，`defstruct` 的 `accessor-name`/`constructor-name` 现在生成正确的大写符号）
+
+228. `mismatch` 缺少 `:test`/`:test-not`/`:key`/`:from-end` 关键字参数支持（ANSI CL 标准要求这些参数，但原有实现仅使用 `eqVal` 比较）— 已修复（添加完整的 keyword 参数解析，`mismatch` 现在支持 `:test` 自定义比较、`:test-not` 反向比较、`:key` 提取关键字、`:from-end` 从右向左搜索）
+
+229. `replace` 创建新序列而非就地修改目标（ANSI CL `replace` 应原地修改 destination 并返回，但原实现总是创建新列表；此外 `builtinReplace` 重复注册覆盖了 `builtinSeqReplace`）— 已修复（删除重复的 `builtinReplace` 注册，对 VStr 目标创建新字符串（字符串不可变）、对 VArray 目标直接修改 arr.elements、对 VPair 列表直接修改 cons 单元）
+
+230. `search` 缺少 `:test-not`/`:key`/`:from-end` 关键字参数支持 — 已修复（添加完整的 keyword 参数解析，`search` 现在支持 `:test-not` 反向匹配、`:key` 提取关键字、`:from-end` 从右向左搜索，保持 `:test`/`:start1`/`:end1`/`:start2`/`:end2` 的原有支持）
+
+231. `subseq` 对 VArray 向量返回列表而非向量（`(subseq #(1 2 3 4 5) 1 3)` 返回 `(2 3)` 而非 `#(2 3)`）— 已修复（添加 VArray 分支到 `builtinSeqSubseq`，调用 `builtinSeqSubseqArray` 返回 `varray`）
+
+232. `map-into` 对 VArray 向量返回列表而非修改后的向量（`(map-into (make-array 3) #'+ '(1 2 3) '(10 20 30))` 返回列表而非 `#(11 22 33)`）— 已修复（添加 VArray 分支到 `builtinMapInto`，直接修改 `resultSeq.array.elements` 并返回 `resultSeq`）
+
+233. `concatenate` 对 `'vector`/`'simple-vector` 结果类型返回列表而非向量（`(concatenate 'vector '(1 2 3) '(4 5 6))` 返回 `(1 2 3 4 5 6)` 而非 `#(1 2 3 4 5 6)`，且 `'string` 类型不处理非字符串输入如字符列表）— 已修复（重写 `builtinSeqConcatenate`，使用 `strings.ToUpper` 标准化类型名，支持 VECTOR/SIMPLE-VECTOR/ARRAY/SIMPLE-ARRAY/LIST/CONS/NULL/BIT-VECTOR/SIMPLE-BIT-VECTOR 结果类型，STRING 类型正确处理字符列表/向量输入）
+
+234. `bit-andc1`/`bit-andc2` 标准位向量操作缺失（ANSI CL 定义 10 个位向量操作，microlisp 仅实现 8 个，缺少 andc1=(NOT a)AND b 和 andc2=a AND(NOT b)）— 已修复（在 `bitArrayOp` switch 中添加 andc1/andc2 case，添加 `builtinBitAndc1`/`builtinBitAndc2` 函数并注册到 builtin table）
+
