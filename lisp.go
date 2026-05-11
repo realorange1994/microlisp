@@ -6402,6 +6402,7 @@ var builtins = []builtinDef{
 	{"char>=", builtinCharGe},
 	{"code-char", builtinCodeChar},
 	{"char-code", builtinCharCode},
+	{"char-int", builtinCharInt},
 	{"name-char", builtinNameChar},
 	{"char-name", builtinCharName},
 	{"eq?", builtinEqvP},
@@ -6480,6 +6481,7 @@ var builtins = []builtinDef{
 	{"symbol-plist-setf", builtinSymbolPlistSetf},
 	{"boundp", builtinBoundp},
 	{"fboundp", builtinFboundp},
+	{"special-operator-p", builtinSpecialOperatorP},
 	{"functionp", builtinFunctionP},
 	{"make-generic-function", builtinMakeGenericFunction},
 	{"makunbound", builtinMakunbound},
@@ -6489,6 +6491,7 @@ var builtins = []builtinDef{
 	{"error", builtinErr},
 	{"exit", builtinExit},
 	{"gensym", builtinGensym},
+	{"gentemp", builtinGentemp},
 	{"%loop-check", builtinLoopCheck},
 	{"type-of", builtinTypeOf},
 	{"describe", builtinDescribe},
@@ -6530,7 +6533,12 @@ var builtins = []builtinDef{
 	{"elt-setf", builtinEltSetf},
 	{"arrayp", builtinArrayP},
 	{"vectorp", builtinVectorP},
+	{"bit-vector-p", builtinBitVectorP},
+	{"simple-vector-p", builtinSimpleVectorP},
+	{"simple-bit-vector-p", builtinSimpleBitVectorP},
+	{"simple-string-p", builtinSimpleStringP},
 	{"array-dimensions", builtinArrayDimensions},
+	{"array-dimension", builtinArrayDimension},
 	{"array-total-size", builtinArrayTotalSize},
 	{"array-rank", builtinArrayRank},
 	{"array-element-type", builtinArrayElementType},
@@ -6543,6 +6551,8 @@ var builtins = []builtinDef{
 	{"array-has-fill-pointer-p", builtinArrayHasFillPointerP},
 	{"adjustable-array-p", builtinAdjustableArrayP},
 	{"array-displacement", builtinArrayDisplacement},
+	{"array-in-bounds-p", builtinArrayInBoundsP},
+	{"array-row-major-index", builtinArrayRowMajorIndex},
 	{"null", builtinNull},
 	{"apply", builtinApply},
 	{"defined?", builtinDefinedP},
@@ -6604,6 +6614,8 @@ var builtins = []builtinDef{
 	{"set-method-combination", builtinSetMethodCombination},
 	{"make-hash-table", builtinMakeHashTable},
 	{"hash-table-p", builtinHashTableP},
+	{"packagep", builtinPackageP},
+	{"compiled-function-p", builtinCompiledFunctionP},
 	{"gethash", builtinGethash},
 	{"gethash-setf", builtinSetGethash},
 	{"remhash", builtinRemhash},
@@ -6652,6 +6664,8 @@ var builtins = []builtinDef{
 	{"vector-push-extend", builtinVectorPushExtend},
 	// Row-major aref
 	{"row-major-aref", builtinRowMajorAref},
+	{"bit", builtinBitAref},
+	{"sbit", builtinSbitAref},
 	// Random state
 	{"make-random-state", builtinMakeRandomState},
 	{"random-state-p", builtinRandomStateP},
@@ -6924,6 +6938,7 @@ var builtins = []builtinDef{
 	{"pathname-type", builtinPathnameType},
 	{"pathname-version", builtinPathnameVersion},
 	{"namestring", builtinNamestring},
+	{"parse-namestring", builtinParseNamestring},
 	{"file-namestring", builtinFileNamestring},
 	{"directory-namestring", builtinDirectoryNamestring},
 	{"host-namestring", builtinHostNamestring},
@@ -6969,6 +6984,22 @@ func isPackage(v *Value) bool {
 	return v != nil && v.typ == VPackage
 }
 
+func builtinPackageP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	return vbool(isPackage(args[0])), nil
+}
+
+func builtinCompiledFunctionP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	v := args[0]
+	// In microlisp, all built-in and defined functions are "compiled"
+	return vbool(v.typ == VPrim || v.typ == VFunc || v.typ == VGeneric), nil
+}
+
 func vrt(rt *Readtable) *Value {
 	v := gcv()
 	v.typ = VReadtable
@@ -6988,6 +7019,22 @@ func getPathname(v *Value) *LispPathname {
 		return parsePathnameString(v.str)
 	}
 	return nil
+}
+
+func builtinParseNamestring(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("parse-namestring: need a namestring")
+	}
+	v := args[0]
+	if v.typ == VPathname {
+		// Already a pathname
+		return multiVal(v, vnum(0)), nil
+	}
+	if v.typ == VStr {
+		pn := parsePathnameString(v.str)
+		return multiVal(vpathname(pn), vnum(float64(len(v.str)))), nil
+	}
+	return nil, fmt.Errorf("parse-namestring: not a valid namestring")
 }
 
 func parsePathnameString(s string) *LispPathname {
@@ -8772,6 +8819,40 @@ func builtinCharCode(args []*Value) (*Value, error) {
 	return vnum(float64(args[0].ch)), nil
 }
 
+func builtinBitAref(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("bit: need bit-vector and index")
+	}
+	arr := args[0]
+	if arr.typ != VArray {
+		return nil, fmt.Errorf("bit: not a bit-vector")
+	}
+	if !isBitVector(arr.array) {
+		return nil, fmt.Errorf("bit: not a bit-vector")
+	}
+	idx := int(toNum(args[1]))
+	if idx < 0 || idx >= arr.array.dims[0] {
+		return nil, fmt.Errorf("bit: index %d out of range", idx)
+	}
+	return arr.array.elements[idx], nil
+}
+
+func builtinSbitAref(args []*Value) (*Value, error) {
+	// sbit is like bit but for simple bit-vectors (same as bit in microlisp)
+	return builtinBitAref(args)
+}
+
+func builtinCharInt(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("char-int: need a character")
+	}
+	if args[0].typ != VChar {
+		return nil, fmt.Errorf("char-int: expected a character")
+	}
+	// In most implementations, char-int is the same as char-code
+	return vnum(float64(args[0].ch)), nil
+}
+
 // Standard character names
 var charNameMap = map[string]rune{
 	"space":     ' ',
@@ -9629,6 +9710,16 @@ func builtinGensym(args []*Value) (*Value, error) {
 	return vsym(fmt.Sprintf("%s_%d", prefix, gensymCounter)), nil
 }
 
+func builtinGentemp(args []*Value) (*Value, error) {
+	gensymCounter++
+	prefix := "T"
+	if len(args) > 0 {
+		prefix = args[0].str
+	}
+	name := fmt.Sprintf("%s%d", prefix, gensymCounter)
+	return internSymbol(name, currentPackage), nil
+}
+
 func builtinLoopCheck(args []*Value) (*Value, error) {
 	loopIterationCount++
 	if loopIterationCount > maxLoopIterations {
@@ -9803,6 +9894,43 @@ func builtinFboundp(args []*Value) (*Value, error) {
 		return vbool(false), nil
 	}
 	return vbool(val.typ == VPrim || val.typ == VFunc || val.typ == VGeneric || val.typ == VMacro), nil
+}
+
+// specialOperators is the set of CL special operators (not functions).
+var specialOperators = map[string]bool{
+	"QUOTE":       true,
+	"IF":          true,
+	"LAMBDA":      true,
+	"PROGN":       true,
+	"PROGV":       true,
+	"THE":         true,
+	"FLET":        true,
+	"LABELS":      true,
+	"LET":         true,
+	"LET*":        true,
+	"BLOCK":       true,
+	"RETURN-FROM": true,
+	"TAGBODY":     true,
+	"GO":          true,
+	"CATCH":       true,
+	"THROW":       true,
+	"MACROLET":    true,
+	"MACRO-FUNCTION": true,
+	"SETF":        true,
+	"SETQ":        true,
+	"FUNCTION":    true,
+	"MULTIPLE-VALUE-CALL": true,
+}
+
+func builtinSpecialOperatorP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("special-operator-p: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("special-operator-p: not a symbol")
+	}
+	return vbool(specialOperators[sym.str]), nil
 }
 
 func builtinFunctionP(args []*Value) (*Value, error) {
@@ -11468,6 +11596,69 @@ func builtinVectorP(args []*Value) (*Value, error) {
 	return vbool(args[0].typ == VArray && len(args[0].array.dims) == 1), nil
 }
 
+// isBitVector checks if a VArray contains only 0/1 integers.
+func isBitVector(arr *LispArray) bool {
+	if arr == nil {
+		return false
+	}
+	for _, el := range arr.elements {
+		if el == nil || el.typ == VNil {
+			return false
+		}
+		if el.typ != VNum {
+			return false
+		}
+		v := toNum(vnum(el.num))
+		if v != 0 && v != 1 {
+			return false
+		}
+	}
+	return true
+}
+
+func builtinBitVectorP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	v := args[0]
+	return vbool(v.typ == VArray && len(v.array.dims) == 1 && isBitVector(v.array)), nil
+}
+
+func builtinSimpleVectorP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	v := args[0]
+	if v.typ != VArray || v.array == nil {
+		return vbool(false), nil
+	}
+	// A simple vector is one-dimensional with no fill pointer
+	return vbool(len(v.array.dims) == 1 && v.array.fillPtr < 0), nil
+}
+
+func builtinSimpleBitVectorP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	v := args[0]
+	if v.typ != VArray || v.array == nil {
+		return vbool(false), nil
+	}
+	if len(v.array.dims) != 1 || v.array.fillPtr >= 0 {
+		return vbool(false), nil
+	}
+	return vbool(isBitVector(v.array)), nil
+}
+
+func builtinSimpleStringP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	v := args[0]
+	// In CL, all strings are simple strings by default
+	return vbool(v.typ == VStr), nil
+}
+
 func builtinArrayDimensions(args []*Value) (*Value, error) {
 	if len(args) < 1 || args[0].typ != VArray || args[0].array == nil {
 		return nil, fmt.Errorf("array-dimensions: need an array")
@@ -11477,6 +11668,21 @@ func builtinArrayDimensions(args []*Value) (*Value, error) {
 		result = cons(vnum(float64(args[0].array.dims[i])), result)
 	}
 	return result, nil
+}
+
+func builtinArrayDimension(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("array-dimension: need array and axis-number")
+	}
+	v := args[0]
+	if v.typ != VArray {
+		return nil, fmt.Errorf("array-dimension: not an array")
+	}
+	axis := int(toNum(args[1]))
+	if axis < 0 || axis >= len(v.array.dims) {
+		return nil, fmt.Errorf("array-dimension: axis %d out of range", axis)
+	}
+	return vnum(float64(v.array.dims[axis])), nil
 }
 
 func builtinArrayTotalSize(args []*Value) (*Value, error) {
@@ -11641,6 +11847,48 @@ func builtinArrayDisplacement(args []*Value) (*Value, error) {
 	}
 	// microlisp does not support displaced arrays
 	return multiVal(vnil(), vbool(false)), nil
+}
+
+func builtinArrayInBoundsP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("array-in-bounds-p: need an array")
+	}
+	v := args[0]
+	if v.typ != VArray || v.array == nil {
+		return nil, fmt.Errorf("array-in-bounds-p: not an array")
+	}
+	if len(args)-1 != len(v.array.dims) {
+		return vbool(false), nil
+	}
+	for i := 0; i < len(v.array.dims); i++ {
+		idx := int(toNum(args[i+1]))
+		if idx < 0 || idx >= v.array.dims[i] {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinArrayRowMajorIndex(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("array-row-major-index: need an array")
+	}
+	v := args[0]
+	if v.typ != VArray || v.array == nil {
+		return nil, fmt.Errorf("array-row-major-index: not an array")
+	}
+	if len(args)-1 != len(v.array.dims) {
+		return nil, fmt.Errorf("array-row-major-index: wrong number of subscripts")
+	}
+	idx := 0
+	for i := 0; i < len(v.array.dims); i++ {
+		sub := int(toNum(args[i+1]))
+		if sub < 0 || sub >= v.array.dims[i] {
+			return nil, fmt.Errorf("array-row-major-index: subscript %d out of range", i)
+		}
+		idx = idx*v.array.dims[i] + sub
+	}
+	return vnum(float64(idx)), nil
 }
 
 func builtinNull(args []*Value) (*Value, error) {
@@ -12193,13 +12441,6 @@ func builtinKeywordP(args []*Value) (*Value, error) {
 		}
 	}
 	return vbool(false), nil
-}
-
-func builtinPackageP(args []*Value) (*Value, error) {
-	if len(args) < 1 {
-		return vbool(false), nil
-	}
-	return vbool(isPackage(args[0])), nil
 }
 
 func builtinReadtableP(args []*Value) (*Value, error) {
@@ -21615,47 +21856,99 @@ func formatDispatch(fs *fmtState) {
 		fs.buf.WriteString(s)
 	case '$':
 		// ~$, ~:$, ~@$ - dollar float formatting
-		digits := fs.getParam(params, 0, 2)
-		decimals := fs.getParam(params, 1, 2)
-		width := fs.getParam(params, 2, 0)
+		// Params: d n w padchar
+		// d = digits after decimal (default 2)
+		// n = minimum digits before decimal point (default 1)
+		// w = minimum field width (default 0)
+		// padchar = padding character (default space)
+		d := fs.getParam(params, 0, 2)
+		n := fs.getParam(params, 1, 1)
+		w := fs.getParam(params, 2, 0)
 		padchar := fs.getCharParam(params, 3, ' ')
 		arg := fs.popArg()
 		f := toNum(arg)
-		s := strconv.FormatFloat(f, 'f', int(decimals), 64)
-		padlen := width - len(s) - int(digits)
-		if padlen < 0 {
-			padlen = 0
+		s := strconv.FormatFloat(f, 'f', int(d), 64)
+		// Ensure minimum digits before decimal point
+		if idx := strings.Index(s, "."); idx >= 0 {
+			beforeDot := s[:idx]
+			sign := ""
+			if len(beforeDot) > 0 && (beforeDot[0] == '-' || beforeDot[0] == '+') {
+				sign = string(beforeDot[0])
+				beforeDot = beforeDot[1:]
+			}
+			for len(beforeDot) < int(n) {
+				beforeDot = "0" + beforeDot
+			}
+			s = sign + beforeDot + s[idx:]
 		}
-		// Insert commas/digits before number
+		// Handle @ modifier: always print sign
+		if at && f >= 0 {
+			s = "+" + s
+		}
+		// Handle colon modifier: sign appears before padding
 		if colon {
-			// CL: ~:$ inserts thousand separator
-			// For simplicity, just output the number with prefix
+			// ~:$ sign before padding
+			padlen := int(w) - len(s)
+			if padlen < 0 {
+				padlen = 0
+			}
+			signPart := ""
+			if len(s) > 0 && (s[0] == '-' || s[0] == '+') {
+				signPart = string(s[0])
+				s = s[1:]
+			}
+			fs.buf.WriteString(signPart)
+			for i := 0; i < padlen; i++ {
+				fs.buf.WriteRune(rune(padchar))
+			}
+			fs.buf.WriteString(s)
+		} else {
+			padlen := int(w) - len(s)
+			if padlen < 0 {
+				padlen = 0
+			}
+			for i := 0; i < padlen; i++ {
+				fs.buf.WriteRune(rune(padchar))
+			}
+			fs.buf.WriteString(s)
 		}
-		for i := 0; i < padlen; i++ {
-			fs.buf.WriteRune(rune(padchar))
-		}
-		fs.buf.WriteString(s)
 	case 'E':
+		// ~E: scientific notation
 		decimals := fs.getParam(params, 1, -1)
+		eMinDigits := fs.getParam(params, 2, 1)
 		arg := fs.popArg()
 		f := toNum(arg)
-		var s string
+		prec := -1
 		if decimals >= 0 {
-			s = strconv.FormatFloat(f, 'E', decimals, 64)
-		} else {
-			s = strconv.FormatFloat(f, 'E', -1, 64)
+			prec = int(decimals) + 1
 		}
-		if idx := strings.Index(s, "E"); idx >= 0 {
-			exp := s[idx:]
-			base := s[:idx]
-			if len(exp) == 3 {
-				exp = string(exp[:2]) + "0" + string(exp[2:])
-			} else if len(exp) == 2 {
-				exp = string(exp) + "+00"
-			}
-			s = base + exp
+		s := strconv.FormatFloat(f, 'E', prec, 64)
+		idx := strings.Index(s, "E")
+		if idx < 0 {
+			fs.buf.WriteString(s)
+			break
 		}
-		fs.buf.WriteString(s)
+		mantissa := s[:idx]
+		expStr := s[idx+1:]
+		// Ensure mantissa has a decimal point
+		if !strings.Contains(mantissa, ".") {
+			mantissa += ".0"
+		}
+		// Normalize exponent: strip leading zeros
+		expSign := ""
+		if len(expStr) > 0 && (expStr[0] == '+' || expStr[0] == '-') {
+			expSign = string(expStr[0])
+			expStr = expStr[1:]
+		}
+		expDigits := strings.TrimLeft(expStr, "0")
+		if expDigits == "" {
+			expDigits = "0"
+		}
+		// Pad to minimum digit count
+		for len(expDigits) < int(eMinDigits) {
+			expDigits = "0" + expDigits
+		}
+		fs.buf.WriteString(mantissa + "E" + expSign + expDigits)
 	case 'R':
 		arg := fs.popArg()
 		n := int(toNum(arg))

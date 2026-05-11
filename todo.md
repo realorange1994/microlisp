@@ -117,8 +117,8 @@
 71. 关键字参数大小写不匹配（reader 大写化后 Go 侧用小写匹配）— 已确认已实现（seqParseKeys 使用大写符号名比较 ":KEY", ":TEST" 等）
 72. `checked-compile` 宏引用 bug（`eval` 未正确展开变量）
 73. `destructuring-bind` 点对模式匹配 nil 值时 Go nil 指针崩溃
-74. `string-upcase/downcase/capitalize` 不接受 string designators（符号/字符）
-75. `string-capitalize` 不支持 `:start`/`:end` 关键字参数
+74. `format ~e` 科学记数法指数有前导零（`(format nil "~e" 42.0)` 返回 "4.2E+01" 而非 "4.2E+1"）— 已修复（重写 ~E 分支：使用 strconv.FormatFloat 正确精度，去除指数前导零，确保尾数有小数点）
+75. `string-capitalize` 不支持 `:start`/`:end` 关键字参数 — 已修复
 76. `nstring-upcase/downcase/capitalize` 不支持 VArray 和 fill-pointer
 77. `(setf fill-pointer)` 未实现 — 已修复（fill-pointer-setf 已注册在 builtin table）
 78. `butlast` 对 dotted list 处理错误 — 已修复（重写 n>0 路径：收集 elems/cdrs，使用 cdrs[len-1] 作为 dottedTail；移除覆盖 Go 内置的 Lisp 定义）
@@ -288,3 +288,11 @@
 156. `pairlis` 不接受可选第三参数 `alist`（`(pairlis '(a b) '(1 2) '((c . 3)))` 应返回 `((A . 1) (B . 2) (C . 3))`）— 已修复（添加 `len(args) >= 3` 时取 `alist` 参数，nconc 结果到 alist）
 
 157. `nsubstitute-if` 不支持字符串输入（对字符串调用报错或返回原串）— 已修复（添加 VStr 分支，遍历 rune 切片，谓词匹配时替换字符，支持 :start/:end/:count/:from-end 关键字参数）
+
+158. `format ~e` 科学记数法指数有前导零（`(format nil "~e" 42.0)` 返回 "4.2E+01" 而非 "4.2E+1"）— 已修复（重写 ~E 分支：去除指数前导零，确保尾数有小数点，支持 e 参数控制指数最小位数）
+
+159. 缺少 ANSI CL 标准谓词函数：`bit-vector-p`、`simple-vector-p`、`simple-bit-vector-p`、`simple-string-p`、`packagep`、`compiled-function-p` — 已修复（添加对应 Go 实现，注册到 builtin table）
+
+160. 缺少 ANSI CL 标准函数：`char-int`、`special-operator-p`、`parse-namestring`、`gentemp` — 已修复（添加 Go 实现，special-operator-p 使用硬编码的特殊操作符集合，gentemp 使用 internSymbol 驻留符号）
+
+161. 缺少 ANSI CL 数组函数：`array-dimension`、`array-in-bounds-p`、`array-row-major-index`、`bit`、`sbit` — 已修复（添加 Go 实现，bit/sbit 检查输入为位向量）
