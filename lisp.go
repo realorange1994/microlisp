@@ -6952,6 +6952,7 @@ var builtins = []builtinDef{
 	{"class-of", builtinClassOf},
 	{"class-name", builtinClassName},
 	{"find-class", builtinFindClass},
+	{"find-class-setf", builtinFindClassSetf},
 	{"is-a?", builtinIsA},
 	{"class-slots", builtinClassSlots},
 	{"class-slot-defs", builtinClassSlotDefs},
@@ -6961,6 +6962,7 @@ var builtins = []builtinDef{
 	{"compute-applicable-methods", builtinComputeApplicableMethods},
 	{"method-qualifiers", builtinMethodQualifiers},
 	{"generic-function-p", builtinGenericFunctionP},
+	{"ensure-generic-function", builtinEnsureGenericFunction},
 	{"set-method-combination", builtinSetMethodCombination},
 	{"make-hash-table", builtinMakeHashTable},
 	{"hash-table-p", builtinHashTableP},
@@ -10630,6 +10632,49 @@ func builtinMakeGenericFunction(args []*Value) (*Value, error) {
 	return gf, nil
 }
 
+// builtinEnsureGenericFunction - ANSI CL ensure-generic-function
+// If a generic function with the given name already exists, return it;
+// otherwise create a new one and register it.
+func builtinEnsureGenericFunction(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("ensure-generic-function: need a function name")
+	}
+	name := args[0]
+	var nameStr string
+	if name.typ == VSym {
+		nameStr = name.str
+	} else if name.typ == VStr {
+		nameStr = name.str
+	} else {
+		return nil, fmt.Errorf("ensure-generic-function: function name must be a symbol or string")
+	}
+	// Check if it already exists as a generic function
+	existing, err := globalEnv.Get(nameStr)
+	if err == nil && existing != nil && existing.typ == VGeneric {
+		return existing, nil
+	}
+	// Create a new generic function
+	gf := gcv()
+	gf.typ = VGeneric
+	gf.str = nameStr
+	// Parse optional keyword arguments
+	for i := 1; i < len(args); i++ {
+		if args[i].typ == VSym && args[i].str == ":LAMBDA-LIST" && i+1 < len(args) {
+			// Store lambda-list info (simplified: just skip)
+			i++
+		} else if args[i].typ == VSym && args[i].str == ":DOCUMENTATION" && i+1 < len(args) {
+			i++
+		} else if args[i].typ == VSym && args[i].str == ":METHOD-COMBINATION" && i+1 < len(args) {
+			if args[i+1].typ == VSym {
+				gf.methodCombo = args[i+1].str
+			}
+			i++
+		}
+	}
+	globalEnv.Set(nameStr, gf)
+	return gf, nil
+}
+
 func builtinMakunbound(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("makunbound: need a symbol")
@@ -14153,6 +14198,23 @@ func builtinFindClass(args []*Value) (*Value, error) {
 		return cls, nil
 	}
 	return vnil(), nil
+}
+
+// builtinFindClassSetf - (setf (find-class symbol) class)
+func builtinFindClassSetf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("(setf find-class): need class and symbol")
+	}
+	newClass := args[0]
+	sym := args[1]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("(setf find-class): second argument must be a symbol")
+	}
+	if newClass.typ != VClass {
+		return nil, fmt.Errorf("(setf find-class): first argument must be a class")
+	}
+	classRegistry[sym.str] = newClass
+	return newClass, nil
 }
 
 func builtinClassOf(args []*Value) (*Value, error) {
@@ -21802,20 +21864,43 @@ func builtinBothCaseP(args []*Value) (*Value, error) {
 // -------- char-equal (case-insensitive) / char-not-equal --------
 func builtinCharEqual(args []*Value) (*Value, error) {
 	if len(args) < 2 {
-		return nil, fmt.Errorf("char-equal: need two characters")
+		return nil, fmt.Errorf("char-equal: need at least two characters")
 	}
-	c1 := charVal(args[0])
-	c2 := charVal(args[1])
-	return vbool(unicode.ToLower(c1) == unicode.ToLower(c2)), nil
+	runes := make([]rune, len(args))
+	for i, a := range args {
+		if a.typ != VChar {
+			return nil, fmt.Errorf("char-equal: expected a character")
+		}
+		runes[i] = unicode.ToLower(a.ch)
+	}
+	for i := 1; i < len(runes); i++ {
+		if runes[i] != runes[0] {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
 }
 
 func builtinCharNotEqual(args []*Value) (*Value, error) {
 	if len(args) < 2 {
-		return nil, fmt.Errorf("char-not-equal: need two characters")
+		return nil, fmt.Errorf("char-not-equal: need at least two characters")
 	}
-	c1 := charVal(args[0])
-	c2 := charVal(args[1])
-	return vbool(unicode.ToLower(c1) != unicode.ToLower(c2)), nil
+	runes := make([]rune, len(args))
+	for i, a := range args {
+		if a.typ != VChar {
+			return nil, fmt.Errorf("char-not-equal: expected a character")
+		}
+		runes[i] = unicode.ToLower(a.ch)
+	}
+	// All pairs must be distinct (not just adjacent)
+	for i := 0; i < len(runes); i++ {
+		for j := i + 1; j < len(runes); j++ {
+			if runes[i] == runes[j] {
+				return vbool(false), nil
+			}
+		}
+	}
+	return vbool(true), nil
 }
 
 func charVal(v *Value) rune {
@@ -21828,42 +21913,68 @@ func charVal(v *Value) rune {
 	return 0
 }
 
-// -------- char-lessp / char-greaterp (case-insensitive) --------
-func builtinCharLessp(args []*Value) (*Value, error) {
+// -------- char-lessp / char-greaterp / char-not-lessp / char-not-greaterp (case-insensitive, multi-arg) --------
+func charCompareCI(op string, args []*Value) (*Value, error) {
 	if len(args) < 2 {
-		return nil, fmt.Errorf("char-lessp: need two characters")
+		return nil, fmt.Errorf("char%s: expected at least 2 characters", op)
 	}
-	return vbool(unicode.ToLower(charVal(args[0])) < unicode.ToLower(charVal(args[1]))), nil
+	runes := make([]rune, len(args))
+	for i, a := range args {
+		if a.typ != VChar {
+			return nil, fmt.Errorf("char%s: expected a character", op)
+		}
+		runes[i] = unicode.ToLower(a.ch)
+	}
+	for i := 0; i < len(runes)-1; i++ {
+		a, b := runes[i], runes[i+1]
+		switch op {
+		case "lessp":
+			if !(a < b) {
+				return vbool(false), nil
+			}
+		case "greaterp":
+			if !(a > b) {
+				return vbool(false), nil
+			}
+		case "not-lessp":
+			if !(a >= b) {
+				return vbool(false), nil
+			}
+		case "not-greaterp":
+			if !(a <= b) {
+				return vbool(false), nil
+			}
+		}
+	}
+	return vbool(true), nil
 }
 
-func builtinCharGreaterp(args []*Value) (*Value, error) {
-	if len(args) < 2 {
-		return nil, fmt.Errorf("char-greaterp: need two characters")
-	}
-	return vbool(unicode.ToLower(charVal(args[0])) > unicode.ToLower(charVal(args[1]))), nil
-}
+func builtinCharLessp(args []*Value) (*Value, error) { return charCompareCI("lessp", args) }
+func builtinCharGreaterp(args []*Value) (*Value, error) { return charCompareCI("greaterp", args) }
+func builtinCharNotLessp(args []*Value) (*Value, error) { return charCompareCI("not-lessp", args) }
+func builtinCharNotGreaterp(args []*Value) (*Value, error) { return charCompareCI("not-greaterp", args) }
 
-// -------- char-not-lessp / char-not-greaterp --------
-func builtinCharNotLessp(args []*Value) (*Value, error) {
-	if len(args) < 2 {
-		return nil, fmt.Errorf("char-not-lessp: need two characters")
-	}
-	return vbool(unicode.ToLower(charVal(args[0])) >= unicode.ToLower(charVal(args[1]))), nil
-}
-
-func builtinCharNotGreaterp(args []*Value) (*Value, error) {
-	if len(args) < 2 {
-		return nil, fmt.Errorf("char-not-greaterp: need two characters")
-	}
-	return vbool(unicode.ToLower(charVal(args[0])) <= unicode.ToLower(charVal(args[1]))), nil
-}
-
-// -------- char/= (char<= and char>= already defined above) --------
+// builtinCharNotEq - ANSI CL char/=: all pairs must be distinct (case-sensitive)
 func builtinCharNotEq(args []*Value) (*Value, error) {
 	if len(args) < 2 {
-		return nil, fmt.Errorf("char/=: need two characters")
+		return nil, fmt.Errorf("char/=: need at least two characters")
 	}
-	return vbool(charVal(args[0]) != charVal(args[1])), nil
+	runes := make([]rune, len(args))
+	for i, a := range args {
+		if a.typ != VChar {
+			return nil, fmt.Errorf("char/=: expected a character")
+		}
+		runes[i] = a.ch
+	}
+	// All pairs must be distinct (not just adjacent)
+	for i := 0; i < len(runes); i++ {
+		for j := i + 1; j < len(runes); j++ {
+			if runes[i] == runes[j] {
+				return vbool(false), nil
+			}
+		}
+	}
+	return vbool(true), nil
 }
 
 // -------- revappend (already exists) --------

@@ -483,3 +483,15 @@
 
 243. `formatBigIntBase` 只支持基数 2/8/16，其他基数错误输出二进制（`formatBigIntBase` 的 switch 只处理 base==16 和 base==8，default 分支硬编码返回 `Text(2)`；`(format nil "~5R" 42)` 返回 `"101010"` 而非 `"132"`）— 已修复（改用 `n.Text(base)` 直接支持 2-36 的任意基数）
 
+244. `char/=` 只检查相邻字符对而非所有字符对（ANSI CL `char/=` 要求所有字符两两不同，`(char/= #\a #\b #\c #\b)` 应返回 `#f` 因为 #\b 出现两次，但只检查相邻对返回 `#t`）— 已修复（重写 `builtinCharNotEq` 使用双重循环检查所有字符对）
+
+245. `char-not-equal` 只检查两个字符且只比较相邻对（ANSI CL `char-not-equal` 要求所有字符两两不同（大小写不敏感），`(char-not-equal #\a #\B #\c #\b)` 应返回 `#f` 因为 #\B 和 #\b 大小写不敏感相同，但只检查前两个返回 `#t`）— 已修复（重写 `builtinCharNotEqual` 使用双重循环和 `unicode.ToLower` 检查所有字符对）
+
+246. `char-equal` 只比较两个字符（ANSI CL `char-equal` 应支持多参数，`(char-equal #\a #\A #\b)` 应返回 `#f` 因为 #\b 不同，但只比较前两个返回 `#t`）— 已修复（重写 `builtinCharEqual` 遍历所有字符验证是否都与第一个大小写不敏感相等）
+
+247. `char-lessp`/`char-greaterp`/`char-not-lessp`/`char-not-greaterp` 只比较两个字符（ANSI CL 这些函数应支持多参数按序比较，如 `(char-lessp #\a #\c #\b)` 应返回 `#f` 因为 c >= b，但只比较前两个返回 `#t`）— 已修复（添加 `charCompareCI` 辅助函数，支持多参数大小写不敏感比较，与 `charCompare` 模式一致）
+
+248. `ensure-generic-function` 标准函数缺失（ANSI CL CLOS 要求 `ensure-generic-function` 函数：若给定名称的泛函已存在则返回之，否则创建新的泛函并注册；支持 `:method-combination`/`:lambda-list`/`:documentation` 关键字参数）— 已修复（添加 `builtinEnsureGenericFunction` Go 函数，检查 globalEnv 中是否已有 VGeneric 类型绑定，不存在时创建新泛函并注册）
+
+249. `(setf (find-class ...))` 未实现（ANSI CL CLOS 要求 `(setf (find-class symbol) class)` 能注册或替换 classRegistry 中的类定义，`(setf (find-class 'alias) (find-class 'base))` 应使 `find-class` 返回指定的类）— 已修复（添加 `builtinFindClassSetf` Go 函数，注册为 `find-class-setf` builtin，接受 newClass 和 symbol 参数并写入 classRegistry）
+
