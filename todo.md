@@ -374,3 +374,13 @@
 197. ANSI CL 浮点常量缺失（`most-positive-single-float`、`most-positive-double-float`、`least-positive-single-float` 等） — 已修复（在 initGlobalEnv 中添加 26 个浮点常量）
 
 198. ANSI CL `boole-xxx` 常量缺失（`boole-clr`、`boole-and`、`boole-ior` 等 16 个） — 已修复（在 initGlobalEnv 中添加，值 0-15 对应 builtinBoole 中的 switch 分支）
+
+## 新修复的 Bug（本次会话 — 第八轮）
+
+199. `reduce` 的 `:from-end` 关键字参数不生效（`seqParseKeys` 返回了 `fromEnd` 值但 `builtinSeqReduce` 用 `_` 忽略了它，总是从左到右归约）— 已修复（`builtinSeqReduce` 根据 `fromEnd` 分支：从左到右时 `(fn accumulator element)`，从右到左时 `(fn element accumulator)`，并反转遍历方向）
+
+200. `maphash` 不对第一个参数进行函数类型检查（对空哈希表静默返回 nil，对非空表报通用 "not a function" 而非 type-error）— 已修复（`builtinMaphash` 在循环前验证第一个参数是 VPrim/VFunc/VGeneric，否则报错 "first argument must be a function"）
+
+201. `read-from-string` 不支持 `:start`/`:end` 关键字参数且返回的位置不正确（`builtinReadFromString` 完全忽略关键字参数，`parseExpr` 不返回位置信息）— 已修复（添加 `parseExprWithPos` 返回 `(value position)`，Lexer 添加 `prevEndPos` 字段在 `next()` 开头记录位置，`builtinReadFromString` 解析 `:start`/`:end`/`:eof-error-p`/`:eof-value` 关键字参数并返回 `(values obj original-pos)`）
+
+202. `merge` 对 `'string` 结果类型返回字符列表而非字符串（Lisp 包装器将结果类型传给 `seq-merge` 但被忽略，Go 函数总是返回 list）— 已修复（Lisp 包装器用 `coerce` 将 `seq-merge` 的结果转换为请求的类型）

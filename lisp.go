@@ -1255,17 +1255,19 @@ type Tok struct {
 }
 
 type Lexer struct {
-	src []rune
-	pos int
-	tok Tok
-	err   error
-	parser *Parser
-	bitVec *Value
+	src        []rune
+	pos        int
+	prevEndPos int // position right after the last token (before whitespace skip)
+	tok        Tok
+	err        error
+	parser     *Parser
+	bitVec     *Value
 }
 
 func lex(s string) *Lexer { return &Lexer{src: []rune(s)} }
 
 func (l *Lexer) next() Tok {
+	l.prevEndPos = l.pos // capture position before skipWS (right after previous token)
 	l.skipWS()
 	if l.pos >= len(l.src) {
 		l.tok = Tok{typ: TEOF}
@@ -2084,10 +2086,30 @@ func tokName(t TokType) string {
 
 // multi-read: read one complete expression, handling quotes as reader syntax
 func parseExpr(s string) (*Value, error) {
+	v, _, err := parseExprWithPos(s)
+	return v, err
+}
+
+// parseExprWithPos parses a single expression and returns the value and position after it.
+func parseExprWithPos(s string) (*Value, int, error) {
 	l := lex(s)
 	p := &Parser{l: l, ptoks: make([]Tok, 0, 64), readtable: currentReadtable, env: globalEnv}
 	p.advance()
-	return p.readExpr()
+	v, err := p.readExpr()
+	if err != nil {
+		return nil, 0, err
+	}
+	// After readExpr(), l.pos may have been advanced past whitespace by the last next() call.
+	// l.prevEndPos is set at the start of each next() call to l.pos before skipWS(),
+	// so it captures the position right after the previous token.
+	// For compound expressions (lists etc.), multiple next() calls were made,
+	// and prevEndPos captures the position right after the expression.
+	// For simple expressions (numbers, symbols), only one next() was called,
+	// so prevEndPos is still 0 and l.pos is already correct.
+	if l.prevEndPos == 0 && l.pos > 0 {
+		return v, l.pos, nil
+	}
+	return v, l.prevEndPos, nil
 }
 
 func (p *Parser) readExpr() (*Value, error) {
@@ -14725,6 +14747,9 @@ func builtinMaphash(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("maphash: need function and hash-table")
 	}
 	fn := args[0]
+	if fn.typ != VPrim && fn.typ != VFunc && fn.typ != VGeneric {
+		return nil, fmt.Errorf("maphash: first argument must be a function, got %s", typeStr(fn))
+	}
 	ht := args[1]
 	if ht.typ != VVHash || ht.hashTab == nil {
 		return nil, fmt.Errorf("maphash: not a hash table")
@@ -15496,7 +15521,7 @@ func builtinSeqReduce(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("seq-reduce: need function and sequence")
 	}
 	fn := args[0]
-	keyFn, _, _, _, _, start, end, initialVal, err := seqParseKeys(args, 2)
+	keyFn, _, _, fromEnd, _, start, end, initialVal, err := seqParseKeys(args, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -15511,29 +15536,58 @@ func builtinSeqReduce(args []*Value) (*Value, error) {
 	if start >= end || len(elements) == 0 {
 		return initialVal, nil
 	}
-	acc := initialVal
-	startIdx := start
 	hasInitialValue := boolFromKey(":initial-value", args, 2)
-	if acc.typ == VNil && !hasInitialValue {
-		acc = elements[startIdx]
-		startIdx = start + 1
-	}
-	for i := startIdx; i < end; i++ {
-		v := elements[i]
-		if !isNil(keyFn) {
+
+	if !fromEnd {
+		// Left-to-right reduce (default)
+		acc := initialVal
+		startIdx := start
+		if acc.typ == VNil && !hasInitialValue {
+			acc = elements[startIdx]
+			startIdx = start + 1
+		}
+		for i := startIdx; i < end; i++ {
+			v := elements[i]
+			if !isNil(keyFn) {
+				var err error
+				v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
 			var err error
-			v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+			acc, err = callFnOnSeq(fn, []*Value{acc, v}, globalEnv)
 			if err != nil {
 				return nil, err
 			}
 		}
-		var err error
-		acc, err = callFnOnSeq(fn, []*Value{acc, v}, globalEnv)
-		if err != nil {
-			return nil, err
+		return acc, nil
+	} else {
+		// Right-to-left reduce (:from-end t)
+		acc := initialVal
+		endIdx := end - 1
+		if acc.typ == VNil && !hasInitialValue {
+			acc = elements[endIdx]
+			endIdx = end - 2
 		}
+		for i := endIdx; i >= start; i-- {
+			v := elements[i]
+			if !isNil(keyFn) {
+				var err error
+				v, err = callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			var err error
+			// For :from-end, function is called as (fn element accumulator)
+			acc, err = callFnOnSeq(fn, []*Value{v, acc}, globalEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return acc, nil
 	}
-	return acc, nil
 }
 
 func boolFromKey(key string, args []*Value, startIdx int) bool {
@@ -25462,8 +25516,9 @@ var initLib = `
   (apply seq-position-if-not (cons pred (cons seq rest))))
 (define (merge seq1 seq2 pred . rest)
   (if (or (eq? seq1 'list) (eq? seq1 'vector) (eq? seq1 'string))
-      ;; CL-style: (merge 'type seq1 seq2 pred) -- skip type, rearrange args
-      (seq-merge seq2 pred (car rest))
+      ;; CL-style: (merge 'type seq1 seq2 pred) -- seq1 is type
+      (let ((result (seq-merge seq2 pred (car rest))))
+        (coerce result seq1))
       ;; MicroLisp-style: (merge seq1 seq2 pred)
       (seq-merge seq1 seq2 pred)))
 
