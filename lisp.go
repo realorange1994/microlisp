@@ -263,6 +263,12 @@ var lispFeatures map[string]bool
 // Modules table for provide/require
 var lispModules map[string]bool
 
+// Compiler macro registry — stores define-compiler-macro definitions
+var compilerMacros = make(map[string]*Value)
+
+// Struct print functions — stores :print-function definitions for defstruct
+var structPrintFns = make(map[string]*Value)
+
 // Threading globals
 var nextThreadID int64
 
@@ -3131,6 +3137,45 @@ evalLoop:
 				_ = envSym // stored in envSym field via macro env
 				env.Set(name, m)
 				return vsym(name), nil
+			case "DEFINE-SYMBOL-MACRO":
+				// (define-symbol-macro name expansion)
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("define-symbol-macro: malformed form")
+				}
+				symName := v.cdr.car
+				if symName == nil || symName.typ != VSym {
+					return nil, fmt.Errorf("define-symbol-macro: name must be a symbol")
+				}
+				if v.cdr.cdr == nil || v.cdr.cdr.typ != VPair {
+					return nil, fmt.Errorf("define-symbol-macro: missing expansion")
+				}
+				expansion := v.cdr.cdr.car
+				sv := gcv()
+				sv.typ = VSymMacro
+				sv.car = expansion
+				globalEnv.Set(symName.str, sv)
+				return symName, nil
+			case "DEFINE-COMPILER-MACRO":
+				// (define-compiler-macro name (args...) body...)
+				// Stores the macro in the compilerMacros table for compiler-macro-function lookup
+				if v.cdr == nil || v.cdr.typ != VPair {
+					return nil, fmt.Errorf("define-compiler-macro: malformed form")
+				}
+				cmName := v.cdr.car
+				if cmName == nil || cmName.typ != VSym {
+					return nil, fmt.Errorf("define-compiler-macro: name must be a symbol")
+				}
+				name := cmName.str
+				m := gcv()
+				m.typ = VMacro
+				m.str = name
+				m.params = nil
+				m.rest = ""
+				m.whole = ""
+				m.body = v.cdr.cdr
+				m.env = env
+				compilerMacros[name] = m
+				return cmName, nil
 			case "MACRO-EXPAND":
 				if v.cdr == nil || v.cdr.typ != VPair {
 					return nil, fmt.Errorf("macro-expand: malformed form")
@@ -4705,7 +4750,17 @@ evalLoop:
 					}
 				}
 				// Slot specifications (with options) come from the 3rd arg of defclass
+				// If a 4th arg is provided, use that for full slot specs (used by defstruct)
 				slotDefsVal := slotsVal
+				if v.cdr.cdr.cdr.cdr != nil && v.cdr.cdr.cdr.cdr.typ == VPair && !isNil(v.cdr.cdr.cdr.cdr.car) {
+					fullSpecs := v.cdr.cdr.cdr.cdr.car
+					if fullSpecs.typ == VPair && fullSpecs.car != nil && fullSpecs.car.typ == VSym && fullSpecs.car.str == "QUOTE" {
+						if !isNil(fullSpecs.cdr) && fullSpecs.cdr.typ == VPair {
+							fullSpecs = fullSpecs.cdr.car
+						}
+					}
+					slotDefsVal = fullSpecs
+				}
 
 				cl := gcv()
 				cl.typ = VClass
@@ -6601,7 +6656,7 @@ var specialOpNames = []string{
 	"multiple-value-bind", "multiple-value-list", "multiple-value-setq",
 	"multiple-value-prog1", "multiple-value-call", "proclaim", "declaim",
 	"progv", "funcall", "macrolet", "symbol-macrolet", "eval-when",
-	"locally", "define", "define-macro", "lambda", "step", "time",
+	"locally", "define", "define-macro", "define-symbol-macro", "define-compiler-macro", "lambda", "step", "time",
 	"ignore-errors", "loop-finish", "and", "or", "not", "begin",
 	"case", "typecase", "ecase", "etypecase", "ctypcase", "ctypecase",
 	"destructuring-bind", "handler-case", "handler-bind",
@@ -6759,6 +6814,10 @@ var builtins = []builtinDef{
 	{"symbol-function", builtinSymbolFunction},
 	{"macro-function", builtinMacroFunction},
 	{"macro-function-setf", builtinMacroFunctionSetf},
+	{"compiler-macro-function", builtinCompilerMacroFunction},
+	{"compiler-macro-function-setf", builtinCompilerMacroFunctionSetf},
+	{"set-class-print-fn", builtinSetClassPrintFn},
+	{"removeClassPrintFn", builtinRemoveClassPrintFn},
 	{"symbol-plist", builtinSymbolPlist},
 	{"symbol-plist-setf", builtinSymbolPlistSetf},
 	{"boundp", builtinBoundp},
@@ -10372,6 +10431,78 @@ func builtinMacroFunctionSetf(args []*Value) (*Value, error) {
 	return newFn, nil
 }
 
+// builtinCompilerMacroFunction returns the compiler macro function for a symbol, or nil.
+func builtinCompilerMacroFunction(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("compiler-macro-function: need a symbol")
+	}
+	sym := args[0]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("compiler-macro-function: not a symbol")
+	}
+	cm, ok := compilerMacros[sym.str]
+	if !ok || cm == nil {
+		return vnil(), nil
+	}
+	return cm, nil
+}
+
+// builtinCompilerMacroFunctionSetf implements (setf (compiler-macro-function sym) fn).
+func builtinCompilerMacroFunctionSetf(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("setf (compiler-macro-function): need value and symbol")
+	}
+	newFn := args[0]
+	sym := args[1]
+	if sym.typ != VSym {
+		return nil, fmt.Errorf("setf (compiler-macro-function): symbol required")
+	}
+	if isNil(newFn) {
+		delete(compilerMacros, sym.str)
+	} else {
+		m := gcv()
+		m.typ = VMacro
+		m.str = sym.str
+		m.params = nil
+		m.rest = ""
+		m.whole = ""
+		m.body = list(newFn, vsym("#FORM"), vsym("#ENV"))
+		m.env = globalEnv
+		compilerMacros[sym.str] = m
+	}
+	return newFn, nil
+}
+
+// builtinSetClassPrintFn stores a print function for a defstruct class (used by :print-function)
+func builtinSetClassPrintFn(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("set-class-print-fn: need class-name and function")
+	}
+	name := args[0]
+	printFn := args[1]
+	if name.typ != VSym {
+		return nil, fmt.Errorf("set-class-print-fn: class-name must be a symbol")
+	}
+	if printFn.typ != VFunc && printFn.typ != VPrim {
+		return nil, fmt.Errorf("set-class-print-fn: function must be callable")
+	}
+	structPrintFns[strings.ToUpper(name.str)] = printFn
+	return vnil(), nil
+}
+
+// builtinRemoveClassPrintFn removes a print function for a defstruct class
+func builtinRemoveClassPrintFn(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("remove-class-print-fn: need class-name")
+	}
+	name := args[0]
+	if name.typ != VSym {
+		return nil, fmt.Errorf("remove-class-print-fn: class-name must be a symbol")
+	}
+	delete(structPrintFns, strings.ToUpper(name.str))
+	return vnil(), nil
+}
+
 func builtinSymbolFunction(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("symbol-function: need a symbol")
@@ -12136,8 +12267,8 @@ func builtinNthSetf(args []*Value) (*Value, error) {
 
 // builtinSymbolValueSetf is used for (setf (symbol-value sym) val)
 func builtinSymbolValueSetf(args []*Value) (*Value, error) {
-	if len(args) < 3 {
-		return nil, fmt.Errorf("setf (symbol-value): need value, symbol, and optional env")
+	if len(args) < 2 {
+		return nil, fmt.Errorf("setf (symbol-value): need value and symbol")
 	}
 	val := args[0]
 	sym := args[1]
@@ -23636,6 +23767,13 @@ func builtinFormat(args []*Value) (*Value, error) {
 		fmt.Print(result)
 		return vnil(), nil
 	}
+	// If stream is a real stream (not nil), write to it
+	if stream.typ == VStream && stream.stream != nil && stream.stream.isOutput {
+		if stream.stream.isString && stream.stream.strBuf != nil {
+			stream.stream.strBuf.WriteString(result)
+		}
+		return vnil(), nil
+	}
 	return vstr(result), nil
 }
 
@@ -24639,6 +24777,18 @@ func princToString(v *Value) string {
 		// Use writeToString for circular reference detection
 		return writeToString(v)
 	case VInstance:
+		// Check for defstruct :print-function / :print-object first
+		if v.instClass != nil {
+			if printFn, ok := structPrintFns[strings.ToUpper(v.instClass.str)]; ok && printFn != nil {
+				// Create a string output stream and call the print function
+				outStream := newStringOutput()
+				_, callErr := callFnOnSeq(printFn, []*Value{v, outStream, vnum(0)}, globalEnv)
+				if callErr == nil {
+					return outStream.stream.strBuf.String()
+				}
+				// If print function fails, fall through to default
+			}
+		}
 		// Check if this is a condition instance with format-control/format-arguments
 		if v.instClass != nil && classHasAncestor(v.instClass, "condition") {
 			fc := instanceSlotWithInheritance(v, "format-control")
@@ -24863,6 +25013,13 @@ func toString(v *Value) string {
 		return "#<generic " + v.str + ">"
 	case VInstance:
 		if v.instClass != nil {
+			if printFn, ok := structPrintFns[strings.ToUpper(v.instClass.str)]; ok && printFn != nil {
+				outStream := newStringOutput()
+				_, callErr := callFnOnSeq(printFn, []*Value{v, outStream, vnum(0)}, globalEnv)
+				if callErr == nil {
+					return outStream.stream.strBuf.String()
+				}
+			}
 			return "#<instance " + v.instClass.str + ">"
 		}
 		return "#<instance>"
@@ -25937,6 +26094,8 @@ var initLib = `
                )
              (if (and (pair? (car opts)) (eq? (caar opts) :print-object))
                (set! print-fn (cadar opts)))
+             (if (and (pair? (car opts)) (eq? (caar opts) :print-function))
+               (set! print-fn (cadar opts)))
              (if (and (pair? (car opts)) (eq? (caar opts) :type))
                (set! repr-type (cadar opts)))
              (parse-options (cdr opts))))))
@@ -26051,12 +26210,14 @@ var initLib = `
                             (list 'new)))))
                 expansions))
             (if print-fn
-              (set! expansions
-                (cons
-                  (list 'define (string->symbol
-                                 (string-append (symbol->string struct-name) "-print"))
-                        print-fn)
-                  expansions)))
+              (let ((print-fn-name
+                      (string->symbol
+                        (string-append (symbol->string struct-name) "-print"))))
+                (set! expansions
+                  (cons (list 'define print-fn-name print-fn) expansions))
+                (set! expansions
+                  (cons (list 'set-class-print-fn (list 'quote struct-name) print-fn-name)
+                        expansions))))
             (cons 'begin (reverse expansions))))))
       ;; no :include branch
       (let ((all-slots slot-defs)
@@ -26118,12 +26279,14 @@ var initLib = `
                         (list 'new)))))
             expansions))
         (if print-fn
-          (set! expansions
-            (cons
-              (list 'define (string->symbol
-                             (string-append (symbol->string struct-name) "-print"))
-                    print-fn)
-              expansions)))
+          (let ((print-fn-name
+                  (string->symbol
+                    (string-append (symbol->string struct-name) "-print"))))
+            (set! expansions
+              (cons (list 'define print-fn-name print-fn) expansions))
+            (set! expansions
+              (cons (list 'set-class-print-fn (list 'quote struct-name) print-fn-name)
+                    expansions))))
         (cons 'begin (reverse expansions))))))
 
 ;; -------- let* macro --------

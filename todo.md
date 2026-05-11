@@ -21,7 +21,7 @@
 ### CLOS / 对象系统
 - [x] CLOS method combinations 未实现 — 已修复（实现 standard/progn/and/or/list/append/nconc/min/max/+ 方法组合，添加 methodCombo 字段到 VGeneric，set-method-combination 内置函数，defgeneric 支持 :method-combination 选项，isTypeSpecializerMatch 和 methodSpecificity 使用大写类型名匹配）
 - [x] `find-method` / `remove-method` 未实现 — 已修复（添加 VMethod 类型，实现 builtinFindMethod 和 builtinRemoveMethod，支持 qualifier/specializer-list/errorp 参数，特化器匹配处理大小写和 t="" 等价）
-- [ ] `call-next-method` 未实现 — 已确认可用（defmethod + CLOS dispatch 中已有 call-next-method/next-method-p 绑定实现，支持方法链调用）
+- [x] `call-next-method` 未实现 — 已确认可用（defmethod + CLOS dispatch 中已有 call-next-method/next-method-p 绑定实现，支持方法链调用）
 
 ### Loop
 - [x] `loop ... from ... downto ... by ...` 语法不支持 — 已验证实现（downto/by/above/below 均已支持）
@@ -460,4 +460,16 @@
 233. `concatenate` 对 `'vector`/`'simple-vector` 结果类型返回列表而非向量（`(concatenate 'vector '(1 2 3) '(4 5 6))` 返回 `(1 2 3 4 5 6)` 而非 `#(1 2 3 4 5 6)`，且 `'string` 类型不处理非字符串输入如字符列表）— 已修复（重写 `builtinSeqConcatenate`，使用 `strings.ToUpper` 标准化类型名，支持 VECTOR/SIMPLE-VECTOR/ARRAY/SIMPLE-ARRAY/LIST/CONS/NULL/BIT-VECTOR/SIMPLE-BIT-VECTOR 结果类型，STRING 类型正确处理字符列表/向量输入）
 
 234. `bit-andc1`/`bit-andc2` 标准位向量操作缺失（ANSI CL 定义 10 个位向量操作，microlisp 仅实现 8 个，缺少 andc1=(NOT a)AND b 和 andc2=a AND(NOT b)）— 已修复（在 `bitArrayOp` switch 中添加 andc1/andc2 case，添加 `builtinBitAndc1`/`builtinBitAndc2` 函数并注册到 builtin table）
+
+## 新修复的 Bug（本次会话）
+
+235. `define-symbol-macro` 标准特殊形式缺失（ANSI CL 要求注册全局符号宏，使符号在变量查找时被替换为展开形式）— 已修复（在 eval 的 switch 中添加 `DEFINE-SYMBOL-MACRO` case，存储 `VSymMacro` 值到 globalEnv；添加到 specialOpNames 列表）
+
+236. `define-compiler-macro`/`compiler-macro-function` 标准函数/特殊形式缺失（ANSI CL 定义编译器宏用于编译期优化）— 已修复（添加 `DEFINE-COMPILER-MACRO` 特殊形式存储在 `compilerMacros` 全局 map，添加 `compiler-macro-function` Go 内置函数读取编译器宏，添加 `compiler-macro-function-setf` 支持用 setf 移除编译器宏，添加到 specialOpNames 列表）
+
+237. `defstruct :print-function`/`:print-object` 选项不生效（defstruct 宏生成 `struct-name-print` 函数但打印系统未调用，且 parse-options 中缺少 `:print-function` 检查）— 已修复（添加 `:print-function` 选项解析到 defstruct parse-options，添加 Go 全局 `structPrintFns` map 存储类名到打印函数映射，添加 `set-class-print-fn`/`removeClassPrintFn` Go 内置函数，修改 defstruct 宏生成 `set-class-print-fn` 调用注册打印函数，修改 `princToString` 和 `toString` 的 VInstance 分支检查 structPrintFns 并调用打印函数）
+
+238. `format` 不写入字符串输出流（`(format s "hello")` 返回字符串而非写入字符串流，导致 defstruct print-function 的 `(format s "...")` 无法向 stream 写入）— 已修复（`builtinFormat` 添加 VStream isOutput 分支：对字符串输出流调用 `strBuf.WriteString` 并返回 nil）
+
+239. `setf (symbol-value sym)` 不生效（`builtinSymbolValueSetf` 要求 3 个参数但 setf 展开器只传递 2 个）— 已修复（将参数检查从 `len(args) < 3` 改为 `len(args) < 2`，使 env 参数真正可选）
 
