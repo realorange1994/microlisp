@@ -204,9 +204,9 @@ func makeSimpleCondition(className, msg string) *Value {
 		cond.instClass = findClass("condition")
 	}
 	cond.instSlots = map[string]*Value{
-		"message":          vstr(msg),
-		"format-control":   vstr(msg),
-		"format-arguments": vnil(),
+		"MESSAGE":          vstr(msg),
+		"FORMAT-CONTROL":   vstr(msg),
+		"FORMAT-ARGUMENTS": vnil(),
 	}
 	return cond
 }
@@ -233,7 +233,7 @@ func builtinError(args []*Value) (*Value, error) {
 		cond = datum
 		if len(args) > 1 {
 			msg = formatMessage(toString(primaryValue(args[1])), args[2:])
-			cond.instSlots["message"] = vstr(msg)
+			cond.instSlots["MESSAGE"] = vstr(msg)
 		}
 	} else if datum.typ == VSym {
 		cls := findClass(datum.str)
@@ -321,7 +321,7 @@ func builtinError(args []*Value) (*Value, error) {
 	}
 	// No handler caught it - return as Go error, wrapped with condition
 	var goErr error
-	if slotMsg, ok := cond.instSlots["message"]; ok {
+	if slotMsg, ok := cond.instSlots["MESSAGE"]; ok {
 		goErr = fmt.Errorf("error: %s", toString(slotMsg))
 	} else if msg != "" {
 		goErr = fmt.Errorf("error: %s", msg)
@@ -491,7 +491,7 @@ func builtinSignal(args []*Value) (*Value, error) {
 		}
 		cond.instSlots = map[string]*Value{}
 		if len(args) > 1 {
-			cond.instSlots["message"] = vstr(toString(primaryValue(args[1])))
+			cond.instSlots["MESSAGE"] = vstr(toString(primaryValue(args[1])))
 		}
 	} else {
 		cond = datum
@@ -1284,9 +1284,9 @@ func builtinBreak(args []*Value) (*Value, error) {
 		cond.instClass = findClass("serious-condition")
 	}
 	cond.instSlots = map[string]*Value{
-		"message":          vstr(msg),
-		"format-control":   vstr(msg),
-		"format-arguments": vnil(),
+		"MESSAGE":          vstr(msg),
+		"FORMAT-CONTROL":   vstr(msg),
+		"FORMAT-ARGUMENTS": vnil(),
 	}
 
 	// Establish continue restart (CL spec: break establishes continue restart)
@@ -1367,9 +1367,9 @@ func goErrorToCondition(err error) *Value {
 		}
 	}
 	cond.instSlots = map[string]*Value{
-		"message":          vstr(msg),
-		"format-control":   vstr(msg),
-		"format-arguments": vnil(),
+		"MESSAGE":          vstr(msg),
+		"FORMAT-CONTROL":   vstr(msg),
+		"FORMAT-ARGUMENTS": vnil(),
 	}
 	return cond
 }

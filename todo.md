@@ -63,7 +63,7 @@
 18. `cl:NAME` 包限定符号无法解析（CL 包没有导出符号）
 19. `nil` 类型说明符被错误当作 `null`（ANSI CL 中 nil 是空类型，null 才匹配 nil）
 20. `subtypep` 不支持复合 CONS 类型说明符（如 `(cons integer *)`）
-21. `compile` 返回值被包装成 VPair 而非 VMultiVal
+21. `compile` 返回值被包装成 VPair 而非 VMultiVal — 已修复（compile 返回 multiVal(fn, vnil(), vnil())）
 22. `make-sequence` 不接受 `:initial-element` 关键字 — 已修复（实现 `builtinMakeSequence`，支持 list/vector/string/bit-vector 类型及 `:initial-element` 关键字）
 23. `subseq` 对字符串返回 nil 而非子字符串
 24. `nreverse` 对列表原地修改但返回错误结果
@@ -77,32 +77,32 @@
 32. `typep` 缺少 `'atom` 类型检查
 33. `subtypep` 返回 list 而非 VMultiVal（导致 `not` 接收整个列表）
 34. 浮点数指数标记（d/D/f/F/s/S/l/L）不被 `parseFloatStr` 支持
-35. `ignore-errors` 出错时返回 `(nil . condition)` 而非 `nil`
+35. `ignore-errors` 出错时返回 `(nil . condition)` 而非 `nil` — 已修复（错误时返回 multiVal(vnil(), condition)，成功时返回 multiVal(result, vnil())）
 36. `destructuring-bind` 不支持 `&rest`/`&body`/`&optional`/`&key`（`&rest` 被当作普通变量绑定到错误值）— 已修复（在 &optional 内部循环中添加 lambda-list 关键字检测，遇到 &rest/&key/&aux 时 break；将 &optional 循环后的 return nil 替换为 continue 让外层循环处理 &rest）
 
 37. Go 词法分析器对超出 float64 尾数精度的大整数（>2^53）丢失精度 — 已修复（`compareNumeric` 添加 `toBigIntExact` 和 `toBigRat` 辅助函数，使用 `big.Int.Cmp` 和 `big.Rat.Cmp` 进行精确比较）
-38. setf 对未绑定变量报错而非创建全局绑定（ANSI CL 语义）
-39. `destructuring-bind` 的 `&key` 使用位置绑定而非关键字匹配
+38. setf 对未绑定变量报错而非创建全局绑定（ANSI CL 语义）— 已修复（set! 和 eval 中的 SETQ 分支在 globalEnv 未绑定时自动创建全局绑定）
+39. `destructuring-bind` 的 `&key` 使用位置绑定而非关键字匹配 — 已修复（bindPatternRec 中 &key 分支使用 keyword matching 而非 positional）
 40. `butlast` 对 n<=0 返回原列表而非副本 — 已修复（Go 实现已正确返回副本；移除覆盖的 Lisp 定义）
 41. `block`/`return-from` 不接受 nil 作为块名 — 已修复（block 和 return-from 均处理 VNil 作为块名，转换为 "NIL"）
-42. `eq`/`equal` 不将 nil 符号和 VNil（空列表）视为相等
+42. `eq`/`equal` 不将 nil 符号和 VNil（空列表）视为相等 — 已修复（eq 和 equal 均处理 VSym "NIL" 与 VNil 的等价）
 43. 双反引号嵌套求值错误（`(quasiquote (quasiquote X))` 未正确解包）— 已修复（evalQuasiquote 重写：QUASIQUOTE 递归 depth+1 并包装结果；UNQUOTE/UNQUOTE-SPLICING 在 depth>0 时递归 depth-1 并包装为 (UNQUOTE ...)；修复 depth==1 时错误求值 UNQUOTE 参数的问题；所有 vsym 使用大写符号名与 reader 一致）
 44. `unquote`/`unquote-splicing` 在 depth>0 时未递归处理 — 已修复（与 Bug #43 同修复，统一 depth>0 路径，移除了错误的 depth==1 特殊分支）
 45. `loop` 的 `for x = expr` 子句在 expr 中引用其他循环变量时报 undefined
 46. `load` 不支持 `:if-does-not-exist nil` 关键字参数 — 已确认已实现（builtinLoad 已处理 :if-does-not-exist 和 :if-exists 关键字参数）
-47. `stringp`/`numberp` 谓词函数未实现
+47. `stringp`/`numberp` 谓词函数未实现 — 已修复（builtinStringP 和 builtinNumberP 已注册）
 48. `loop` 不支持 `being each present-symbol/external-symbol of package` 子句 — 已确认已实现（loop 宏支持 being 子句和 present-symbol/external-symbol）
-49. `random` 函数接受浮点数参数时总是返回 0（截断为整数导致 rand.Intn(0/1)）
-50. `macroexpand` 不展开 quasiquote 形式（返回原始形式不变）
+49. `random` 函数接受浮点数参数时总是返回 0（截断为整数导致 rand.Intn(0/1)）— 已修复（builtinRandom 对 VNum 区分浮点和整数路径，浮点参数使用 rand.Float64）
+50. `macroexpand` 不展开 quasiquote 形式（返回原始形式不变）— 已确认已实现（builtinMacroexpand 处理 quasiquote 分支返回 `(quote expanded)`)
 51. `loop` 不支持解构模式如 `(for (a b) in list)` — 已确认已实现（loop 宏已支持 destr-specs/destructuring-bind 包装解构模式）
 52. `functionp` 谓词函数未实现 — 已确认已实现（builtinFunctionP 正确判断 VPrim/VFunc/VGeneric）
 53. `defun` 接受 `(setf name)` 作为函数名 — 已修复
 54. `ignore-errors` 错误时未返回 `(values nil condition)` — 已修复（成功时返回 multiVal(result, vnil())，错误时返回 multiVal(vnil(), condition)）
-55. `nth-value` 无法从 VMultiVal 正确提取第 n 个值
-56. `delete-if`/`nsubstitute-if` 谓词函数调用方式错误（eval 而非 callFnOnSeq）
+55. `nth-value` 无法从 VMultiVal 正确提取第 n 个值 — 已修复（nth-value 特殊形式使用 multiValList 获取多值列表并正确索引）
+56. `delete-if`/`nsubstitute-if` 谓词函数调用方式错误（eval 而非 callFnOnSeq）— 已修复（使用 callFn 正确调用谓词函数，支持 #'evenp 等函数引用）
 57. `delete-duplicates` 使用指针相等而非值相等判断重复 — 已修复（使用 toString 进行值比较；添加 VArray 和 VStr 委托给 remove-duplicates）
 58. `*random-state*` 未初始化 — 已修复
-59. `coerce` 不支持 `'vector` 和 `'array` 结果类型
+59. `coerce` 不支持 `'vector` 和 `'array` 结果类型 — 已修复（coerce 的 vector/array 分支支持列表和字符串输入）
 60. `typep` 不处理复合 `vector` 类型说明符如 `(vector *)` 且不识别字符串为 vector/array — 已修复（字符串是 CL 中的 vector 和 array 子类型）
 61. `logand`/`logior`/`logxor` 对非整数参数静默转为0而非报type-error — 已修复（已有 `isIntegerValue` 检查和 `signalTypeError` 返回）
 62. `(setf (values ...) ...)` 未实现 — 已修复（setf 展开器处理 values 子形式）
@@ -115,11 +115,11 @@
 69. `find-all-symbols` 函数未实现 — 已确认已实现（builtinFindAllSymbols 已存在于代码中）
 70. `coerce` 类型说明符大小写敏感（`'STRING` vs `'string`）— 已确认已实现（builtinCoerce 使用 strings.ToLower 标准化类型名）
 71. 关键字参数大小写不匹配（reader 大写化后 Go 侧用小写匹配）— 已确认已实现（seqParseKeys 使用大写符号名比较 ":KEY", ":TEST" 等）
-72. `checked-compile` 宏引用 bug（`eval` 未正确展开变量）
-73. `destructuring-bind` 点对模式匹配 nil 值时 Go nil 指针崩溃
+72. `checked-compile` 宏引用 bug（`eval` 未正确展开变量）— 不适用（sbcl 特有）
+73. `destructuring-bind` 点对模式匹配 nil 值时 Go nil 指针崩溃 — 已修复（添加 nil/VNil 元素检查）
 74. `format ~e` 科学记数法指数有前导零（`(format nil "~e" 42.0)` 返回 "4.2E+01" 而非 "4.2E+1"）— 已修复（重写 ~E 分支：使用 strconv.FormatFloat 正确精度，去除指数前导零，确保尾数有小数点）
 75. `string-capitalize` 不支持 `:start`/`:end` 关键字参数 — 已修复
-76. `nstring-upcase/downcase/capitalize` 不支持 VArray 和 fill-pointer
+76. `nstring-upcase/downcase/capitalize` 不支持 VArray 和 fill-pointer — 已修复（VArray 分支修改 arr.elements 中的 VChar 元素，尊重 fillPtr 限制）
 77. `(setf fill-pointer)` 未实现 — 已修复（fill-pointer-setf 已注册在 builtin table）
 78. `butlast` 对 dotted list 处理错误 — 已修复（重写 n>0 路径：收集 elems/cdrs，使用 cdrs[len-1] 作为 dottedTail；移除覆盖 Go 内置的 Lisp 定义）
 79. `floor`/`ceiling`/`truncate`/`round` 返回 list 而非 VMultiVal（多值应使用 multiVal 而非 list）— 已修复
@@ -308,3 +308,5 @@
 165. `format ~g` 精度计算错误（使用固定小数位数而非有效位数）— 已修复（根据指数值计算固定格式的小数位数：decPlaces = digits - 1 - exp）
 
 166. `upgraded-array-element-type` 标准函数缺失 — 已修复（添加 builtinUpgradedArrayElementType 内置函数）
+
+167. `makeSimpleCondition` 槽名大小写不匹配（`instSlots` 使用小写键但 `instanceSlotWithInheritance` 用大写查找，导致 `princToString` 对 error 条件返回 `"#<instance ...>"` 而非格式化消息）— 已修复（统一使用大写键名 "MESSAGE"、"FORMAT-CONTROL"、"FORMAT-ARGUMENTS"）
