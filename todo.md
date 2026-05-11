@@ -473,3 +473,13 @@
 
 239. `setf (symbol-value sym)` 不生效（`builtinSymbolValueSetf` 要求 3 个参数但 setf 展开器只传递 2 个）— 已修复（将参数检查从 `len(args) < 3` 改为 `len(args) < 2`，使 env 参数真正可选）
 
+## 新修复的 Bug（本次会话 — 第十三轮）
+
+240. `format ~nR` 不支持基数参数（ANSI CL `~nR` 应将整数按基数 n 输出，如 `~2R` 输出二进制 `~16R` 输出十六进制，但 microlisp 忽略参数总是输出基数英文拼法）— 已修复（`formatDispatch` 的 `R` 分支在 `len(params) >= 1 && !colon && !at` 时使用参数作为基数调用 `formatBigIntBase` 输出，其他修饰符组合不受影响）
+
+241. `typep` 对复合 `(vector element-type)` 类型说明符不检查元素类型（`(typep #(1 2 3.0) '(vector integer))` 错误返回 `#t`，因为只检查了 vector 类型而未验证每个元素是否满足 element-type）— 已修复（`typepCheckRec` 的 `VECTOR`/`ARRAY` 分支提取 element-type 说明符，优先使用 `LispArray.elemType` 快速路径，否则逐个验证元素；对字符串检查 `CHARACTER` 等价性；添加 `arrayElemTypeMatches` 辅助函数）
+
+242. 类型层级错误：`BASE-CHAR` 声称是 `STANDARD-CHAR` 的子类型（`subtypep 'base-char 'standard-char` 错误返回 `#t`；ANSI CL 规定 `STANDARD-CHAR ⊆ BASE-CHAR ⊆ CHARACTER`）— 已修复（`typeIsSubtype` 和 `simpleSubtype` 中的类型层级映射：`BASE-CHAR` 的父类型列表移除 `STANDARD-CHAR`，`STANDARD-CHAR` 添加 `BASE-CHAR` 作为父类型）
+
+243. `formatBigIntBase` 只支持基数 2/8/16，其他基数错误输出二进制（`formatBigIntBase` 的 switch 只处理 base==16 和 base==8，default 分支硬编码返回 `Text(2)`；`(format nil "~5R" 42)` 返回 `"101010"` 而非 `"132"`）— 已修复（改用 `n.Text(base)` 直接支持 2-36 的任意基数）
+

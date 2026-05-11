@@ -893,6 +893,32 @@ func builtinGetSetf(args []*Value) (*Value, error) {
 	return newVal, nil
 }
 
+// arrayElemTypeMatches checks if a declared array element type matches a type specifier.
+// Used as a fast path in typepCheckRec for compound (vector/array element-type) checks.
+func arrayElemTypeMatches(declaredType string, etSpec *Value, env *Env) bool {
+	dt := strings.ToUpper(declaredType)
+	if etSpec.typ == VSym {
+		specName := strings.ToUpper(etSpec.str)
+		if specName == "*" || specName == "T" {
+			return true
+		}
+		if dt == "CHARACTER" {
+			return specName == "CHARACTER" || specName == "BASE-CHAR" || specName == "STANDARD-CHAR"
+		}
+		if dt == "BIT" {
+			return specName == "BIT" || specName == "INTEGER" || specName == "RATIONAL" || specName == "REAL" || specName == "NUMBER" || specName == "T"
+		}
+		if dt == "SINGLE-FLOAT" {
+			return specName == "SINGLE-FLOAT" || specName == "FLOAT" || specName == "REAL" || specName == "NUMBER" || specName == "T"
+		}
+		if dt == "T" {
+			return true
+		}
+		return dt == specName
+	}
+	return false
+}
+
 func typepCheck(val *Value, typeSpec *Value, env *Env) bool {
 	return typepCheckRec(val, typeSpec, env, make(map[*Value]bool))
 }
@@ -965,22 +991,86 @@ func typepCheckRec(val *Value, typeSpec *Value, env *Env, seen map[*Value]bool) 
 					body = body.cdr
 				}
 				return false
-			case "ARRAY":
+case "ARRAY":
 				// (array element-type) - check if array (strings are also arrays in CL)
 				if val.typ != VArray && val.typ != VStr {
 					return false
 				}
+				// Check element-type if specified
+				elemTypeSpec := typeSpec.cdr
+				if elemTypeSpec != nil && !isNil(elemTypeSpec) && elemTypeSpec.typ == VPair {
+					etSpec := elemTypeSpec.car
+					if !(etSpec.typ == VSym && strings.ToUpper(etSpec.str) == "*") {
+						// Check declared elemType first for fast path
+						if val.typ == VArray && val.array.elemType != "" && val.array.elemType != "T" {
+							if !arrayElemTypeMatches(val.array.elemType, etSpec, env) {
+								return false
+							}
+						} else {
+							// Fall back to checking each element
+							var elements []*Value
+							if val.typ == VArray {
+								elements = val.array.elements
+							} else if val.typ == VStr {
+								elements = make([]*Value, 0, len(val.str))
+								for _, ch := range val.str {
+									elements = append(elements, vchar(ch))
+								}
+							}
+							for _, elem := range elements {
+								if !typepCheckRec(primaryValue(elem), etSpec, env, seen) {
+									return false
+								}
+							}
+						}
+					}
+				}
 				return true
 			case "VECTOR":
 				// (vector) - check if 1D array or string (strings are vectors in CL)
-				// (vector element-type) - check if 1D array
+				// (vector element-type) - check if 1D array with matching element type
 				if val.typ != VArray && val.typ != VStr {
 					return false
 				}
 				if val.typ == VStr {
-					return true // strings are vectors of characters
+					// Strings are always 1D vectors
+					// Check element-type if specified
+					elemTypeSpec := typeSpec.cdr
+					if elemTypeSpec != nil && !isNil(elemTypeSpec) && elemTypeSpec.typ == VPair {
+						etSpec := elemTypeSpec.car
+						if !(etSpec.typ == VSym && strings.ToUpper(etSpec.str) == "*") {
+							// For strings, element type must be CHARACTER or equivalent
+							if !typepCheckRec(vchar('a'), etSpec, env, seen) {
+								return false
+							}
+						}
+					}
+					return true
 				}
-				return len(val.array.dims) == 1
+				if len(val.array.dims) != 1 {
+					return false
+				}
+				// Check element-type if specified
+				elemTypeSpec := typeSpec.cdr
+				if elemTypeSpec != nil && !isNil(elemTypeSpec) && elemTypeSpec.typ == VPair {
+					etSpec := elemTypeSpec.car
+					if !(etSpec.typ == VSym && strings.ToUpper(etSpec.str) == "*") {
+						// Check declared elemType first for fast path
+						if val.array.elemType != "" && val.array.elemType != "T" {
+							if !arrayElemTypeMatches(val.array.elemType, etSpec, env) {
+								return false
+							}
+						} else {
+							// Fall back to checking each element
+							for _, elem := range val.array.elements {
+								if !typepCheckRec(primaryValue(elem), etSpec, env, seen) {
+									return false
+								}
+							}
+						}
+					}
+				}
+				return true
 			case "CONS":
 				// (cons) - check if it's a pair
 				// (cons car-type) - check car matches car-type
