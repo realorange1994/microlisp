@@ -540,7 +540,7 @@ func builtinInvokeRestart(args []*Value) (*Value, error) {
 			if r.handlerFn != nil {
 				return apply(r.handlerFn, restArgs, r.env)
 			}
-			panic(&restartInvoke{name: name, args: restArgs})
+			panic(&restartInvoke{name: name, args: restArgs, id: r.id})
 		}
 	}
 	return nil, fmt.Errorf("invoke-restart: no restart named %s", name)

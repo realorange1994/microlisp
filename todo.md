@@ -26,7 +26,7 @@
 ### Loop
 - [x] `loop ... from ... downto ... by ...` 语法不支持 — 已验证实现（downto/by/above/below 均已支持）
 - [x] `loop` hash-key 迭代挂起 — 已修复（实现 `hash-table-keys`/`hash-table-values` 函数，loop 宏的 `being` 子句支持 `hash-keys`/`hash-key`/`hash-values`/`hash-value`，支持 `using (hash-value v)` 并行绑定）
-- [ ] `loop` destructuring 不完整
+- [ ] `loop` destructuring 不完整 — 注：`for (a b) on list` 的析构模式在 loop 宏中未实现（loop 宏已被禁止修改）
 - [x] `loop for-across` 未实现（遍历数组）— 已修复（转换为 idx from 0 below length + body set var to aref）
 
 ### 其他
@@ -310,3 +310,67 @@
 166. `upgraded-array-element-type` 标准函数缺失 — 已修复（添加 builtinUpgradedArrayElementType 内置函数）
 
 167. `makeSimpleCondition` 槽名大小写不匹配（`instSlots` 使用小写键但 `instanceSlotWithInheritance` 用大写查找，导致 `princToString` 对 error 条件返回 `"#<instance ...>"` 而非格式化消息）— 已修复（统一使用大写键名 "MESSAGE"、"FORMAT-CONTROL"、"FORMAT-ARGUMENTS"）
+
+168. `hash-table-size` 返回条目计数而非桶数量（ANSI CL 要求 `hash-table-size` 返回容量/bucket数，`hash-table-count` 返回条目数）— 已修复（改用 `len(ht.hashTab.table)` 返回桶数量）
+
+169. `hash-table-rehash-threshold` 标准函数缺失 — 已修复（HashTable 结构体添加 rehashThreshold 字段，添加 builtinHashTableRehashThreshold，make-hash-table 支持 :rehash-threshold 关键字参数）
+
+170. 缺少 ANSI CL 标准函数：`subst-if-not`、`nsubst-if-not` — 已修复（添加 builtinSubstIfNot 和 builtinNsubstIfNot，谓词返回 false 时替换）
+
+171. 缺少 ANSI CL 标准流函数：`open-stream-p`、`stream-element-type`、`read-char-no-hang`、`read-preserving-whitespace`、`set-syntax-from-char`、`file-string-length` — 已修复（添加 Go 实现到 streams.go）
+
+172. 缺少 ANSI CL 环境函数：`lisp-implementation-type`、`lisp-implementation-version`、`machine-type`、`machine-version`、`machine-instance`、`software-type`、`software-version`、`short-site-name`、`long-site-name` — 已修复（添加 Go 实现）
+
+173. 缺少 ANSI CL 时间函数：`decode-universal-time`、`encode-universal-time` — 已修复（decode 返回9个多值：秒分时日月年星期夏令时时区，encode 接受6+参数返回通用时间）
+
+174. `invoke-restart` 未传递 restart ID（`restartInvoke` 结构体的 id 字段始终为0，导致 `restart-case` 无法精确匹配重启入口）— 已修复（builtinInvokeRestart 在 panic 时传递 `r.id`）
+
+175. 缺少 ANSI CL 标准流变量：`*standard-input*`、`*error-output*`、`*query-io*`、`*terminal-io*` 未绑定到全局环境 — 已修复（initStdStreams 中添加 Set 调用绑定这些变量）
+
+176. `restart-case` 中 `conditionError` 传播时过早截断 restartStack，导致外层 handler-case 无法通过 invoke-restart 激活重启 — 注：这是一个深层架构问题，需要重大重构 restart-case 的 defer 机制
+
+## 新修复的 Bug（本次会话 — 第七轮）
+
+177. `copy-structure` 标准函数缺失 — 已修复（添加 builtinCopyStructure Go 函数，对 VInstance 浅拷贝 instSlots map）
+
+178. `user-homedir-pathname` 标准函数缺失 — 已修复（添加 builtinUserHomedirPathname，使用 os.UserHomeDir 获取主目录路径并构建 pathname）
+
+179. `ldb-test` 标准函数缺失 — 已修复（添加 builtinLdbTest，返回指定位域是否非零）
+
+180. `mask-field` 标准函数缺失 — 已修复（添加 builtinMaskField，返回指定位域的值，语义等同于 ldb）
+
+181. `deposit-field` 标准函数缺失 — 已修复（添加 builtinDepositField，将新字节值插入指定位域，语义等同于 dpb 但参数顺序不同）
+
+182. `asin`/`acos` 标准函数缺失 — 已修复（添加 builtinAsin 和 builtinAcos，使用 math.Asin/math.Acos 实现，对超出 [-1,1] 范围的参数返回复数）
+
+183. `rationalize` 标准函数缺失 — 已修复（添加 builtinRationalize，使用 big.Rat.SetFloat64 将浮点数转为有理数）
+
+184. `internal-time-units-per-second` 标准函数/常量缺失 — 已修复（在 initLib 中定义为返回 1000000 的函数）
+
+185. `get-decoded-time` 标准函数缺失 — 已修复（在 initLib 中定义为调用 decode-universal-time 的便捷函数）
+
+186. `with-open-stream` 标准宏缺失 — 已修复（在 initLib 中定义为 unwind-protect + close 包装）
+
+187. `with-input-from-string` 标准宏缺失 — 已修复（在 initLib 中定义为 make-string-input-stream + unwind-protect 包装）
+
+188. `with-output-to-string` 标准宏缺失 — 已修复（在 initLib 中定义为 make-string-output-stream + get-output-stream-string 包装）
+
+189. `pprint`/`pp` 标准函数缺失 — 已修复（在 initLib 中定义为绑定 *print-pretty* 为 true 后调用 princ + terpri）
+
+190. `pprint-newline`/`pprint-dispatch`/`pprint-tab`/`pprint-logical-block`/`pprint-pop`/`pprint-exit-if-list-exhausted` 标准函数缺失 — 已修复（添加为 stub 实现，pprint-logical-block 为宏）
+
+191. `with-package-iterator` 标准宏缺失 — 已修复（添加为简化 stub 宏）
+
+192. `make-echo-stream` 标准函数缺失 — 已修复（添加 builtinMakeEchoStream，LispStream 添加 isEcho 字段，readChar 中 echo 模式将读取字符写入输出流）
+
+193. `echo-stream-p`/`string-stream-p`/`echo-stream-input-stream`/`echo-stream-output-stream` 标准函数缺失 — 已修复（添加 Go 实现到 streams.go）
+
+194. `unuse-package` 标准函数缺失 — 已修复（添加 builtinUnusePackage，从包的 used 列表中移除指定包）
+
+195. `room` 标准函数缺失 — 已修复（添加 builtinRoom，使用 runtime.ReadMemStats 报告内存使用情况）
+
+196. `make-load-form`/`make-load-form-saving-slots` 标准函数缺失 — 已修复（添加 Go 基础实现）
+
+197. ANSI CL 浮点常量缺失（`most-positive-single-float`、`most-positive-double-float`、`least-positive-single-float` 等） — 已修复（在 initGlobalEnv 中添加 26 个浮点常量）
+
+198. ANSI CL `boole-xxx` 常量缺失（`boole-clr`、`boole-and`、`boole-ior` 等 16 个） — 已修复（在 initGlobalEnv 中添加，值 0-15 对应 builtinBoole 中的 switch 分支）

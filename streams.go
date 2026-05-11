@@ -82,7 +82,12 @@ func (s *LispStream) readChar() (rune, error) {
 	}
 	// Two-way stream: read from input
 	if s.isTwoWay {
-		return s.twoWayInput.stream.readChar()
+		r, err := s.twoWayInput.stream.readChar()
+		if err == nil && s.isEcho {
+			// Echo the character to the output stream
+			s.twoWayOutput.stream.writeChar(r)
+		}
+		return r, err
 	}
 	// Unread buffer takes priority
 	if len(s.unreadBuf) > 0 {
@@ -485,6 +490,116 @@ func builtinStreamOutputP(args []*Value) (*Value, error) {
 		return vbool(false), nil
 	}
 	return vbool(args[0].stream.isOutput), nil
+}
+
+func builtinOpenStreamP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	if args[0].typ != VStream {
+		return vbool(false), nil
+	}
+	return vbool(!args[0].stream.isClosed), nil
+}
+
+func builtinStreamElementType(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("stream-element-type: need a stream")
+	}
+	if args[0].typ != VStream {
+		return nil, fmt.Errorf("stream-element-type: not a stream")
+	}
+	return vsym("CHARACTER"), nil
+}
+
+func builtinReadCharNoHang(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("read-char-no-hang: need a stream")
+	}
+	stream := args[0]
+	if stream.typ != VStream || stream.stream == nil {
+		return nil, fmt.Errorf("read-char-no-hang: not a stream")
+	}
+	s := stream.stream
+	if s.isClosed {
+		return nil, fmt.Errorf("read-char-no-hang: stream is closed")
+	}
+	if !s.isInput {
+		return nil, fmt.Errorf("read-char-no-hang: not an input stream")
+	}
+	// Try non-blocking read: check if data is available
+	if s.reader != nil {
+		if s.reader.Buffered() > 0 {
+			r, _, err := s.reader.ReadRune()
+			if err != nil {
+				return vnil(), nil
+			}
+			return vchar(r), nil
+		}
+	}
+	if s.strReader != nil {
+		if s.strReader.Len() > 0 {
+			r, _, err := s.strReader.ReadRune()
+			if err != nil {
+				return vnil(), nil
+			}
+			return vchar(r), nil
+		}
+	}
+	// No data available without blocking
+	return vnil(), nil
+}
+
+func builtinSetSyntaxFromChar(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("set-syntax-from-char: need to-char and from-char")
+	}
+	toChar := args[0]
+	fromChar := args[1]
+	if toChar.typ != VChar || fromChar.typ != VChar {
+		return nil, fmt.Errorf("set-syntax-from-char: arguments must be characters")
+	}
+	toR := toChar.ch
+	fromR := fromChar.ch
+	// Get the current readtable
+	rt := currentReadtable
+	if rt == nil {
+		return nil, fmt.Errorf("set-syntax-from-char: no current readtable")
+	}
+	// Copy macro function from from-char to to-char in the current readtable
+	if rt.macroFns != nil {
+		if fn, ok := rt.macroFns[fromR]; ok {
+			rt.macroFns[toR] = fn
+		} else {
+			delete(rt.macroFns, toR)
+		}
+	}
+	return vbool(true), nil
+}
+
+func builtinReadPreservingWhitespace(args []*Value) (*Value, error) {
+	// read-preserving-whitespace behaves like read for now
+	// (the difference is that trailing whitespace is preserved, which
+	// requires deeper integration with the reader)
+	var readArgs []*Value
+	if len(args) > 0 && args[0].typ == VStream {
+		readArgs = args
+	}
+	return builtinRead(readArgs)
+}
+
+func builtinFileStringLength(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("file-string-length: need stream and object")
+	}
+	stream := args[0]
+	obj := args[1]
+	if stream.typ != VStream || stream.stream == nil {
+		return nil, fmt.Errorf("file-string-length: not a stream")
+	}
+	// Return the length the string representation would have
+	str := writeToString(obj)
+	return vnum(float64(len(str))), nil
 }
 
 func builtinReadChar(args []*Value) (*Value, error) {
@@ -923,6 +1038,23 @@ func newConcatenatedStream(streams []*Value) *Value {
 	return v
 }
 
+func newEchoStream(input, output *Value) *Value {
+	// Echo stream: reads from input, echoes to output
+	// We use two-way stream with echo mode
+	stream := &LispStream{
+		isTwoWay:     true,
+		isInput:      true,
+		isOutput:     true,
+		isEcho:       true,
+		twoWayInput:  input,
+		twoWayOutput: output,
+	}
+	v := gcv()
+	v.typ = VStream
+	v.stream = stream
+	return v
+}
+
 func newTwoWayStream(input, output *Value) *Value {
 	stream := &LispStream{
 		isTwoWay:     true,
@@ -992,6 +1124,21 @@ func builtinMakeTwoWayStream(args []*Value) (*Value, error) {
 	return newTwoWayStream(input, output), nil
 }
 
+func builtinMakeEchoStream(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("make-echo-stream: need input and output streams")
+	}
+	input := args[0]
+	output := args[1]
+	if input.typ != VStream {
+		return nil, fmt.Errorf("make-echo-stream: expected input stream")
+	}
+	if output.typ != VStream {
+		return nil, fmt.Errorf("make-echo-stream: expected output stream")
+	}
+	return newEchoStream(input, output), nil
+}
+
 func builtinSynonymStreamP(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return vbool(false), nil
@@ -1030,6 +1177,46 @@ func builtinTwoWayStreamP(args []*Value) (*Value, error) {
 		return vbool(false), nil
 	}
 	return vbool(args[0].stream.isTwoWay), nil
+}
+
+func builtinEchoStreamP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	if args[0].typ != VStream {
+		return vbool(false), nil
+	}
+	return vbool(args[0].stream.isEcho), nil
+}
+
+func builtinStringStreamP(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vbool(false), nil
+	}
+	if args[0].typ != VStream {
+		return vbool(false), nil
+	}
+	return vbool(args[0].stream.isString), nil
+}
+
+func builtinEchoStreamInputStream(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	if args[0].typ != VStream || !args[0].stream.isEcho {
+		return nil, fmt.Errorf("echo-stream-input-stream: expected an echo stream")
+	}
+	return args[0].stream.twoWayInput, nil
+}
+
+func builtinEchoStreamOutputStream(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return vnil(), nil
+	}
+	if args[0].typ != VStream || !args[0].stream.isEcho {
+		return nil, fmt.Errorf("echo-stream-output-stream: expected an echo stream")
+	}
+	return args[0].stream.twoWayOutput, nil
 }
 
 func builtinSynonymStreamSymbol(args []*Value) (*Value, error) {

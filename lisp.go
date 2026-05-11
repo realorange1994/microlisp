@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -82,6 +83,7 @@ type LispStream struct {
 	isTwoWay         bool
 	twoWayInput      *Value // input stream
 	twoWayOutput     *Value // output stream
+	isEcho           bool   // echo-stream: echo reads to output
 	// Peek/unread support
 	peekedChar rune   // cached peeked character
 	hasPeeked  bool   // whether peekedChar is valid
@@ -160,11 +162,12 @@ type genMethod struct {
 }
 
 type HashTable struct {
-	testFn     *Value
-	hashFn     *Value
-	table      map[uint64][]*hashEntry
-	count      int
-	rehashSize float64
+	testFn          *Value
+	hashFn          *Value
+	table           map[uint64][]*hashEntry
+	count           int
+	rehashSize      float64
+	rehashThreshold float64
 }
 
 type hashEntry struct {
@@ -270,6 +273,7 @@ var threadChannelsMu sync.Mutex
 // Stream globals
 var stdoutStream *Value
 var stdinStream *Value
+var stderrStream *Value
 
 // Condition system globals
 type handlerEntry struct {
@@ -413,6 +417,12 @@ func featureSatisfiedEnv(spec *Value, env *Env, seen map[*Value]bool) bool {
 func initStdStreams() {
 	stdoutStream = newFileStream(os.Stdout, false, true, "")
 	stdinStream = newFileStream(os.Stdin, true, false, "")
+	stderrStream = newFileStream(os.Stderr, false, true, "")
+	globalEnv.Set("*standard-output*", stdoutStream)
+	globalEnv.Set("*standard-input*", stdinStream)
+	globalEnv.Set("*error-output*", stderrStream)
+	globalEnv.Set("*query-io*", stdinStream) // Default query-io uses stdin/stdout
+	globalEnv.Set("*terminal-io*", stdoutStream) // Default terminal-io
 }
 
 func initGlobalEnv() {
@@ -483,6 +493,50 @@ func initGlobalEnv() {
 		globalEnv.Set("pi", vnum(math.Pi))
 		globalEnv.Set("most-positive-fixnum", vnum(4611686018427387903))
 		globalEnv.Set("most-negative-fixnum", vnum(-4611686018427387904))
+		// CL floating-point constants (float64 values)
+		globalEnv.Set("most-positive-single-float", vfloat(math.MaxFloat32))
+		globalEnv.Set("most-positive-double-float", vfloat(math.MaxFloat64))
+		globalEnv.Set("most-positive-long-float", vfloat(math.MaxFloat64))
+		globalEnv.Set("most-positive-short-float", vfloat(math.MaxFloat32))
+		globalEnv.Set("least-positive-single-float", vfloat(math.SmallestNonzeroFloat32))
+		globalEnv.Set("least-positive-double-float", vfloat(math.SmallestNonzeroFloat64))
+		globalEnv.Set("least-positive-long-float", vfloat(math.SmallestNonzeroFloat64))
+		globalEnv.Set("least-positive-short-float", vfloat(math.SmallestNonzeroFloat32))
+		globalEnv.Set("least-positive-normalized-single-float", vfloat(math.Float64frombits(0x00800000)))
+		globalEnv.Set("least-positive-normalized-double-float", vfloat(math.Float64frombits(0x0010000000000000)))
+		globalEnv.Set("most-negative-single-float", vfloat(-math.MaxFloat32))
+		globalEnv.Set("most-negative-double-float", vfloat(-math.MaxFloat64))
+		globalEnv.Set("most-negative-long-float", vfloat(-math.MaxFloat64))
+		globalEnv.Set("most-negative-short-float", vfloat(-math.MaxFloat32))
+		globalEnv.Set("least-negative-single-float", vfloat(-math.SmallestNonzeroFloat32))
+		globalEnv.Set("least-negative-double-float", vfloat(-math.SmallestNonzeroFloat64))
+		globalEnv.Set("least-negative-long-float", vfloat(-math.SmallestNonzeroFloat64))
+		globalEnv.Set("least-negative-short-float", vfloat(-math.SmallestNonzeroFloat32))
+		globalEnv.Set("least-negative-normalized-single-float", vfloat(-math.Float64frombits(0x00800000)))
+		globalEnv.Set("least-negative-normalized-double-float", vfloat(-math.Float64frombits(0x0010000000000000)))
+		globalEnv.Set("single-float-epsilon", vfloat(math.Float64frombits(0x3CB0000000000000)))
+		globalEnv.Set("double-float-epsilon", vfloat(math.Float64frombits(0x3CB0000000000000)))
+		globalEnv.Set("short-float-epsilon", vfloat(math.Float64frombits(0x3CB0000000000000)))
+		globalEnv.Set("long-float-epsilon", vfloat(math.Float64frombits(0x3CB0000000000000)))
+		globalEnv.Set("single-float-negative-epsilon", vfloat(math.Float64frombits(0x3C90000000000000)))
+		globalEnv.Set("double-float-negative-epsilon", vfloat(math.Float64frombits(0x3C90000000000000)))
+		// CL boole operation constants (ANSI CL standard)
+		globalEnv.Set("boole-clr", vnum(0))
+		globalEnv.Set("boole-and", vnum(1))
+		globalEnv.Set("boole-andc1", vnum(2))
+		globalEnv.Set("boole-1", vnum(3))
+		globalEnv.Set("boole-andc2", vnum(4))
+		globalEnv.Set("boole-2", vnum(5))
+		globalEnv.Set("boole-xor", vnum(6))
+		globalEnv.Set("boole-ior", vnum(7))
+		globalEnv.Set("boole-nor", vnum(8))
+		globalEnv.Set("boole-eqv", vnum(9))
+		globalEnv.Set("boole-c2", vnum(10))
+		globalEnv.Set("boole-orc2", vnum(11))
+		globalEnv.Set("boole-c1", vnum(12))
+		globalEnv.Set("boole-orc1", vnum(13))
+		globalEnv.Set("boole-nand", vnum(14))
+		globalEnv.Set("boole-set", vnum(15))
 }
 
 // -------- GC --------
@@ -6633,6 +6687,12 @@ var builtins = []builtinDef{
 	{"input-stream-p", builtinStreamInputP},
 	{"stream-output-p", builtinStreamOutputP},
 	{"output-stream-p", builtinStreamOutputP},
+	{"open-stream-p", builtinOpenStreamP},
+	{"stream-element-type", builtinStreamElementType},
+	{"read-char-no-hang", builtinReadCharNoHang},
+	{"read-preserving-whitespace", builtinReadPreservingWhitespace},
+	{"set-syntax-from-char", builtinSetSyntaxFromChar},
+	{"file-string-length", builtinFileStringLength},
 	{"interactive-stream-p", builtinInteractiveStreamP},
 	{"listen", builtinListen},
 	{"clear-input", builtinClearInput},
@@ -6645,10 +6705,15 @@ var builtins = []builtinDef{
 	{"make-broadcast-stream", builtinMakeBroadcastStream},
 	{"make-concatenated-stream", builtinMakeConcatenatedStream},
 	{"make-two-way-stream", builtinMakeTwoWayStream},
+	{"make-echo-stream", builtinMakeEchoStream},
 	{"synonym-stream-p", builtinSynonymStreamP},
 	{"broadcast-stream-p", builtinBroadcastStreamP},
 	{"concatenated-stream-p", builtinConcatenatedStreamP},
 	{"two-way-stream-p", builtinTwoWayStreamP},
+	{"echo-stream-p", builtinEchoStreamP},
+	{"string-stream-p", builtinStringStreamP},
+	{"echo-stream-input-stream", builtinEchoStreamInputStream},
+	{"echo-stream-output-stream", builtinEchoStreamOutputStream},
 	{"synonym-stream-symbol", builtinSynonymStreamSymbol},
 	{"broadcast-stream-streams", builtinBroadcastStreamStreams},
 	{"concatenated-stream-streams", builtinConcatenatedStreamStreams},
@@ -6685,6 +6750,9 @@ var builtins = []builtinDef{
 	{"%loop-check", builtinLoopCheck},
 	{"type-of", builtinTypeOf},
 	{"describe", builtinDescribe},
+	{"room", builtinRoom},
+	{"make-load-form", builtinMakeLoadForm},
+	{"make-load-form-saving-slots", builtinMakeLoadFormSavingSlots},
 	{"documentation", builtinDocumentation},
 	{"apropos", builtinApropos},
 	{"apropos-list", builtinAproposList},
@@ -6776,6 +6844,7 @@ var builtins = []builtinDef{
 	{"package-shadowing-import-list", builtinPackageShadowingImportList},
 	{"import", builtinImport},
 	{"use-package", builtinUsePackage},
+	{"unuse-package", builtinUnusePackage},
 	{"shadow", builtinShadow},
 	{"unintern", builtinUnintern},
 	{"shadowing-import", builtinShadowingImport},
@@ -6816,6 +6885,7 @@ var builtins = []builtinDef{
 	{"hash-table?", builtinHashTableP},
 	{"hash-table-size", builtinHashTableSize},
 	{"hash-table-rehash-size", builtinHashTableRehashSize},
+	{"hash-table-rehash-threshold", builtinHashTableRehashThreshold},
 	{"hash-table-test", builtinHashTableTest},
 	{"hash-table-keys", builtinHashTableKeys},
 	{"hash-table-values", builtinHashTableValues},
@@ -6863,9 +6933,21 @@ var builtins = []builtinDef{
 	{"copy-random-state", builtinCopyRandomState},
 	// Universal time
 	{"get-universal-time", builtinGetUniversalTime},
+	{"decode-universal-time", builtinDecodeUniversalTime},
+	{"encode-universal-time", builtinEncodeUniversalTime},
 	{"get-internal-real-time", builtinGetInternalRealTime},
 	{"get-internal-run-time", builtinGetInternalRunTime},
 	{"sleep", builtinSleep},
+	// Environment functions
+	{"lisp-implementation-type", builtinLispImplementationType},
+	{"lisp-implementation-version", builtinLispImplementationVersion},
+	{"machine-type", builtinMachineType},
+	{"machine-version", builtinMachineVersion},
+	{"machine-instance", builtinMachineInstance},
+	{"software-type", builtinSoftwareType},
+	{"software-version", builtinSoftwareVersion},
+	{"short-site-name", builtinShortSiteName},
+	{"long-site-name", builtinLongSiteName},
 	// CL bit aliases
 	{"bit-and", builtinBitAnd},
 	{"bit-ior", builtinBitIor},
@@ -6923,8 +7005,10 @@ var builtins = []builtinDef{
 	{"subst", builtinSubst},
 	{"sublis", builtinSublis},
 	{"subst-if", builtinSubstIf},
+	{"subst-if-not", builtinSubstIfNot},
 	{"nsubst", builtinNsubst},
 	{"nsubst-if", builtinNsubstIf},
+	{"nsubst-if-not", builtinNsubstIfNot},
 	{"nsublis", builtinNsublis},
 	{"tree-equal", builtinTreeEqual},
 	{"map-into", builtinMapInto},
@@ -6940,6 +7024,7 @@ var builtins = []builtinDef{
 	{"nset-difference", builtinSetDifference},
 	{"subsetp", builtinSubsetp},
 	{"copy-list", builtinCopyList},
+	{"copy-structure", builtinCopyStructure},
 	{"copy-alist", builtinCopyAlist},
 	{"copy-tree", builtinCopyTree},
 	{"list-length", builtinListLength},
@@ -7053,6 +7138,9 @@ var builtins = []builtinDef{
 	{"tan", builtinTan},
 	{"atan", builtinAtan},
 	{"atan2", builtinAtan2},
+	{"asin", builtinAsin},
+	{"acos", builtinAcos},
+	{"rationalize", builtinRationalize},
 	{"exp", builtinExp},
 	{"sinh", builtinSinh},
 	{"cosh", builtinCosh},
@@ -7117,6 +7205,9 @@ var builtins = []builtinDef{
 	{"byte-position", builtinBytePosition},
 	{"ldb", builtinLdb},
 	{"dpb", builtinDpb},
+	{"ldb-test", builtinLdbTest},
+	{"mask-field", builtinMaskField},
+	{"deposit-field", builtinDepositField},
 	{"boole", builtinBoole},
 	{"coerce", builtinCoerce},
 	// Pathname operations
@@ -7136,6 +7227,7 @@ var builtins = []builtinDef{
 	{"enough-namestring", builtinEnoughNamestring},
 	{"merge-pathnames", builtinMergePathnames},
 	{"pathnamep", builtinPathnamep},
+	{"user-homedir-pathname", builtinUserHomedirPathname},
 	{"probe-file", builtinProbeFile},
 	{"delete-file", builtinDeleteFile},
 	{"rename-file", builtinRenameFile},
@@ -7589,6 +7681,28 @@ func builtinMergePathnames(args []*Value) (*Value, error) {
 		result.version = dp.version
 	}
 	return vpathname(result), nil
+}
+
+func builtinUserHomedirPathname(args []*Value) (*Value, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "/"
+	}
+	// Split home path into directory components
+	parts := strings.Split(strings.TrimRight(home, "/\\"), string(os.PathSeparator))
+	dirList := vnil()
+	for i := len(parts) - 1; i >= 0; i-- {
+		if parts[i] != "" {
+			dirList = cons(vstr(parts[i]), dirList)
+		}
+	}
+	dirList = cons(vsym(":ABSOLUTE"), dirList)
+	p := &LispPathname{
+		directory: dirList,
+		name:      "",
+		ftype:     "",
+	}
+	return vpathname(p), nil
 }
 
 func builtinPathnamep(args []*Value) (*Value, error) {
@@ -10328,6 +10442,61 @@ func builtinDescribe(args []*Value) (*Value, error) {
 		sb.WriteString("\n")
 	}
 	return vstr(sb.String()), nil
+}
+
+// -------- room --------
+func builtinRoom(args []*Value) (*Value, error) {
+	var verbose bool
+	if len(args) > 0 {
+		verbose = !isNil(args[0])
+	}
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	fmt.Fprintf(os.Stderr, "Dynamic Space Usage: %d bytes allocated, %d bytes total\n", m.Alloc, m.TotalAlloc)
+	if verbose {
+		fmt.Fprintf(os.Stderr, "  HeapSys: %d bytes\n", m.HeapSys)
+		fmt.Fprintf(os.Stderr, "  HeapAlloc: %d bytes\n", m.HeapAlloc)
+		fmt.Fprintf(os.Stderr, "  HeapIdle: %d bytes\n", m.HeapIdle)
+		fmt.Fprintf(os.Stderr, "  HeapReleased: %d bytes\n", m.HeapReleased)
+		fmt.Fprintf(os.Stderr, "  NumGC: %d\n", m.NumGC)
+	}
+	return vnil(), nil
+}
+
+// -------- make-load-form --------
+func builtinMakeLoadForm(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("make-load-form: need an object")
+	}
+	// Default: return (make-load-form-saving-slots object) if the object is a structure
+	if args[0].typ == VInstance {
+		return vsym("MAKE-LOAD-FORM-SAVING-SLOTS"), nil
+	}
+	return vnil(), fmt.Errorf("make-load-form: cannot make load form for %s", typeStr(args[0]))
+}
+
+// -------- make-load-form-saving-slots --------
+func builtinMakeLoadFormSavingSlots(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("make-load-form-saving-slots: need an object")
+	}
+	if args[0].typ != VInstance {
+		return nil, fmt.Errorf("make-load-form-saving-slots: expected a structure")
+	}
+	inst := args[0]
+	slotNames := listFromSlice([]*Value{})
+	if inst.instClass != nil {
+		// Try to get slot names from the class
+		class := globalEnv.bindings[inst.instClass.str]
+		if class != nil && class.typ == VClass {
+			for _, sn := range class.classSlots {
+				slotNames = cons(vstr(sn), slotNames)
+			}
+		}
+	}
+	// Return: (make-load-form-saving-slots-helper object slot-names)
+	// For simplicity, return a list form
+	return listFromSlice([]*Value{vsym("MAKE-LOAD-FORM-SAVING-SLOTS-HELPERS"), inst, slotNames}), nil
 }
 
 // docstrings stores documentation strings: map[symbolName_docType] -> docstring
@@ -13203,6 +13372,32 @@ func useOnePackage(v *Value) error {
 	return nil
 }
 
+func builtinUnusePackage(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("unuse-package: need package name(s)")
+	}
+	srcPkg := resolvePackageFromDesignator(primaryValue(args[0]))
+	if srcPkg == nil {
+		return nil, fmt.Errorf("unuse-package: package not found")
+	}
+	pkg := currentPackage
+	if len(args) >= 2 {
+		pkg2 := resolvePackageFromDesignator(primaryValue(args[1]))
+		if pkg2 != nil {
+			pkg = pkg2
+		}
+	}
+	// Remove srcPkg from used list
+	newUsed := make([]*Package, 0, len(pkg.used))
+	for _, p := range pkg.used {
+		if p != srcPkg {
+			newUsed = append(newUsed, p)
+		}
+	}
+	pkg.used = newUsed
+	return vbool(true), nil
+}
+
 func builtinShadow(args []*Value) (*Value, error) {
 	if len(args) < 1 || args[0].typ != VSym {
 		return nil, fmt.Errorf("shadow: need symbol")
@@ -14358,8 +14553,9 @@ func builtinSxhash(args []*Value) (*Value, error) {
 
 func builtinMakeHashTable(args []*Value) (*Value, error) {
 	ht := &HashTable{
-		table:      make(map[uint64][]*hashEntry),
-		rehashSize: 1.5,
+		table:           make(map[uint64][]*hashEntry),
+		rehashSize:      1.5,
+		rehashThreshold: 1.0,
 	}
 	// Parse keyword args
 	for i := 0; i < len(args); i++ {
@@ -14385,6 +14581,14 @@ func builtinMakeHashTable(args []*Value) (*Value, error) {
 					rsz := toNum(primaryValue(args[i]))
 					if rsz > 0 {
 						ht.rehashSize = rsz
+					}
+				}
+			case ":REHASH-THRESHOLD":
+				if i+1 < len(args) {
+					i++
+					rt := toNum(primaryValue(args[i]))
+					if rt > 0 {
+						ht.rehashThreshold = rt
 					}
 				}
 			}
@@ -14545,7 +14749,7 @@ func builtinHashTableSize(args []*Value) (*Value, error) {
 	if ht.typ != VVHash || ht.hashTab == nil {
 		return nil, fmt.Errorf("hash-table-size: not a hash table")
 	}
-	return vnum(float64(ht.hashTab.count)), nil
+	return vnum(float64(len(ht.hashTab.table))), nil
 }
 
 func builtinHashTableTest(args []*Value) (*Value, error) {
@@ -14605,6 +14809,17 @@ func builtinHashTableRehashSize(args []*Value) (*Value, error) {
 		return nil, fmt.Errorf("hash-table-rehash-size: not a hash table")
 	}
 	return vnum(args[0].hashTab.rehashSize), nil
+}
+
+func builtinHashTableRehashThreshold(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("hash-table-rehash-threshold: need hash-table")
+	}
+	ht := args[0]
+	if ht.typ != VVHash || ht.hashTab == nil {
+		return nil, fmt.Errorf("hash-table-rehash-threshold: not a hash table")
+	}
+	return vnum(ht.hashTab.rehashThreshold), nil
 }
 
 func builtinPush(args []*Value) (*Value, error) {
@@ -14776,6 +14991,80 @@ func builtinGetUniversalTime(args []*Value) (*Value, error) {
 
 func builtinGetInternalRealTime(args []*Value) (*Value, error) {
 	return vnum(float64(time.Now().UnixNano() / int64(time.Millisecond))), nil
+}
+
+func builtinDecodeUniversalTime(args []*Value) (*Value, error) {
+	var ut float64
+	if len(args) > 0 {
+		ut = toNum(primaryValue(args[0]))
+	} else {
+		ut = float64(time.Now().Unix() + 2208988800)
+	}
+	t := time.Unix(int64(ut)-2208988800, 0)
+	seconds := vnum(float64(t.Second()))
+	minutes := vnum(float64(t.Minute()))
+	hours := vnum(float64(t.Hour()))
+	day := vnum(float64(t.Day()))
+	month := vnum(float64(t.Month()))
+	year := vnum(float64(t.Year()))
+	dayOfWeek := vnum(float64(t.Weekday()))
+	daylightSavingsP := vbool(false)
+	timezone := vnum(0)
+	return multiVal(seconds, minutes, hours, day, month, year, dayOfWeek, daylightSavingsP, timezone), nil
+}
+
+func builtinEncodeUniversalTime(args []*Value) (*Value, error) {
+	if len(args) < 6 {
+		return nil, fmt.Errorf("encode-universal-time: need second minute hour day month year")
+	}
+	sec := int(toNum(primaryValue(args[0])))
+	min := int(toNum(primaryValue(args[1])))
+	hour := int(toNum(primaryValue(args[2])))
+	day := int(toNum(primaryValue(args[3])))
+	month := int(toNum(primaryValue(args[4])))
+	year := int(toNum(primaryValue(args[5])))
+	t := time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC)
+	return vnum(float64(t.Unix() + 2208988800)), nil
+}
+
+func builtinLispImplementationType(args []*Value) (*Value, error) {
+	return vstr("MicroLisp"), nil
+}
+
+func builtinLispImplementationVersion(args []*Value) (*Value, error) {
+	return vstr("0.1.0"), nil
+}
+
+func builtinMachineType(args []*Value) (*Value, error) {
+	return vstr(runtime.GOARCH), nil
+}
+
+func builtinMachineVersion(args []*Value) (*Value, error) {
+	return vstr(""), nil
+}
+
+func builtinMachineInstance(args []*Value) (*Value, error) {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	return vstr(hostname), nil
+}
+
+func builtinSoftwareType(args []*Value) (*Value, error) {
+	return vstr(runtime.GOOS), nil
+}
+
+func builtinSoftwareVersion(args []*Value) (*Value, error) {
+	return vstr(""), nil
+}
+
+func builtinShortSiteName(args []*Value) (*Value, error) {
+	return vstr(""), nil
+}
+
+func builtinLongSiteName(args []*Value) (*Value, error) {
+	return vstr(""), nil
 }
 
 var processStartTime = time.Now()
@@ -16293,6 +16582,35 @@ func builtinSubstIf(args []*Value) (*Value, error) {
 	return helper(tree), nil
 }
 
+// -------- subst-if-not --------
+func builtinSubstIfNot(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("subst-if-not: need new, predicate, and tree")
+	}
+	newVal := args[0]
+	pred := args[1]
+	tree := args[2]
+	visited := make(map[*Value]bool)
+	var helper func(t *Value) *Value
+	helper = func(t *Value) *Value {
+		if visited[t] {
+			return t
+		}
+		if t.typ == VPair {
+			visited[t] = true
+		}
+		result, err := callFnOnSeq(pred, []*Value{t}, globalEnv)
+		if err == nil && !isTruthy(result) {
+			return newVal
+		}
+		if t.typ == VPair {
+			return cons(helper(t.car), helper(t.cdr))
+		}
+		return t
+	}
+	return helper(tree), nil
+}
+
 // -------- nsubst / nsubst-if / nsublis --------
 func builtinNsubst(args []*Value) (*Value, error) {
 	if len(args) < 3 {
@@ -16330,6 +16648,32 @@ func builtinNsubstIf(args []*Value) (*Value, error) {
 	helper = func(t *Value) *Value {
 		result, err := callFnOnSeq(pred, []*Value{t}, globalEnv)
 		if err == nil && isTruthy(result) {
+			return newVal
+		}
+		if t.typ == VPair {
+			if visited[t] {
+				return t
+			}
+			visited[t] = true
+			t.car = helper(t.car)
+			t.cdr = helper(t.cdr)
+		}
+		return t
+	}
+	return helper(args[2]), nil
+}
+
+func builtinNsubstIfNot(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("nsubst-if-not: need new, predicate, and tree")
+	}
+	newVal := args[0]
+	pred := args[1]
+	visited := make(map[*Value]bool)
+	var helper func(t *Value) *Value
+	helper = func(t *Value) *Value {
+		result, err := callFnOnSeq(pred, []*Value{t}, globalEnv)
+		if err == nil && !isTruthy(result) {
 			return newVal
 		}
 		if t.typ == VPair {
@@ -16574,6 +16918,25 @@ func builtinSubsetp(args []*Value) (*Value, error) {
 		}
 	}
 	return vbool(true), nil
+}
+
+func builtinCopyStructure(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("copy-structure: need an instance")
+	}
+	inst := args[0]
+	if inst.typ != VInstance {
+		return nil, fmt.Errorf("copy-structure: expected a structure instance, got %s", typeStr(inst))
+	}
+	newSlots := make(map[string]*Value, len(inst.instSlots))
+	for k, v := range inst.instSlots {
+		newSlots[k] = v // shallow copy of slots
+	}
+	result := gcv()
+	result.typ = VInstance
+	result.instClass = inst.instClass
+	result.instSlots = newSlots
+	return result, nil
 }
 
 func builtinCopyList(args []*Value) (*Value, error) {
@@ -20713,6 +21076,64 @@ func builtinCis(args []*Value) (*Value, error) {
 	return vcomplex(math.Cos(radians), math.Sin(radians)), nil
 }
 
+// -------- asin --------
+func builtinAsin(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("asin: need a number")
+	}
+	n := toNum(args[0])
+	if args[0].typ == VComplex {
+		// complex asin: asin(z) = -i*log(iz + sqrt(1-z^2))
+		return nil, fmt.Errorf("asin: complex arguments not yet supported")
+	}
+	if n < -1 || n > 1 {
+		// Result is complex for |n| > 1
+		return vcomplex(0, math.Asin(n)), nil
+	}
+	return vnum(math.Asin(n)), nil
+}
+
+// -------- acos --------
+func builtinAcos(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("acos: need a number")
+	}
+	n := toNum(args[0])
+	if args[0].typ == VComplex {
+		return nil, fmt.Errorf("acos: complex arguments not yet supported")
+	}
+	if n < -1 || n > 1 {
+		return vcomplex(math.Acos(n), 0), nil
+	}
+	return vnum(math.Acos(n)), nil
+}
+
+// -------- rationalize --------
+func builtinRationalize(args []*Value) (*Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("rationalize: need a number")
+	}
+	v := args[0]
+	if v.typ == VRat {
+		return v, nil
+	}
+	n := toNum(v)
+	if n == math.Trunc(n) && !v.isFloat {
+		return vnum(n), nil
+	}
+	// Convert float to rational using continued fraction algorithm
+	frac := big.NewRat(1, 1)
+	frac.SetFloat64(n)
+	// Reduce to integer numerator/denominator
+	num := frac.Num()
+	den := frac.Denom()
+	if den.IsUint64() && num.IsUint64() {
+		return vrat(int64(num.Uint64()), int64(den.Uint64())), nil
+	}
+	// For very large values, just return as float
+	return vnum(n), nil
+}
+
 // -------- complex --------
 func builtinComplex(args []*Value) (*Value, error) {
 	if len(args) < 2 {
@@ -21207,6 +21628,68 @@ func builtinDpb(args []*Value) (*Value, error) {
 	bs := seqToList(args[1])
 	if len(bs) < 2 {
 		return nil, fmt.Errorf("dpb: invalid byte specifier")
+	}
+	size := int(toNum(bs[0]))
+	pos := int(toNum(bs[1]))
+	n := int64(toNum(args[2]))
+	if size <= 0 {
+		return args[2], nil // zero-width field: no change
+	}
+	if size > 63 {
+		size = 63
+	}
+	mask := int64((1 << uint(size)) - 1)
+	return vnum(float64((n & ^(mask << uint(pos))) | ((newByte & mask) << uint(pos)))), nil
+}
+
+// -------- Byte manipulation helpers --------
+func builtinLdbTest(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("ldb-test: need byte specifier and integer")
+	}
+	bs := seqToList(args[0])
+	if len(bs) < 2 {
+		return nil, fmt.Errorf("ldb-test: invalid byte specifier")
+	}
+	size := int(toNum(bs[0]))
+	pos := int(toNum(bs[1]))
+	n := int64(toNum(args[1]))
+	if size <= 0 || size > 63 {
+		return vbool(false), nil
+	}
+	mask := int64((1 << uint(size)) - 1)
+	return vbool(((n >> uint(pos)) & mask) != 0), nil
+}
+
+func builtinMaskField(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("mask-field: need byte specifier and integer")
+	}
+	bs := seqToList(args[0])
+	if len(bs) < 2 {
+		return nil, fmt.Errorf("mask-field: invalid byte specifier")
+	}
+	size := int(toNum(bs[0]))
+	pos := int(toNum(bs[1]))
+	n := int64(toNum(args[1]))
+	if size <= 0 {
+		return vnum(0), nil
+	}
+	if size > 63 {
+		size = 63
+	}
+	mask := int64((1 << uint(size)) - 1)
+	return vnum(float64((n >> uint(pos)) & mask)), nil
+}
+
+func builtinDepositField(args []*Value) (*Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("deposit-field: need newbyte, byte specifier, and integer")
+	}
+	newByte := int64(toNum(args[0]))
+	bs := seqToList(args[1])
+	if len(bs) < 2 {
+		return nil, fmt.Errorf("deposit-field: invalid byte specifier")
 	}
 	size := int(toNum(bs[0]))
 	pos := int(toNum(bs[1]))
@@ -25311,6 +25794,81 @@ var initLib = `
                                 (list 'values 'k (list 'gethash 'k ht) #t))
                           (list 'values 'nil 'nil 'nil)))))
             (cons 'progn body)))))
+
+;; -------- internal-time-units-per-second --------
+(define (internal-time-units-per-second) 1000000)
+
+;; -------- get-decoded-time --------
+;; Convenience: calls decode-universal-time on current universal time
+(define (get-decoded-time)
+  (decode-universal-time (get-universal-time)))
+
+;; -------- with-open-stream --------
+;; (with-open-stream (var stream-form) &body body)
+(define-macro (with-open-stream spec . body)
+  (let ((var (car spec))
+        (form (cadr spec)))
+    (list 'let (list (list var form))
+      (list 'unwind-protect
+            (cons 'progn body)
+            (list 'if var (list 'close var))))))
+
+;; -------- with-input-from-string --------
+;; (with-input-from-string (var string) &body body)
+(define-macro (with-input-from-string spec . body)
+  (let ((var (car spec))
+        (str (cadr spec)))
+    (list 'let (list (list var (list 'make-string-input-stream str)))
+      (list 'unwind-protect
+            (cons 'progn body)
+            (list 'close var)))))
+
+;; -------- with-output-to-string --------
+;; (with-output-to-string (var) &body body)
+(define-macro (with-output-to-string spec . body)
+  (let ((var (car spec)))
+    (list 'let (list (list var (list 'make-string-output-stream)))
+      (cons 'progn (append body
+        (list (list 'get-output-stream-string var)))))))
+
+;; -------- pprint --------
+;; Pretty-print a form to the current output stream
+(define (pprint obj)
+  (let ((*print-pretty* #t))
+    (princ obj)
+    (terpri)
+    obj))
+
+;; -------- pprint-newline --------
+(define (pprint-newline kind) nil)
+
+;; -------- pprint-dispatch --------
+(define (pprint-dispatch object) nil)
+
+;; -------- pprint-tab --------
+(define (pprint-tab kind col1 col2) nil)
+
+;; -------- pprint-logical-block --------
+(define-macro (pprint-logical-block spec . body)
+  (cons 'progn body))
+
+;; -------- pprint-pop / pprint-exit-if-list-exhausted --------
+(define (pprint-pop list) nil)
+(define (pprint-exit-if-list-exhausted) nil)
+
+;; -------- with-package-iterator --------
+(define-macro (with-package-iterator spec . body)
+  (cons 'progn body))
+
+;; -------- pp (alias for pprint) --------
+(define (pp obj)
+  (let ((*print-pretty* #t))
+    (princ obj)
+    (terpri)
+    obj))
+
+;; -------- copy-structure (Lisp-level wrapper) --------
+;; copy-structure is implemented as a Go builtin
 
 `
 
