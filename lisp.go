@@ -11143,32 +11143,69 @@ func arrayTotalSize(dims []int) int {
 func arrayFillRecursive(contents *Value, dims []int, elements []*Value, idx *int, visited map[*Value]bool) {
 	if len(dims) == 1 {
 		// Leaf level: fill elements directly
-		for !isNil(contents) {
-			if *idx >= len(elements) {
-				return
+		// Support both VPair (list) and VArray (vector) as contents
+		if contents.typ == VArray {
+			arr := contents.array
+			end := len(arr.elements)
+			if arr.fillPtr >= 0 && arr.fillPtr < end {
+				end = arr.fillPtr
 			}
-			if contents.typ == VPair {
-				if visited[contents] {
-					return // cycle detected
+			for i := 0; i < end; i++ {
+				if *idx >= len(elements) {
+					return
 				}
-				visited[contents] = true
+				elem := arr.elements[i]
+				if elem == nil {
+					elem = vnil()
+				}
+				elements[*idx] = elem
+				*idx++
 			}
-			elements[*idx] = contents.car
-			*idx++
-			contents = contents.cdr
+		} else {
+			for !isNil(contents) {
+				if *idx >= len(elements) {
+					return
+				}
+				if contents.typ == VPair {
+					if visited[contents] {
+						return // cycle detected
+					}
+					visited[contents] = true
+				}
+				elements[*idx] = contents.car
+				*idx++
+				contents = contents.cdr
+			}
 		}
 	} else {
 		// Nested: recurse into sublists
-		for !isNil(contents) {
-			if contents.typ == VPair {
-				if visited[contents] {
-					return // cycle detected
-				}
-				visited[contents] = true
+		// Support both VPair (list) and VArray (vector) as contents
+		if contents.typ == VArray {
+			arr := contents.array
+			end := len(arr.elements)
+			if arr.fillPtr >= 0 && arr.fillPtr < end {
+				end = arr.fillPtr
 			}
-			subDims := dims[1:]
-			arrayFillRecursive(contents.car, subDims, elements, idx, visited)
-			contents = contents.cdr
+			for i := 0; i < end; i++ {
+				subDims := dims[1:]
+				elem := arr.elements[i]
+				if elem == nil {
+					elem = vnil()
+				}
+				arrayFillRecursive(elem, subDims, elements, idx, visited)
+			}
+		} else {
+			for !isNil(contents) {
+				if contents.typ == VPair {
+					if visited[contents] {
+						return // cycle detected
+					}
+					visited[contents] = true
+				}
+				subDims := dims[1:]
+				arrayFillRecursive(contents.car, subDims, elements, idx, visited)
+				contents = contents.cdr
+			}
 		}
 	}
 }
@@ -13295,6 +13332,7 @@ func methodSpecificity(m genMethod, evArgs []*Value) int {
 			}
 		} else if isTypeSpecializerMatch(evArgs[0], sp) {
 			spUp := strings.ToUpper(sp)
+			// Score hierarchy: lower = more specific
 			switch spUp {
 			case "NULL":
 				baseScore = 1
@@ -13302,10 +13340,104 @@ func methodSpecificity(m genMethod, evArgs []*Value) int {
 				baseScore = 2
 			case "LIST":
 				baseScore = 3
+			case "SYMBOL":
+				baseScore = 10
+			case "STRING":
+				baseScore = 11
+			case "SIMPLE-STRING":
+				baseScore = 12
+			case "CHARACTER":
+				baseScore = 13
+			case "BASE-CHAR":
+				baseScore = 14
+			case "STANDARD-CHAR":
+				baseScore = 15
+			case "KEYWORD":
+				baseScore = 16
+			case "NUMBER":
+				baseScore = 200
+			case "REAL":
+				baseScore = 150
+			case "RATIONAL":
+				baseScore = 140
+			case "RATIO":
+				baseScore = 135
+			case "INTEGER":
+				baseScore = 130
+			case "FIXNUM":
+				baseScore = 120
+			case "BIGNUM":
+				baseScore = 115
+			case "BIT":
+				baseScore = 110
+			case "FLOAT":
+				baseScore = 145
+			case "SINGLE-FLOAT":
+				baseScore = 125
+			case "DOUBLE-FLOAT":
+				baseScore = 118
+			case "SHORT-FLOAT":
+				baseScore = 122
+			case "LONG-FLOAT":
+				baseScore = 112
+			case "COMPLEX":
+				baseScore = 160
+			case "SEQUENCE":
+				baseScore = 180
+			case "VECTOR":
+				baseScore = 165
+			case "ARRAY":
+				baseScore = 175
+			case "SIMPLE-VECTOR":
+				baseScore = 155
+			case "HASH-TABLE":
+				baseScore = 300
+			case "PACKAGE":
+				baseScore = 301
+			case "PATHNAME":
+				baseScore = 302
+			case "RANDOM-STATE":
+				baseScore = 303
+			case "READTABLE":
+				baseScore = 304
+			case "STREAM":
+				baseScore = 305
+			case "CLASS":
+				baseScore = 306
+			case "FUNCTION":
+				baseScore = 400
+			case "COMPILED-FUNCTION":
+				baseScore = 390
+			case "METHOD":
+				baseScore = 395
 			case "T":
 				baseScore = 999
 			default:
-				baseScore = 500
+				// For user-defined types, check subtype relationship with known types.
+				// Start with default score, then refine based on subtype relationships.
+				score := 500
+				// If sp is a subtype of a known type, give it a more specific score
+				for other, otherScore := range map[string]int{
+					"NUMBER": 200, "REAL": 150, "RATIONAL": 140, "INTEGER": 130,
+					"FIXNUM": 120, "BIGNUM": 115, "BIT": 110, "RATIO": 135,
+					"FLOAT": 145, "SINGLE-FLOAT": 125, "DOUBLE-FLOAT": 118,
+					"SHORT-FLOAT": 122, "LONG-FLOAT": 112, "COMPLEX": 160,
+					"SEQUENCE": 180, "LIST": 3, "VECTOR": 165, "ARRAY": 175,
+					"SIMPLE-VECTOR": 155, "STRING": 11, "CHARACTER": 13,
+					"SYMBOL": 10, "HASH-TABLE": 300, "STREAM": 305,
+					"PACKAGE": 301, "PATHNAME": 302, "RANDOM-STATE": 303,
+					"READTABLE": 304, "FUNCTION": 400, "CONS": 2, "NULL": 1,
+				} {
+					if other == spUp {
+						continue
+					}
+					if typeIsSubtype(spUp, other) {
+						if otherScore > 0 && otherScore <= score {
+							score = otherScore - 1
+						}
+					}
+				}
+				baseScore = score
 			}
 		}
 	}
@@ -13320,6 +13452,27 @@ func methodSpecificity(m genMethod, evArgs []*Value) int {
 		}
 	}
 	return baseScore
+}
+
+// subtypepCheck checks if typeA is a subtype of typeB using the built-in subtypep logic
+func subtypepCheck(typeA, typeB string, env *Env) bool {
+	return typeIsSubtype(strings.ToUpper(typeA), strings.ToUpper(typeB))
+}
+
+// typeIsSubtype checks if t1 is a subtype of t2 using the same hierarchy as subtypepChecks
+func typeIsSubtype(t1, t2 string) bool {
+	if t1 == t2 {
+		return true
+	}
+	types := map[string][]string{"INTEGER": {"RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "FLOAT": {"REAL", "NUMBER", "ATOM", "T"}, "RATIONAL": {"REAL", "NUMBER", "ATOM", "T"}, "COMPLEX": {"NUMBER", "ATOM", "T"}, "REAL": {"NUMBER", "ATOM", "T"}, "RATIO": {"RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "FIXNUM": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "BIGNUM": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "BIT": {"INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"}, "SHORT-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "SINGLE-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "DOUBLE-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "LONG-FLOAT": {"FLOAT", "REAL", "NUMBER", "ATOM", "T"}, "STRING": {"ARRAY", "VECTOR", "SEQUENCE", "ATOM", "T"}, "SIMPLE-STRING": {"STRING", "ARRAY", "VECTOR", "SEQUENCE", "ATOM", "T"}, "CHARACTER": {"ATOM", "T"}, "BASE-CHAR": {"STANDARD-CHAR", "CHARACTER", "ATOM", "T"}, "STANDARD-CHAR": {"CHARACTER", "ATOM", "T"}, "EXTENDED-CHAR": {"CHARACTER", "ATOM", "T"}, "SYMBOL": {"ATOM", "T"}, "KEYWORD": {"SYMBOL", "ATOM", "T"}, "NULL": {"SYMBOL", "LIST", "SEQUENCE", "ATOM", "T"}, "CONS": {"LIST", "SEQUENCE", "T"}, "PAIR": {"CONS", "LIST", "SEQUENCE", "T"}, "LIST": {"SEQUENCE", "T"}, "SEQUENCE": {"T"}, "VECTOR": {"ARRAY", "SEQUENCE", "T"}, "SIMPLE-VECTOR": {"VECTOR", "ARRAY", "SEQUENCE", "T"}, "ARRAY": {"T"}, "FUNCTION": {"T"}, "COMPILED-FUNCTION": {"FUNCTION", "T"}, "HASH-TABLE": {"T"}, "STREAM": {"T"}, "PACKAGE": {"T"}, "PATHNAME": {"T"}, "RANDOM-STATE": {"T"}, "READTABLE": {"T"}, "INSTANCE": {"T"}, "STRUCTURE": {"INSTANCE", "T"}, "METHOD": {"T"}, "BOOLEAN": {"ATOM", "T"}}
+	if subtypes, ok := types[t1]; ok {
+		for _, s := range subtypes {
+			if s == t2 {
+				return true
+			}
+		}
+	}
+	return false
 }
 // callNextMethodChain applies the next method(s) in a chain with the original arguments
 func callNextMethodChain(methods []genMethod, evArgs []*Value) (*Value, error) {
@@ -16169,7 +16322,22 @@ func builtinPairlis(args []*Value) (*Value, error) {
 	for i := 0; i < len(keys) && i < len(vals); i++ {
 		result = append(result, cons(keys[i], vals[i]))
 	}
-	return listFromSlice(result), nil
+	alist := vnil()
+	if len(args) >= 3 {
+		alist = args[2]
+	}
+	// Append result to alist: (nconc result alist)
+	if len(result) == 0 {
+		return alist, nil
+	}
+	res := listFromSlice(result)
+	// Find end of result list and set cdr to alist
+	t := res
+	for t.typ == VPair && !isNil(t.cdr) {
+		t = t.cdr
+	}
+	t.cdr = alist
+	return res, nil
 }
 
 // -------- assoc --------
@@ -16840,6 +17008,67 @@ func builtinNsubstituteIf(args []*Value) (*Value, error) {
 	keyFn, _, _, fromEnd, count, start, end, _, err := seqParseKeys(args, 3)
 	if err != nil {
 		return nil, err
+	}
+
+	// Handle VStr: strings are immutable in Go, so create a new one
+	if seq.typ == VStr {
+		runes := []rune(seq.str)
+		if end < 0 || end > len(runes) {
+			end = len(runes)
+		}
+		if start < 0 {
+			start = 0
+		}
+		replaced := 0
+		if fromEnd {
+			for i := end - 1; i >= start; i-- {
+				if count >= 0 && replaced >= count {
+					break
+				}
+				v := vchar(runes[i])
+				if !isNil(keyFn) {
+					v2, err2 := callFnOnSeq(keyFn, []*Value{v}, globalEnv)
+					if err2 != nil {
+						return nil, err2
+					}
+					v = v2
+				}
+				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
+				if perr == nil && isTruthy(predVal) {
+					if newVal.typ == VChar {
+						runes[i] = newVal.ch
+					} else if newVal.typ == VStr && len(newVal.str) == 1 {
+						runes[i] = rune(newVal.str[0])
+					}
+					replaced++
+				}
+			}
+		} else {
+			for i := start; i < end; i++ {
+				if count >= 0 && replaced >= count {
+					break
+				}
+				v := vchar(runes[i])
+				if !isNil(keyFn) {
+					v2, err2 := callFnOnSeq(keyFn, []*Value{vchar(runes[i])}, globalEnv)
+					if err2 != nil {
+						return nil, err2
+					}
+					v = v2
+				}
+				predVal, perr := callFnOnSeq(pred, []*Value{v}, globalEnv)
+				if perr == nil && isTruthy(predVal) {
+					if newVal.typ == VChar {
+						runes[i] = newVal.ch
+					} else if newVal.typ == VStr && len(newVal.str) == 1 {
+						runes[i] = rune(newVal.str[0])
+					}
+					replaced++
+				}
+			}
+		}
+		seq.str = string(runes)
+		return seq, nil
 	}
 
 	// Handle VArray: modify elements in-place

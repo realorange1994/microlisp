@@ -278,3 +278,13 @@
 152. `with-standard-io-syntax` 宏未实现 — 已修复（Go 初始化添加 *print-radix*/*print-readably*/*print-gensym*/*print-array*/*read-base*/*read-default-float-format*/*read-eval*/*read-suppress* 变量，defmacro 用 unwind-protect save/restore 所有 IO 变量）
 
 153. `with-hash-table-iterator` 宏未实现 — 已修复（实现为 let+macrolet 包装，内部绑定 hash-table-keys 和 index 计数器，迭代器宏返回 (values key value present-p) 三值）
+
+## 新修复的 Bug（本次会话 — 第六轮）
+
+154. `make-array` 对向量 `:initial-contents` 返回 `#(NIL NIL NIL)`（`arrayFillRecursive` 仅遍历 VPair 列表，不处理 VArray 向量）— 已修复（添加 VArray 分支遍历 arr.elements，支持单维和多维情况）
+
+155. CLOS 方法特化优先级不正确（`integer` 方法和 `number` 方法同时匹配整数参数时按定义顺序选择而非类型特化性）— 已修复（`methodSpecificity` 为所有内置类型添加分层分数：INTEGER=130 < RATIONAL=140 < REAL=150 < NUMBER=200，更具体的类型分数更低；添加 `typeIsSubtype` 全局函数用于默认分支的子类型判断）
+
+156. `pairlis` 不接受可选第三参数 `alist`（`(pairlis '(a b) '(1 2) '((c . 3)))` 应返回 `((A . 1) (B . 2) (C . 3))`）— 已修复（添加 `len(args) >= 3` 时取 `alist` 参数，nconc 结果到 alist）
+
+157. `nsubstitute-if` 不支持字符串输入（对字符串调用报错或返回原串）— 已修复（添加 VStr 分支，遍历 rune 切片，谓词匹配时替换字符，支持 :start/:end/:count/:from-end 关键字参数）
