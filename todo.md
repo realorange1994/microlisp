@@ -384,3 +384,13 @@
 201. `read-from-string` 不支持 `:start`/`:end` 关键字参数且返回的位置不正确（`builtinReadFromString` 完全忽略关键字参数，`parseExpr` 不返回位置信息）— 已修复（添加 `parseExprWithPos` 返回 `(value position)`，Lexer 添加 `prevEndPos` 字段在 `next()` 开头记录位置，`builtinReadFromString` 解析 `:start`/`:end`/`:eof-error-p`/`:eof-value` 关键字参数并返回 `(values obj original-pos)`）
 
 202. `merge` 对 `'string` 结果类型返回字符列表而非字符串（Lisp 包装器将结果类型传给 `seq-merge` 但被忽略，Go 函数总是返回 list）— 已修复（Lisp 包装器用 `coerce` 将 `seq-merge` 的结果转换为请求的类型）
+
+## 新修复的 Bug（本次会话 — 第九轮）
+
+203. `string=`/`string<`/`string>`/`string<=`/`string>=`/`string/=` 不支持 `:start1/:end1/:start2/:end2` 关键字参数（ANSI CL 标准要求这些函数支持关键字参数限制比较范围，如 `(string= "abcdef" "abcxyz" :start1 0 :end1 3 :start2 0 :end2 3)` 应返回 `#t`）— 已修复（添加 `strCmpKw` 结构体和 `parseStrCmpKwArgs`/`runesSlice` 辅助函数，重写全部 12 个字符串比较函数使用关键字参数解析和子串切片）
+
+204. `format ~g` 输出不必要尾随零（`(format nil "~g" 42.0)` 返回 `"42.0000"` 而非 `"42.0"`，`(format nil "~g" 0.000042)` 返回 `"4.20000e-05"` 而非 `"4.2E-5"`，定点格式在 decPlaces=0 时丢失小数点）— 已修复（固定格式去除尾随零但保留至少一位小数，指数格式去除尾数尾随零和前导零，decPlaces=0 时自动添加 ".0"）
+
+205. ANSI CL 位运算函数缺失（`lognand`、`lognor`、`logandc1`、`logandc2`、`logorc1`、`logorc2`）— 已修复（添加 `logAndInts` 辅助函数支持 int64/big.Int 双路径，实现 6 个函数：lognand=NOT(AND), lognor=NOT(IOR), logandc1=AND(NOT a, b), logandc2=AND(a, NOT b), logorc1=IOR(NOT a, b), logorc2=IOR(a, NOT b)）
+
+206. `array-element-type` 总是返回 `T`（ANSI CL 要求返回实际元素类型，如 `(array-element-type (make-array 5 :element-type 'character))` 应返回 `CHARACTER`，`(array-element-type "hello")` 应返回 `CHARACTER`）— 已修复（`LispArray` 添加 `elemType` 字段，`make-array` 解析 `:element-type` 关键字参数，`array-element-type` 对字符串返回 `CHARACTER`，`upgraded-array-element-type` 支持 CHARACTER/BIT/SINGLE-FLOAT/T 类型映射）

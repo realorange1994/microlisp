@@ -106,6 +106,7 @@ type LispArray struct {
 	elements   []*Value // flat storage (row-major)
 	fillPtr    int      // fill-pointer for vectors (-1 if no fill-pointer)
 	adjustable bool     // whether array is adjustable
+	elemType   string   // element type (e.g., "T", "CHARACTER", "BIT", "SINGLE-FLOAT")
 }
 
 type Value struct {
@@ -7218,6 +7219,12 @@ var builtins = []builtinDef{
 	{"logior", builtinLogior},
 	{"logxor", builtinLogxor},
 	{"lognot", builtinLognot},
+	{"lognand", builtinLognand},
+	{"lognor", builtinLognor},
+	{"logandc1", builtinLogandc1},
+	{"logandc2", builtinLogandc2},
+	{"logorc1", builtinLogorc1},
+	{"logorc2", builtinLogorc2},
 	{"logcount", builtinLogcount},
 	{"logbitp", builtinLogbitp},
 	{"logtest", builtinLogtest},
@@ -11760,6 +11767,7 @@ func builtinMakeArray(args []*Value) (*Value, error) {
 	var initialContents *Value = nil
 	fillPointer := -1
 	adjustable := false
+	elemType := "T"
 	for i := 1; i < len(args); i++ {
 		if args[i].typ == VSym {
 			switch args[i].str {
@@ -11787,6 +11795,21 @@ func builtinMakeArray(args []*Value) (*Value, error) {
 					i++
 					adjustable = isTruthy(args[i])
 				}
+			case ":ELEMENT-TYPE":
+				if i+1 < len(args) {
+					i++
+					etName := strings.ToUpper(toString(args[i]))
+					switch etName {
+					case "CHARACTER", "BASE-CHAR", "STANDARD-CHAR":
+						elemType = "CHARACTER"
+					case "BIT":
+						elemType = "BIT"
+					case "SINGLE-FLOAT", "DOUBLE-FLOAT", "FLOAT":
+						elemType = "SINGLE-FLOAT"
+					default:
+						elemType = "T"
+					}
+				}
 			}
 		}
 	}
@@ -11811,6 +11834,7 @@ func builtinMakeArray(args []*Value) (*Value, error) {
 		elements:   elements,
 		fillPtr:    fillPointer,
 		adjustable: adjustable,
+		elemType:   elemType,
 	}
 	v := gcv()
 	v.typ = VArray
@@ -12174,13 +12198,43 @@ func builtinVectorPop(args []*Value) (*Value, error) {
 }
 
 func builtinArrayElementType(args []*Value) (*Value, error) {
-	// Simplified: always return T since we don't track element types
-	return vsym("T"), nil
+	if len(args) < 1 {
+		return nil, fmt.Errorf("array-element-type: need an array")
+	}
+	arr := args[0]
+	if arr.typ == VStr {
+		// Strings are vectors of CHARACTER
+		return vsym("CHARACTER"), nil
+	}
+	if arr.typ != VArray || arr.array == nil {
+		return nil, fmt.Errorf("array-element-type: argument must be an array")
+	}
+	et := arr.array.elemType
+	if et == "" {
+		et = "T"
+	}
+	return vsym(et), nil
 }
 
 func builtinUpgradedArrayElementType(args []*Value) (*Value, error) {
-	// Simplified: always return T since we don't have specialized array types
-	return vsym("T"), nil
+	if len(args) < 1 {
+		return nil, fmt.Errorf("upgraded-array-element-type: need a type specifier")
+	}
+	typeArg := args[0]
+	typeName := strings.ToUpper(toString(typeArg))
+	// Map known element types to their upgraded types
+	switch typeName {
+	case "CHARACTER", "BASE-CHAR", "STANDARD-CHAR":
+		return vsym("CHARACTER"), nil
+	case "BIT":
+		return vsym("BIT"), nil
+	case "SINGLE-FLOAT", "DOUBLE-FLOAT", "FLOAT", "SHORT-FLOAT", "LONG-FLOAT":
+		return vsym("SINGLE-FLOAT"), nil
+	case "FIXNUM", "BIGNUM", "INTEGER", "RATIONAL", "RATIO", "REAL", "NUMBER":
+		return vsym("T"), nil
+	default:
+		return vsym("T"), nil
+	}
 }
 
 func builtinAdjustArray(args []*Value) (*Value, error) {
@@ -18924,6 +18978,80 @@ func checkStringArg(v *Value, funcName string) (string, error) {
 	return s, nil
 }
 
+// strCmpKw holds parsed :start1/:end1/:start2/:end2 keyword arguments
+type strCmpKw struct {
+	start1 int
+	end1   int
+	start2 int
+	end2   int
+}
+
+// runesSlice returns a slice of runes from start to end.
+func runesSlice(rs []rune, start, end int) []rune {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(rs) {
+		end = len(rs)
+	}
+	if start >= end {
+		return []rune{}
+	}
+	return rs[start:end]
+}
+
+// parseStrCmpKwArgs parses :start1/:end1/:start2/:end2 from keyword args.
+// s1len and s2len are the rune lengths of the two strings.
+func parseStrCmpKwArgs(args []*Value, s1len, s2len int) strCmpKw {
+	p := strCmpKw{start1: 0, end1: s1len, start2: 0, end2: s2len}
+	for i := 2; i < len(args); i++ {
+		if args[i].typ != VSym {
+			continue
+		}
+		switch args[i].str {
+		case ":START1":
+			if i+1 < len(args) {
+				i++
+				p.start1 = int(toNum(args[i]))
+			}
+		case ":END1":
+			if i+1 < len(args) {
+				i++
+				p.end1 = int(toNum(args[i]))
+			}
+		case ":START2":
+			if i+1 < len(args) {
+				i++
+				p.start2 = int(toNum(args[i]))
+			}
+		case ":END2":
+			if i+1 < len(args) {
+				i++
+				p.end2 = int(toNum(args[i]))
+			}
+		}
+	}
+	if p.start1 < 0 {
+		p.start1 = 0
+	}
+	if p.start1 > s1len {
+		p.start1 = s1len
+	}
+	if p.end1 < 0 || p.end1 > s1len {
+		p.end1 = s1len
+	}
+	if p.start2 < 0 {
+		p.start2 = 0
+	}
+	if p.start2 > s2len {
+		p.start2 = s2len
+	}
+	if p.end2 < 0 || p.end2 > s2len {
+		p.end2 = s2len
+	}
+	return p
+}
+
 func builtinStrEqual(args []*Value) (*Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("string=: need two strings")
@@ -18936,7 +19064,12 @@ func builtinStrEqual(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return vbool(s1 == s2), nil
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	sub1 := runesSlice(r1, p.start1, p.end1)
+	sub2 := runesSlice(r2, p.start2, p.end2)
+	return vbool(string(sub1) == string(sub2)), nil
 }
 
 func builtinStrLess(args []*Value) (*Value, error) {
@@ -18951,8 +19084,11 @@ func builtinStrLess(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	runes1 := runesSlice(r1, p.start1, p.end1)
+	runes2 := runesSlice(r2, p.start2, p.end2)
 	for i := 0; i < len(runes1) && i < len(runes2); i++ {
 		if runes1[i] < runes2[i] {
 			return vnum(float64(i)), nil
@@ -19582,7 +19718,20 @@ func builtinStrEqualCI(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return vbool(strings.EqualFold(s1, s2)), nil
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	sub1 := runesSlice(r1, p.start1, p.end1)
+	sub2 := runesSlice(r2, p.start2, p.end2)
+	if len(sub1) != len(sub2) {
+		return vbool(false), nil
+	}
+	for i := range sub1 {
+		if unicode.ToLower(sub1[i]) != unicode.ToLower(sub2[i]) {
+			return vbool(false), nil
+		}
+	}
+	return vbool(true), nil
 }
 
 // -------- string-not-equal, string-greaterp, string-lessp, etc. --------
@@ -19598,22 +19747,18 @@ func builtinStringNotEqual(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	if strings.EqualFold(s1, s2) {
-		return vnil(), nil
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	runes1 := runesSlice(r1, p.start1, p.end1)
+	runes2 := runesSlice(r2, p.start2, p.end2)
+	if len(runes1) != len(runes2) {
+		return vnum(float64(0)), nil
 	}
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
-	minLen := len(runes1)
-	if len(runes2) < minLen {
-		minLen = len(runes2)
-	}
-	for i := 0; i < minLen; i++ {
+	for i := 0; i < len(runes1); i++ {
 		if unicode.ToLower(runes1[i]) != unicode.ToLower(runes2[i]) {
 			return vnum(float64(i)), nil
 		}
-	}
-	if len(runes1) != len(runes2) {
-		return vnum(float64(minLen)), nil
 	}
 	return vnil(), nil
 }
@@ -19630,8 +19775,11 @@ func builtinStringGreaterp(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	runes1 := runesSlice(r1, p.start1, p.end1)
+	runes2 := runesSlice(r2, p.start2, p.end2)
 	for i := 0; i < len(runes1) && i < len(runes2); i++ {
 		c1 := unicode.ToLower(runes1[i])
 		c2 := unicode.ToLower(runes2[i])
@@ -19660,8 +19808,11 @@ func builtinStringLessp(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	runes1 := runesSlice(r1, p.start1, p.end1)
+	runes2 := runesSlice(r2, p.start2, p.end2)
 	for i := 0; i < len(runes1) && i < len(runes2); i++ {
 		c1 := unicode.ToLower(runes1[i])
 		c2 := unicode.ToLower(runes2[i])
@@ -19690,8 +19841,11 @@ func builtinStringNotGreaterp(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	runes1 := runesSlice(r1, p.start1, p.end1)
+	runes2 := runesSlice(r2, p.start2, p.end2)
 	for i := 0; i < len(runes1) && i < len(runes2); i++ {
 		c1 := unicode.ToLower(runes1[i])
 		c2 := unicode.ToLower(runes2[i])
@@ -19702,10 +19856,10 @@ func builtinStringNotGreaterp(args []*Value) (*Value, error) {
 			return vnum(float64(i)), nil
 		}
 	}
-	if len(runes1) <= len(runes2) {
-		return vnum(float64(len(runes1))), nil
+	if len(runes1) > len(runes2) {
+		return vnil(), nil
 	}
-	return vnil(), nil
+	return vnum(float64(len(runes1))), nil
 }
 
 func builtinStringNotLessp(args []*Value) (*Value, error) {
@@ -19720,8 +19874,11 @@ func builtinStringNotLessp(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	runes1 := runesSlice(r1, p.start1, p.end1)
+	runes2 := runesSlice(r2, p.start2, p.end2)
 	for i := 0; i < len(runes1) && i < len(runes2); i++ {
 		c1 := unicode.ToLower(runes1[i])
 		c2 := unicode.ToLower(runes2[i])
@@ -19732,10 +19889,10 @@ func builtinStringNotLessp(args []*Value) (*Value, error) {
 			return vnum(float64(i)), nil
 		}
 	}
-	if len(runes1) >= len(runes2) {
-		return vnum(float64(len(runes2))), nil
+	if len(runes1) < len(runes2) {
+		return vnil(), nil
 	}
-	return vnil(), nil
+	return vnum(float64(len(runes2))), nil
 }
 
 // -------- write-to-string (already defined above, skip duplicate) --------
@@ -19951,11 +20108,14 @@ func builtinStringNotEq(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s1 == s2 {
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	runes1 := runesSlice(r1, p.start1, p.end1)
+	runes2 := runesSlice(r2, p.start2, p.end2)
+	if string(runes1) == string(runes2) {
 		return vnil(), nil
 	}
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
 	minLen := len(runes1)
 	if len(runes2) < minLen {
 		minLen = len(runes2)
@@ -19980,8 +20140,11 @@ func builtinStringGreater(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	runes1 := runesSlice(r1, p.start1, p.end1)
+	runes2 := runesSlice(r2, p.start2, p.end2)
 	for i := 0; i < len(runes1) && i < len(runes2); i++ {
 		if runes1[i] > runes2[i] {
 			return vnum(float64(i)), nil
@@ -20008,8 +20171,11 @@ func builtinStringLe(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	runes1 := runesSlice(r1, p.start1, p.end1)
+	runes2 := runesSlice(r2, p.start2, p.end2)
 	for i := 0; i < len(runes1) && i < len(runes2); i++ {
 		if runes1[i] < runes2[i] {
 			return vnum(float64(i)), nil
@@ -20036,8 +20202,11 @@ func builtinStringGe(args []*Value) (*Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	runes1 := []rune(s1)
-	runes2 := []rune(s2)
+	r1 := []rune(s1)
+	r2 := []rune(s2)
+	p := parseStrCmpKwArgs(args, len(r1), len(r2))
+	runes1 := runesSlice(r1, p.start1, p.end1)
+	runes2 := runesSlice(r2, p.start2, p.end2)
 	for i := 0; i < len(runes1) && i < len(runes2); i++ {
 		if runes1[i] > runes2[i] {
 			return vnum(float64(i)), nil
@@ -21453,6 +21622,94 @@ func builtinLognot(args []*Value) (*Value, error) {
 		return vbigint(result), nil
 	}
 	return vnum(float64(^int64(toNum(args[0])))), nil
+}
+
+// logandInts converts two args to int64 if possible, or returns big.Ints
+func logAndInts(a, b *Value) (int64, int64, *big.Int, *big.Int, bool) {
+	if a.typ == VBigInt || b.typ == VBigInt || a.typ == VNum && float64(int64(toNum(a))) != toNum(a) || b.typ == VNum && float64(int64(toNum(b))) != toNum(b) {
+		ai := toBigInt(a)
+		if ai == nil {
+			ai = big.NewInt(int64(toNum(a)))
+		}
+		bi := toBigInt(b)
+		if bi == nil {
+			bi = big.NewInt(int64(toNum(b)))
+		}
+		return 0, 0, ai, bi, true
+	}
+	return int64(toNum(a)), int64(toNum(b)), nil, nil, false
+}
+
+func builtinLognand(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("lognand: need two integers")
+	}
+	a, b, ai, bi, isBig := logAndInts(args[0], args[1])
+	if isBig {
+		result := new(big.Int).Not(new(big.Int).And(ai, bi))
+		return vbigint(result), nil
+	}
+	return vnum(float64(^(a & b))), nil
+}
+
+func builtinLognor(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("lognor: need two integers")
+	}
+	a, b, ai, bi, isBig := logAndInts(args[0], args[1])
+	if isBig {
+		result := new(big.Int).Not(new(big.Int).Or(ai, bi))
+		return vbigint(result), nil
+	}
+	return vnum(float64(^(a | b))), nil
+}
+
+func builtinLogandc1(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("logandc1: need two integers")
+	}
+	a, b, ai, bi, isBig := logAndInts(args[0], args[1])
+	if isBig {
+		result := new(big.Int).And(new(big.Int).Not(ai), bi)
+		return vbigint(result), nil
+	}
+	return vnum(float64((^a) & b)), nil
+}
+
+func builtinLogandc2(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("logandc2: need two integers")
+	}
+	a, b, ai, bi, isBig := logAndInts(args[0], args[1])
+	if isBig {
+		result := new(big.Int).And(ai, new(big.Int).Not(bi))
+		return vbigint(result), nil
+	}
+	return vnum(float64(a & (^b))), nil
+}
+
+func builtinLogorc1(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("logorc1: need two integers")
+	}
+	a, b, ai, bi, isBig := logAndInts(args[0], args[1])
+	if isBig {
+		result := new(big.Int).Or(new(big.Int).Not(ai), bi)
+		return vbigint(result), nil
+	}
+	return vnum(float64((^a) | b)), nil
+}
+
+func builtinLogorc2(args []*Value) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("logorc2: need two integers")
+	}
+	a, b, ai, bi, isBig := logAndInts(args[0], args[1])
+	if isBig {
+		result := new(big.Int).Or(ai, new(big.Int).Not(bi))
+		return vbigint(result), nil
+	}
+	return vnum(float64(a | (^b))), nil
 }
 
 // -------- logcount --------
@@ -23101,15 +23358,64 @@ func formatDispatch(fs *fmtState) {
 			exp := int(math.Floor(math.Log10(absF)))
 			// CL ~g: use fixed-point when -4 <= exp < digits
 			if absF >= 1e16 || (absF < 1e-3 && absF > 0) || exp >= digits || exp < -4 {
-				// Use exponential format
-				fs.buf.WriteString(strconv.FormatFloat(f, 'e', digits-1, 64))
+				// Use exponential format with ~E-like logic
+				// Format as mantissa + E + exponent, stripping trailing zeros
+				prec := digits - 1
+				if prec < 0 {
+					prec = 0
+				}
+				s := strconv.FormatFloat(f, 'E', prec, 64)
+				idx := strings.Index(s, "E")
+				if idx < 0 {
+					fs.buf.WriteString(s)
+				} else {
+					mantissa := s[:idx]
+					expStr := s[idx+1:]
+					// Strip trailing zeros from mantissa
+					mantissa = strings.TrimRight(mantissa, "0")
+					// If mantissa ends with '.', remove it
+					mantissa = strings.TrimSuffix(mantissa, ".")
+					// If mantissa is empty, use "0"
+					if mantissa == "" {
+						mantissa = "0"
+					}
+					// Ensure mantissa has a decimal point
+					if !strings.Contains(mantissa, ".") {
+						mantissa += ".0"
+					}
+					// Normalize exponent: strip leading zeros
+					expSign := ""
+					if len(expStr) > 0 && (expStr[0] == '+' || expStr[0] == '-') {
+						expSign = string(expStr[0])
+						expStr = expStr[1:]
+					}
+					expDigits := strings.TrimLeft(expStr, "0")
+					if expDigits == "" {
+						expDigits = "0"
+					}
+					fs.buf.WriteString(mantissa + "E" + expSign + expDigits)
+				}
 			} else {
 				// Use fixed-point format with appropriate decimal places
 				decPlaces := digits - 1 - exp
 				if decPlaces < 0 {
 					decPlaces = 0
 				}
-				fs.buf.WriteString(strconv.FormatFloat(f, 'f', decPlaces, 64))
+				s := strconv.FormatFloat(f, 'f', decPlaces, 64)
+				// Strip unnecessary trailing zeros, but keep at least one decimal digit
+				if dotIdx := strings.Index(s, "."); dotIdx >= 0 {
+					// Remove trailing zeros after decimal point
+					s = strings.TrimRight(s, "0")
+					// If only '.' remains, add one '0' to keep "42."
+					s = strings.TrimSuffix(s, ".")
+					if s == "" || !strings.Contains(s, ".") {
+						s += ".0"
+					}
+				} else {
+					// No decimal point - add ".0" for floating-point clarity
+					s += ".0"
+				}
+				fs.buf.WriteString(s)
 			}
 		}
 	case 'W':

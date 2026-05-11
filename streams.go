@@ -726,7 +726,79 @@ func builtinReadFromString(args []*Value) (*Value, error) {
 	} else {
 		strStr = writeToString(str)
 	}
-	return parseExpr(strStr)
+
+	// Parse keyword arguments
+	eofErrorP := true
+	eofValue := vnil()
+	startPos := 0
+	endPos := len([]rune(strStr))
+
+	for i := 1; i < len(args); {
+		if args[i].typ == VSym {
+			switch args[i].str {
+			case ":EOF-ERROR-P":
+				if i+1 < len(args) {
+					i++
+					eofErrorP = !isNil(primaryValue(args[i]))
+				}
+			case ":EOF-VALUE":
+				if i+1 < len(args) {
+					i++
+					eofValue = primaryValue(args[i])
+				}
+			case ":START":
+				if i+1 < len(args) {
+					i++
+					startPos = int(toNum(primaryValue(args[i])))
+				}
+			case ":END":
+				if i+1 < len(args) {
+					i++
+					endPos = int(toNum(primaryValue(args[i])))
+				}
+			case ":PRESERVE-WHITESPACE":
+				if i+1 < len(args) {
+					i++
+					// preserveWhitespace not yet fully implemented
+				}
+			default:
+				i++
+				if i < len(args) && args[i-1].typ == VSym && args[i-1].str[0] == ':' {
+					i++
+				}
+			}
+		} else {
+			i++
+		}
+	}
+
+	// Apply start/end
+	runes := []rune(strStr)
+	if startPos < 0 {
+		startPos = 0
+	}
+	if startPos > len(runes) {
+		startPos = len(runes)
+	}
+	if endPos > len(runes) {
+		endPos = len(runes)
+	}
+	if startPos > endPos {
+		startPos = endPos
+	}
+
+	subStr := string(runes[startPos:endPos])
+
+	v, pos, err := parseExprWithPos(subStr)
+	if err != nil {
+		if !eofErrorP {
+			return multiVal(eofValue, vnum(float64(startPos))), nil
+		}
+		return nil, err
+	}
+
+	// Return position relative to original string
+	return multiVal(v, vnum(float64(startPos+pos))), nil
 }
 
 func builtinPrint(args []*Value) (*Value, error) {
