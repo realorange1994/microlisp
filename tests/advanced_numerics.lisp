@@ -19,7 +19,7 @@
 (assert-equal 'rational (type-of -2/3) "type: -2/3 is rational")
 
 ;; Integer results simplify back to number
-(assert-equal 'number (type-of 4/2) "type: 4/2 simplifies to number")
+(assert-equal 'integer (type-of 4/2) "type: 4/2 simplifies to integer")
 (assert-equal 2 4/2 "4/2 = 2")
 
 ;; Simplification
@@ -71,7 +71,7 @@
 (assert-equal 'complex (type-of #c(0 1)) "type: #c(0 1) is complex")
 
 ;; Zero imaginary part simplifies to real
-(assert-equal 'number (type-of #c(5 0)) "type: #c(5 0) simplifies to number")
+(assert-equal 'integer (type-of #c(5 0)) "type: #c(5 0) simplifies to integer")
 (assert-equal 5 #c(5 0) "#c(5 0) = 5")
 
 ;; Cross-type numeric equality via =
@@ -96,7 +96,7 @@
 (assert-equal #c(-5 10) (* #c(1 2) #c(3 4)) "#c(1 2) * #c(3 4) = #c(-5 10)")
 
 ;; Division
-(assert-equal #c(0.5 0) (/ #c(1 0) #c(2 0)) "#c(1 0) / #c(2 0) = #c(0.5 0)")
+(assert-true (= 0.5 (/ #c(1 0) #c(2 0))) "#c(1 0) / #c(2 0) = 0.5 numerically")
 
 (end-suite)
 
@@ -135,8 +135,8 @@
 (assert-equal 3735928559 #xDEADBEEF "#xDEADBEEF = 3735928559")
 
 ;; Type is number (not rational)
-(assert-equal 'number (type-of #b101) "type: #b101 is number")
-(assert-equal 'number (type-of #xFF) "type: #xFF is number")
+(assert-equal 'integer (type-of #b101) "type: #b101 is integer")
+(assert-equal 'integer (type-of #xFF) "type: #xFF is integer")
 
 (end-suite)
 
@@ -163,7 +163,7 @@
 (assert-equal -3 (- #c(3 0)) "-(#c(3 0)) = -3")
 
 ;; Complex with rational parts
-(assert-equal #c(0.5 0) (/ 1 2) "1/2 as complex = #c(0.5 0)")
+(assert-true (= 0.5 (/ 1 2)) "1/2 = 0.5 numerically")
 
 (end-suite)
 

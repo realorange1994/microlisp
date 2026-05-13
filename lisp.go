@@ -6578,7 +6578,7 @@ func parseMacroParams(v *Value) (params []string, rest string, whole string, env
 func typeStr(v *Value) string {
 	switch v.typ {
 	case VNil:
-		return "nil"
+		return "NULL"
 	case VNum:
 		if v.isFloat {
 			return "SINGLE-FLOAT"
@@ -8393,6 +8393,9 @@ func toBigIntExact(v *Value) *big.Int {
 func toBigRat(v *Value) big.Rat {
 	switch v.typ {
 	case VNum:
+		if v.isFloat {
+			return *new(big.Rat).SetFloat64(v.num)
+		}
 		return *big.NewRat(int64(v.num), 1)
 	case VRat:
 		return *big.NewRat(v.irat, v.iden)
@@ -9593,8 +9596,11 @@ func eqVal(a, b *Value) bool {
 		return false
 	}
 	// In CL, nil (symbol) and () (empty list/VNil) are equal
-	if (a.typ == VSym && strings.EqualFold(a.str, "nil") && b.typ == VNil) ||
-		(b.typ == VSym && strings.EqualFold(b.str, "nil") && a.typ == VNil) {
+	if (a.typ == VNil && b.typ == VNil) {
+		return true
+	}
+	if a.typ == VNil && b.typ == VSym && strings.EqualFold(b.str, "nil") ||
+		b.typ == VNil && a.typ == VSym && strings.EqualFold(a.str, "nil") {
 		return true
 	}
 	if a.typ != b.typ {
@@ -13170,7 +13176,7 @@ func builtinIntern(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("intern: need symbol name")
 	}
-	name := primaryValue(args[0]).str
+	name := strings.ToUpper(primaryValue(args[0]).str)
 	pkg := currentPackage
 	if len(args) >= 2 && !isNil(args[1]) {
 		pkg = resolvePackageFromDesignator(args[1])
@@ -13240,7 +13246,7 @@ func builtinFindSymbol(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("find-symbol: need string name")
 	}
-	name := primaryValue(args[0]).str
+	name := strings.ToUpper(primaryValue(args[0]).str)
 	pkg := currentPackage
 	if len(args) >= 2 && !isNil(args[1]) {
 		pkg = resolvePackageFromDesignator(args[1])
@@ -13269,7 +13275,7 @@ func builtinFindAllSymbols(args []*Value) (*Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("find-all-symbols: need string name")
 	}
-	name := primaryValue(args[0]).str
+	name := strings.ToUpper(primaryValue(args[0]).str)
 	var result *Value
 	for _, pkg := range packages {
 		if sym, ok := pkg.symbols[name]; ok {
@@ -22008,9 +22014,12 @@ func builtinGraphicCharP(args []*Value) (*Value, error) {
 	} else {
 		return vbool(false), nil
 	}
-	// Graphic chars are printable characters (including space, excluding control chars)
-	// Per CL spec: characters that print something, includes space (code 32)
-	return vbool(unicode.IsPrint(ch)), nil
+	// Graphic chars are printable characters EXCLUDING whitespace (space, tab, newline, etc.)
+	// Per ANSI CL: space, newline, tab, page, return, backspace are NOT graphic characters
+	if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\b' {
+		return vbool(false), nil
+	}
+	return vbool(unicode.IsPrint(ch) && !unicode.IsSpace(ch)), nil
 }
 
 // -------- standard-char-p --------
@@ -23388,11 +23397,11 @@ func builtinCoerce(args []*Value) (*Value, error) {
 			}
 			return vcomplexAlways(toNum(obj), 0), nil
 		default:
-			// Plain (complex) or unknown subtype - always return a VComplex per CL
+			// Plain (complex) or unknown subtype - use vcomplex which simplifies #c(x 0) to x
 			if obj.typ == VComplex {
 				return obj, nil
 			}
-			return vcomplexAlways(toNum(obj), 0), nil
+			return vcomplex(toNum(obj), 0), nil
 		}
 	case "character", ":character":
 		if obj.typ == VChar {
@@ -24445,13 +24454,11 @@ func formatDispatch(fs *fmtState) {
 		}
 	case '&':
 		// fresh-line: output newline unless already at start of line
-		n := int(fs.getParam(params, 0, 1))
 		if fs.buf.Len() > 0 {
-			fs.buf.WriteString("\n")
-			n--
-		}
-		for i := 0; i < n; i++ {
-			fs.buf.WriteString("\n")
+			n := int(fs.getParam(params, 0, 1))
+			for i := 0; i < n; i++ {
+				fs.buf.WriteString("\n")
+			}
 		}
 	case '|':
 		fs.buf.WriteString("\f")
@@ -25121,6 +25128,8 @@ func princToString(v *Value) string {
 		return v.bigInt.String()
 	case VStr:
 		return v.str
+	case VChar:
+		return string(v.ch)
 	case VNil:
 		return "nil"
 	case VBool:
@@ -26946,6 +26955,16 @@ var initLib = `
                 (let ((hidden-var (gensym "destr-")))
                   (set! in-lets (cons (list user-var hidden-var list-expr #t) in-lets))
                   (set! expanded (cons (list hidden-var 'in list-expr) expanded)))))
+            (if (equal? (cadr f) 'on)
+              (let* ((user-var (car f))
+                     (list-expr (car (cddr f)))
+                     (tail (gensym "on-")))
+                ;; Check if user-var is a destructuring pattern (a list, not a symbol)
+                (if (symbol? user-var)
+                  (set! expanded (cons f expanded))
+                  (let ((hidden-var (gensym "destr-")))
+                    (set! in-lets (cons (list user-var hidden-var list-expr #t 'on) in-lets))
+                    (set! expanded (cons (list hidden-var 'on list-expr) expanded)))))
             (if (equal? (cadr f) 'being)
               ;; Handle: for sym being each present-symbol of package
               ;; Handle: for k being the hash-keys of ht
@@ -27005,7 +27024,7 @@ var initLib = `
                      (init-expr (car args)))
                 (set! eq-lets (cons (list var init-expr) eq-lets))
                 (set! expanded (cons (list var '= 'nil) expanded)))
-              (set! expanded (cons f expanded)))))))
+              (set! expanded (cons f expanded))))))))
         raw-for-vars)
       (let* ((for-vars (reverse expanded))
              (in-lets (reverse in-lets))
@@ -27242,11 +27261,12 @@ var initLib = `
             (let ((user-var (car p))
                   (tail-var (cadr p))
                   (list-expr (caddr p))
-                  (is-destr (car (cdddr p))))
+                  (is-destr (car (cdddr p)))
+                  (destr-mode (if (null? (cdr (cdddr p))) 'in (cadr (cdddr p)))))
               (if is-destr
                 (begin
-                  ;; Store (pattern tail-var) for wrapping
-                  (set! destr-specs (cons (list user-var tail-var) destr-specs)))
+                  ;; Store (pattern tail-var mode) for wrapping
+                  (set! destr-specs (cons (list user-var tail-var destr-mode) destr-specs)))
                 (begin
                   ;; Add initial binding: (user-var (car list-expr))
                   (set! acc-inits
@@ -27312,8 +27332,11 @@ var initLib = `
                    (for-each
                      (lambda (d)
                        (let ((pattern (car d))
-                             (tail-var (cadr d)))
-                         (set! result (list 'destructuring-bind pattern (list 'car tail-var) result))))
+                             (tail-var (cadr d))
+                             (mode (caddr d)))
+                         (set! result (list 'destructuring-bind pattern
+                                       (if (equal? mode 'on) tail-var (list 'car tail-var))
+                                       result))))
                      destr-specs)
                    result)))
 

@@ -44,7 +44,7 @@
 ;; ============================================================
 (start-suite "~S Directive")
 
-(assert-equal "foo" (format #f "~s" 'foo) "~s: symbol")
+(assert-equal "FOO" (format #f "~s" 'foo) "~s: symbol")
 (assert-equal "\"bar\"" (format #f "~s" "bar") "~s: string with quotes")
 
 (end-suite)

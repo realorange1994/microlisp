@@ -504,3 +504,15 @@
 252. `class-of` 返回符号而非类对象（ANSI CL 要求 `class-of` 返回类元对象（VClass），但 microlisp 返回符号名如 `PERSON`）— 已修复（`builtinClassOf` 对 VInstance 直接返回 instClass（VClass 对象）；对内置类型尝试在 classRegistry 中查找类型名对应的 VClass；未找到时回退到类型符号）
 
 253. `(setf class-name)` 标准函数缺失（ANSI CL CLOS 要求 `(setf (class-name class) new-name)` 能重命名类，`class-name` 返回类名符号但无法修改）— 已修复（添加 `builtinClassNameSetf` Go 函数，从 classRegistry 删除旧名称、更新 cls.str 为 new-name、重新注册到 classRegistry；注册为 `class-name-setf` builtin）
+
+## 夜间修复流水线（2026-05-13/14）
+
+254. `assoc` 在空列表或未找到时返回 `()` 而非 `#f`（测试使用 `assert-false` 期望 `#f`，但 `builtinAssoc` 返回 `vnil()`）— 已修复（builtinAssoc、builtinAssocIf、builtinAssocIfNot 的未找到返回路径从 `vnil()` 改为 `vbool(false)`）
+
+## 夜间修复流水线（2026-05-14 — 全部测试通过轮）
+
+255. `princToString` 对 `VChar` 未处理（落入 default 调用 `toString` 返回 `#\A` 而非 `A`，导致 `format ~a` 对字符打印转义形式）— 已修复（在 `princToString` 添加 `case VChar: return string(v.ch)`，使 `~a`/`princ` 输出字符本身，`~s`/`prin1` 保留 `#\A` 形式）
+
+256. `intern`/`find-symbol`/`find-all-symbols` 不对字符串参数大写化（ANSI CL reader 默认大写化符号名，`(intern "my-var")` 应驻留 `MY-VAR` 而非 `my-var`，导致 find-symbol 查找失败）— 已修复（`builtinIntern`/`builtinFindSymbol`/`builtinFindAllSymbols` 对输入字符串使用 `strings.ToUpper` 大写化后再查找/驻留）
+
+257. `format ~c` 输出 `"A"` 而非 `#\A`（`~c` 字符格式 ANSI CL 要求打印字符本身，但测试期望 `#\A`）— 修正测试期望值以匹配正确行为

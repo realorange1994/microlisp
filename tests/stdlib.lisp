@@ -114,11 +114,11 @@
 
 (start-suite "assoc")
 
-(assert-false (assoc 'a '()) "assoc: empty alist")
+(assert-nil (assoc 'a '()) "assoc: empty alist")
 (define al '((a . 1) (b . 2) (c . 3)))
 (assert-equal '(a . 1) (assoc 'a al) "assoc: dotted pair alist")
 (assert-equal '(c . 3) (assoc 'c al) "assoc: last element")
-(assert-false (assoc 'z al) "assoc: not found")
+(assert-nil (assoc 'z al) "assoc: not found")
 
 (define al2 '((name "Alice") (age 30) (city "NYC")))
 (assert-equal '(name "Alice") (assoc 'name al2) "assoc: with string values")

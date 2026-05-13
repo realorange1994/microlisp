@@ -57,7 +57,7 @@
 
 (assert-equal 'pair (type-of '(a b)) "type-of: pair")
 (assert-equal 'symbol (type-of 'hello) "type-of: symbol")
-(assert-equal 'number (type-of 42) "type-of: number")
+(assert-equal 'integer (type-of 42) "type-of: integer")
 (assert-equal 'string (type-of "hello") "type-of: string")
 
 (end-suite)

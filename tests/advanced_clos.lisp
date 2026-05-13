@@ -19,7 +19,7 @@
 
 (define p (make-instance 'point))
 (assert-true (instance? p) "make-instance: creates instance")
-(assert-equal 'point (class-of p) "class-of: point")
+(assert-equal 'point (class-name (class-of p)) "class-of: point")
 
 ;; Slot access - initially nil
 (assert-nil (slot-value p 'x) "slot-value: x initially nil")
@@ -168,7 +168,7 @@
 (start-suite "class-of and instance? Edge Cases")
 
 ;; class-of on non-instances returns type symbol
-(assert-equal 'number (class-of 42) "class-of: number")
+(assert-equal 'integer (class-of 42) "class-of: number")
 (assert-equal 'string (class-of "hello") "class-of: string")
 (assert-equal 'symbol (class-of 'x) "class-of: symbol")
 (assert-equal 'pair (class-of '(1 2)) "class-of: pair")

@@ -34,21 +34,21 @@
 (assert-equal "0.5" (format nil "~2f" 0.5) "fixed-point width 2 (microLisp ignores)")
 
 ;; --- ~e: Exponential ---
-(assert-true (string= "3.14E+00" (format nil "~e" 3.14)) "exponential")
+(assert-equal "3.14E+0" (format nil "~e" 3.14) "exponential")
 
 ;; --- ~g: General ---
-(assert-equal "3.140000" (format nil "~g" 3.14) "general float")
+(assert-equal "3.14" (format nil "~g" 3.14) "general float")
 
 (end-suite)
 (start-suite "String and Symbol Formatting")
 
 ;; --- ~a: Aesthetic ---
 (assert-equal "hello" (format nil "~a" "hello") "aesthetic string")
-(assert-equal "hello" (format nil "~a" 'hello) "aesthetic symbol")
+(assert-equal "HELLO" (format nil "~a" 'hello) "aesthetic symbol")
 (assert-equal "42" (format nil "~a" 42) "aesthetic number")
 (assert-equal "(1 2 3)" (format nil "~a" (list 1 2 3)) "aesthetic list")
-(assert-equal ":key" (format nil "~a" :key) "aesthetic keyword")
-(assert-equal "#\\A" (format nil "~a" #\A) "aesthetic character")
+(assert-equal ":KEY" (format nil "~a" :key) "aesthetic keyword")
+(assert-equal "A" (format nil "~a" #\A) "aesthetic character")
 
 ;; --- ~s: Standard (readably) ---
 (assert-equal "\"hello\"" (format nil "~s" "hello") "standard string")
@@ -57,7 +57,7 @@
 (assert-equal "#\\A" (format nil "~s" #\A) "standard character")
 
 ;; --- ~c: Character ---
-(assert-equal "#\\A" (format nil "~c" #\A) "character format")
+(assert-equal "A" (format nil "~c" #\A) "character format")
 
 (end-suite)
 (start-suite "List Formatting: ~{ ~}")

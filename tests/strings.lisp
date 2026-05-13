@@ -41,9 +41,9 @@
 
 (start-suite "symbol->string / string->symbol")
 
-(assert-equal "hello" (symbol->string 'hello) "symbol->string: hello")
-(assert-equal "x" (symbol->string 'x) "symbol->string: single char")
-(assert-equal "hello-world" (symbol->string 'hello-world)
+(assert-equal "HELLO" (symbol->string 'hello) "symbol->string: hello")
+(assert-equal "X" (symbol->string 'x) "symbol->string: single char")
+(assert-equal "HELLO-WORLD" (symbol->string 'hello-world)
   "symbol->string: hyphenated")
 
 (assert-equal 'hello (string->symbol "hello") "string->symbol: hello")
@@ -66,19 +66,19 @@
 (assert-equal "hello" (string "hello") "string: string passthrough")
 (assert-equal "42hello" (string 42 "hello") "string: mixed args")
 
-(assert-equal "symbol" (string 'symbol) "string: symbol to string")
+(assert-equal "SYMBOL" (string 'symbol) "string: symbol to string")
 (assert-equal "#t" (string #t) "string: boolean to string")
 
 (end-suite)
 
 (start-suite "type-of")
 
-(assert-equal 'number (type-of 42) "type: number")
+(assert-equal 'integer (type-of 42) "type: number")
 (assert-equal 'string (type-of "hi") "type: string")
 (assert-equal 'symbol (type-of 'x) "type: symbol")
 (assert-equal 'boolean (type-of #t) "type: boolean true")
 (assert-equal 'boolean (type-of #f) "type: boolean false")
-(assert-equal 'nil (type-of '()) "type: nil")
+(assert-equal 'null (type-of '()) "type: nil")
 (assert-equal 'pair (type-of '(1 2)) "type: pair")
 (assert-equal 'procedure (type-of +) "type: primitive procedure")
 (assert-equal 'procedure (type-of (lambda (x) x)) "type: lambda/procedure")

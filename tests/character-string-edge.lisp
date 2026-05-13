@@ -55,8 +55,8 @@
 ;; ============================================================
 (start-suite "symbol-name-basic")
 
-;; Symbol to string - MicroLisp returns lowercase
-(assert-equal "hello" (symbol-name 'hello) "symbol-name returns lowercase")
+;; Symbol to string - CL reader uppercases, symbol-name returns uppercase
+(assert-equal "HELLO" (symbol-name 'hello) "symbol-name returns uppercase")
 
 (end-suite)
 

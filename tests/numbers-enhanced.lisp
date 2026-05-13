@@ -25,7 +25,7 @@
 
 ;; Division
 (assert-equal 2 (/ 6 3) "division: 6 / 3")
-(assert-equal 0.5 (/ 3 6) "division: 3 / 6")
+(assert-true (= 0.5 (/ 3 6)) "division: 3 / 6")
 (assert-equal 2.5 (/ 5.0 2) "division: float")
 
 (define x 5)

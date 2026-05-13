@@ -199,7 +199,7 @@
 
 (define v1 '(1 2 3 4 5))
 (define v2 '(10 20))
-(assert-equal '(10 20) (replace v1 v2) "replace: basic replaces from start")
+(assert-equal '(10 20 3 4 5) (replace v1 v2) "replace: basic replaces from start")
 (assert-equal '(10 20 3 4 5) (replace '(1 2 3 4 5) '(10 20) :start1 0 :end1 2) "replace: with bounds")
 
 (end-suite)

@@ -152,23 +152,22 @@
 (end-suite)
 
 ;; ============================================================
-;; Test 8: class-of returns symbol
-;; Bug: class-of returns class object instead of symbol
+;; Test 8: class-of returns class metaobject (ANSI CL spec)
 ;; ============================================================
 (start-suite "class-of return type")
 
-;; class-of should return a symbol, not a class object
+;; class-of returns a class metaobject (VClass), use class-name to get symbol
 (defclass test-class-of-class () ())
 
 (define class-of-instance (make-instance 'test-class-of-class))
 (define class-result (class-of class-of-instance))
 
 (assert-true
-  (symbol? class-result)
-  "class-of returns a symbol")
+  (symbol? (class-name class-result))
+  "class-of returns a class with a name")
 
 (assert-equal 'test-class-of-class
-  class-result
+  (class-name class-result)
   "class-of returns correct class name")
 
 (end-suite)

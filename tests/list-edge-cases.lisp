@@ -67,7 +67,7 @@
 ;; assoc basic
 (assert-equal '(a . 1) (assoc 'a alist) "assoc: finds first")
 (assert-equal '(b . 2) (assoc 'b alist) "assoc: finds second")
-(assert-false (assoc 'd alist) "assoc: not found returns false")
+(assert-nil (assoc 'd alist) "assoc: not found returns nil")
 
 ;; rassoc basic
 (define ralist '((a . 1) (b . 2) (c . 3)))

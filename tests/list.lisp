@@ -151,10 +151,10 @@
 (assert-equal 99 (list-ref '(1 99 3) 1) "list-ref: middle element")
 
 ;; assoc
-(assert-false (assoc 'a '()) "assoc: empty alist")
+(assert-nil (assoc 'a '()) "assoc: empty alist")
 (assert-equal '(a 1) (assoc 'a '((a 1) (b 2))) "assoc: find a")
 (assert-equal '(b 2) (assoc 'b '((a 1) (b 2))) "assoc: find b")
-(assert-false (assoc 'c '((a 1) (b 2))) "assoc: not found returns #f")
+(assert-nil (assoc 'c '((a 1) (b 2))) "assoc: not found returns nil")
 
 ;; member? (custom function, from stdlib)
 (assert-false (member? 'x '()) "member?: empty list")
