@@ -8884,7 +8884,15 @@ func builtinDiv(args []*Value) (*Value, error) {
 }
 
 func builtinEq(args []*Value) (*Value, error) {
-	if len(args) < 2 {
+	if len(args) == 0 {
+		return vbool(true), nil
+	}
+	for _, a := range args {
+		if !isNumber(a) {
+			return signalTypeError(a)
+		}
+	}
+	if len(args) == 1 {
 		return vbool(true), nil
 	}
 	for i := 1; i < len(args); i++ {
@@ -8910,6 +8918,11 @@ func builtinNe(args []*Value) (*Value, error) {
 }
 
 func builtinLt(args []*Value) (*Value, error) {
+	for _, a := range args {
+		if !isReal(a) {
+			return signalTypeError(a)
+		}
+	}
 	if len(args) < 2 {
 		return vbool(true), nil
 	}
@@ -8922,6 +8935,11 @@ func builtinLt(args []*Value) (*Value, error) {
 }
 
 func builtinGt(args []*Value) (*Value, error) {
+	for _, a := range args {
+		if !isReal(a) {
+			return signalTypeError(a)
+		}
+	}
 	if len(args) < 2 {
 		return vbool(true), nil
 	}
@@ -8934,6 +8952,11 @@ func builtinGt(args []*Value) (*Value, error) {
 }
 
 func builtinLe(args []*Value) (*Value, error) {
+	for _, a := range args {
+		if !isReal(a) {
+			return signalTypeError(a)
+		}
+	}
 	if len(args) < 2 {
 		return vbool(true), nil
 	}
@@ -8946,6 +8969,11 @@ func builtinLe(args []*Value) (*Value, error) {
 }
 
 func builtinGe(args []*Value) (*Value, error) {
+	for _, a := range args {
+		if !isReal(a) {
+			return signalTypeError(a)
+		}
+	}
 	if len(args) < 2 {
 		return vbool(true), nil
 	}
@@ -21190,6 +21218,10 @@ func isReal(v *Value) bool {
 	return v.typ == VNum || v.typ == VRat || v.typ == VBigInt
 }
 
+func isNumber(v *Value) bool {
+	return v.typ == VNum || v.typ == VRat || v.typ == VBigInt || v.typ == VComplex
+}
+
 // -------- max / min --------
 func builtinMax(args []*Value) (*Value, error) {
 	if len(args) < 1 {
@@ -22521,9 +22553,12 @@ func isIntegerValue(v *Value) bool {
 		return v.iden == 1
 	}
 	if v.typ == VNum {
-		// In microlisp, all numbers are float64 internally.
-		// We can't distinguish CL floats from CL integers at the value level.
-		// Accept whole-number VNum values as integers for bitwise ops.
+		// VNum with isFloat=true was explicitly created as a float (e.g., 3.0).
+		// Per CLHS, floats are NOT integers, so reject them for bitwise ops.
+		if v.isFloat {
+			return false
+		}
+		// VNum with isFloat=false represents an integer literal (e.g., 3).
 		return v.num == math.Trunc(v.num) && !math.IsInf(v.num, 0) && !math.IsNaN(v.num)
 	}
 	return false
@@ -22940,7 +22975,10 @@ func builtinLogtest(args []*Value) (*Value, error) {
 	}
 	a := int64(toNum(args[0]))
 	b := int64(toNum(args[1]))
-	return vbool(a&b != 0), nil
+	if a&b != 0 {
+		return vsym("T"), nil
+	}
+	return vnil(), nil
 }
 
 // -------- copy-alist --------
